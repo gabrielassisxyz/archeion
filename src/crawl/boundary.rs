@@ -40,13 +40,32 @@ impl Seed {
     }
 }
 
+/// What a crawl produced for one URL: a response, or the report that there was none.
+///
+/// The split is not a detail of one engine. A fetch that never reached a server has no
+/// status, no headers and no body, and an engine with nowhere to say so invents them: this
+/// one answers 599 for a DNS failure and 524 for a connection timeout. Archiving that as a
+/// response would put a status in the record that no server ever sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageEvent {
+    Response(PageResponse),
+    NoResponse(FetchFailure),
+}
+
+/// A URL the crawl never got an answer for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchFailure {
+    pub url: String,
+    pub reason: String,
+}
+
 /// One response, as the engine surfaced it and before anything archival happens to it.
 ///
-/// A non-200 is a page event like any other. An archive that keeps only successes cannot
+/// A non-200 is a response like any other. An archive that keeps only successes cannot
 /// answer why something is missing from it, and a 404 recorded at a date is the evidence
 /// that the page was already gone then.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PageEvent {
+pub struct PageResponse {
     /// The address the engine asked for, which differs from the final URL when it
     /// redirected. Both are kept: identity is derived from where the content actually is,
     /// diagnosis needs where the archive went looking.
@@ -55,9 +74,9 @@ pub struct PageEvent {
     pub status: u16,
     pub headers: Vec<Header>,
     pub body: Vec<u8>,
-    /// Stamped by the engine, because the fetch is the event being dated. A clock read
-    /// further in would date the write instead, and would leave the pipeline with a
-    /// hidden input a test cannot fix.
+    /// Stamped where the page crosses the boundary, which is the closest an adapter can
+    /// get to the fetch it is reporting. A clock read further in would date the write
+    /// instead, and would leave the pipeline with a hidden input no test can fix.
     pub fetched_at: Timestamp,
 }
 

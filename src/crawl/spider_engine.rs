@@ -20,7 +20,9 @@ use spider::tokio::sync::broadcast::error::RecvError;
 use spider::website::Website;
 use url::Url;
 
-use super::boundary::{CrawlEngine, CrawlError, CrawlOutcome, PageEvent, Seed};
+use super::boundary::{
+    CrawlEngine, CrawlError, CrawlOutcome, FetchFailure, PageEvent, PageResponse, Seed,
+};
 use crate::storage::Header;
 
 /// Archiving under a name that says what it is and where to complain about it. A crawler
@@ -71,8 +73,11 @@ async fn crawl_seed(
 
     // The crawl finishing does not mean the queue is empty, and cancelling the drain to
     // learn that would throw away pages already fetched. Only a caller that asked to stop
-    // leaves the rest unread.
-    if !stopped_by_caller {
+    // leaves the rest unread, and what it leaves is counted like any other loss: those
+    // pages cost a fetch each and the archive does not have them.
+    if stopped_by_caller {
+        outcome.pages_dropped += pages.len();
+    } else {
         drain(&mut pages, on_page, &mut outcome).await;
     }
 
@@ -109,7 +114,9 @@ fn configured_website(start: &str, seed: &Seed) -> Website {
     website
         .with_limit(seed.max_pages)
         .with_depth(seed.max_depth)
-        .with_concurrency_limit(Some(seed.concurrency))
+        // Zero permits is a crawl that waits forever on its own semaphore, with no page to
+        // stop it through and no deadline to end it, so it is corrected rather than obeyed.
+        .with_concurrency_limit(Some(seed.concurrency.max(1)))
         .with_delay(u64::try_from(seed.delay.as_millis()).unwrap_or(u64::MAX))
         .with_respect_robots_txt(true)
         // A seed is a site, not a company: subdomains and other TLDs of the same name are
@@ -124,12 +131,23 @@ fn configured_website(start: &str, seed: &Seed) -> Website {
 
 fn page_event(page: Page) -> PageEvent {
     let requested_url = page.get_url().to_string();
+
+    // A fetch that reached no server still arrives here as a page, carrying a status the
+    // engine made up for it: 599 for a DNS failure, 524 for a connection timeout. The
+    // error it recorded is the only part of that page that came from reality.
+    if let Some(reason) = page.error_status.clone() {
+        return PageEvent::NoResponse(FetchFailure {
+            url: requested_url,
+            reason,
+        });
+    }
+
     let final_url = page
         .final_redirect_destination
         .clone()
         .unwrap_or_else(|| requested_url.clone());
 
-    PageEvent {
+    PageEvent::Response(PageResponse {
         requested_url,
         final_url,
         status: page.status_code.as_u16(),
@@ -139,7 +157,7 @@ fn page_event(page: Page) -> PageEvent {
         // archive: later than the fetch by the time it sat in the queue, and the closest
         // honest value available here.
         fetched_at: Timestamp::now(),
-    }
+    })
 }
 
 fn headers_of(headers: Option<&HeaderMap>) -> Vec<Header> {
@@ -187,6 +205,8 @@ fn usable_seed_url(url: &str) -> Result<String, CrawlError> {
 
 #[cfg(test)]
 mod tests {
+    use spider::tokio::sync::broadcast;
+
     use super::*;
 
     #[test]
@@ -220,8 +240,11 @@ mod tests {
         assert!(headers_of(None).is_empty());
     }
 
+    /// A header map groups by name and says nothing about the order two different names
+    /// arrived in, so what is checked here is the part that is actually preserved: a name
+    /// that repeats keeps every one of its values, in the order it sent them.
     #[test]
-    fn headers_keep_their_order_and_their_repeats() {
+    fn a_header_that_repeats_keeps_all_of_its_values() {
         let mut map = HeaderMap::new();
         map.append("set-cookie", "a=1".parse().expect("valid header value"));
         map.append(
@@ -231,9 +254,100 @@ mod tests {
         map.append("set-cookie", "b=2".parse().expect("valid header value"));
 
         let headers = headers_of(Some(&map));
-        let values: Vec<&str> = headers.iter().map(|header| header.value.as_str()).collect();
+        let cookies: Vec<&str> = headers
+            .iter()
+            .filter(|header| header.name == "set-cookie")
+            .map(|header| header.value.as_str())
+            .collect();
 
         assert_eq!(headers.len(), 3);
-        assert!(values.contains(&"a=1") && values.contains(&"b=2"));
+        assert_eq!(cookies, ["a=1", "b=2"]);
+    }
+
+    #[test]
+    fn a_fetch_that_reached_no_server_is_not_reported_as_a_response() {
+        let mut page = Page::default();
+        page.error_status = Some("error sending request: dns error".to_owned());
+
+        match page_event(page) {
+            PageEvent::NoResponse(failure) => {
+                assert_eq!(failure.reason, "error sending request: dns error");
+            }
+            PageEvent::Response(response) => {
+                panic!("a failed fetch was archived as status {}", response.status)
+            }
+        }
+    }
+
+    #[test]
+    fn a_redirected_page_is_reported_at_the_address_it_ended_on() {
+        let mut page = Page::default();
+        page.final_redirect_destination = Some("https://example.com/final".to_owned());
+
+        match page_event(page) {
+            PageEvent::Response(response) => {
+                assert_eq!(response.final_url, "https://example.com/final");
+                assert_ne!(response.requested_url, response.final_url);
+            }
+            PageEvent::NoResponse(failure) => panic!("a response was lost: {}", failure.reason),
+        }
+    }
+
+    /// The queue between the engine and the archive is the one part of this adapter that
+    /// can lose data, so it is exercised directly: a channel, more pages than it holds, and
+    /// no network anywhere.
+    #[test]
+    fn a_queue_that_overflowed_costs_those_pages_and_not_the_rest_of_the_crawl() {
+        let runtime = Runtime::new().expect("a runtime for the test");
+        runtime.block_on(async {
+            let (sender, mut pages) = broadcast::channel::<Page>(2);
+            for _ in 0..5 {
+                sender.send(Page::default()).expect("the receiver is alive");
+            }
+            drop(sender);
+
+            let mut received = 0usize;
+            let mut outcome = CrawlOutcome::default();
+            let stopped = drain(
+                &mut pages,
+                &mut |_| {
+                    received += 1;
+                    ControlFlow::Continue(())
+                },
+                &mut outcome,
+            )
+            .await;
+
+            assert!(!stopped, "the caller never asked to stop");
+            assert_eq!(received, 2, "the pages still queued were delivered");
+            assert_eq!(outcome.pages_dropped, 3);
+        });
+    }
+
+    #[test]
+    fn a_caller_that_asks_to_stop_is_obeyed_on_the_page_it_asked() {
+        let runtime = Runtime::new().expect("a runtime for the test");
+        runtime.block_on(async {
+            // The sender stays alive, so a drain that ignored the answer would hang here
+            // rather than end quietly on a closed queue.
+            let (sender, mut pages) = broadcast::channel::<Page>(4);
+            sender.send(Page::default()).expect("the receiver is alive");
+            sender.send(Page::default()).expect("the receiver is alive");
+
+            let mut received = 0usize;
+            let mut outcome = CrawlOutcome::default();
+            let stopped = drain(
+                &mut pages,
+                &mut |_| {
+                    received += 1;
+                    ControlFlow::Break(())
+                },
+                &mut outcome,
+            )
+            .await;
+
+            assert!(stopped);
+            assert_eq!(received, 1);
+        });
     }
 }

@@ -7,5 +7,7 @@
 mod boundary;
 mod spider_engine;
 
-pub use boundary::{CrawlEngine, CrawlError, CrawlOutcome, PageEvent, Seed};
+pub use boundary::{
+    CrawlEngine, CrawlError, CrawlOutcome, FetchFailure, PageEvent, PageResponse, Seed,
+};
 pub use spider_engine::SpiderEngine;

@@ -7,15 +7,22 @@
 use std::ops::ControlFlow;
 
 use crate::canonical_url::{CanonicalUrl, InvalidCanonicalUrl};
-use crate::crawl::{CrawlEngine, CrawlError, PageEvent, Seed};
+use crate::crawl::{CrawlEngine, CrawlError, FetchFailure, PageEvent, PageResponse, Seed};
 use crate::storage::{Archive, Header, NewCapture, StorageError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
     #[error(transparent)]
     Crawl(#[from] CrawlError),
-    #[error(transparent)]
-    Storage(#[from] StorageError),
+    /// The run is carried out with the error because it is the moment the report matters
+    /// most: the archive holds whatever was written before the disk refused, and a caller
+    /// that only learns the write failed has to go looking for the rest.
+    #[error("{source}")]
+    Storage {
+        #[source]
+        source: StorageError,
+        run: CaptureRun,
+    },
 }
 
 /// A page the crawl fetched and the archive has no address for. It is reported rather than
@@ -27,12 +34,15 @@ pub struct UnaddressablePage {
     pub reason: InvalidCanonicalUrl,
 }
 
-/// What one seed left behind. Every page the engine produced is in exactly one of these
-/// counts, so a run that archived less than expected says where the rest went.
+/// What one seed left behind. Every URL the engine reported is in exactly one of these,
+/// so a run that archived less than expected says where the rest went.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CaptureRun {
     pub captures_written: usize,
     pub unaddressable_pages: Vec<UnaddressablePage>,
+    /// URLs no server answered. They are reported and not stored: there is no response to
+    /// archive, and inventing one would put a status in the record nothing ever sent.
+    pub failed_fetches: Vec<FetchFailure>,
     /// Pages the engine fetched that never reached the archive, straight from the engine.
     pub pages_dropped: usize,
 }
@@ -51,7 +61,15 @@ pub fn capture_seed(
     let mut run = CaptureRun::default();
     let mut write_failure: Option<StorageError> = None;
 
-    let outcome = engine.crawl(seed, &mut |page| {
+    let outcome = engine.crawl(seed, &mut |event| {
+        let page = match event {
+            PageEvent::Response(page) => page,
+            PageEvent::NoResponse(failure) => {
+                run.failed_fetches.push(failure);
+                return ControlFlow::Continue(());
+            }
+        };
+
         // The final URL and not the requested one: after a redirect, the content is at the
         // destination, and filing it under the address that pointed there would give the
         // same page a second identity for every link that reaches it.
@@ -78,14 +96,14 @@ pub fn capture_seed(
         }
     })?;
 
-    if let Some(error) = write_failure {
-        return Err(error.into());
-    }
     run.pages_dropped = outcome.pages_dropped;
+    if let Some(source) = write_failure {
+        return Err(CaptureError::Storage { source, run });
+    }
     Ok(run)
 }
 
-fn new_capture(canonical_url: CanonicalUrl, page: PageEvent) -> NewCapture {
+fn new_capture(canonical_url: CanonicalUrl, page: PageResponse) -> NewCapture {
     let media_type = media_type_of(&page.headers);
     NewCapture {
         canonical_url,
@@ -109,13 +127,11 @@ fn media_type_of(headers: &[Header]) -> Option<String> {
         .iter()
         .find(|header| header.name.eq_ignore_ascii_case("content-type"))
         .map(|header| {
-            header
+            let (media_type, _parameters) = header
                 .value
-                .split(';')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase()
+                .split_once(';')
+                .unwrap_or((header.value.as_str(), ""));
+            media_type.trim().to_ascii_lowercase()
         })
         .filter(|media_type| !media_type.is_empty())
 }
@@ -173,7 +189,7 @@ mod tests {
     }
 
     fn page(url: &str, status: u16, body: &str) -> PageEvent {
-        PageEvent {
+        PageEvent::Response(PageResponse {
             requested_url: url.to_owned(),
             final_url: url.to_owned(),
             status,
@@ -183,6 +199,13 @@ mod tests {
             }],
             body: body.as_bytes().to_vec(),
             fetched_at: "2026-07-25T14:03:22Z".parse().expect("valid timestamp"),
+        })
+    }
+
+    fn response_of(event: &mut PageEvent) -> &mut PageResponse {
+        match event {
+            PageEvent::Response(response) => response,
+            PageEvent::NoResponse(failure) => panic!("expected a response, got {failure:?}"),
         }
     }
 
@@ -293,8 +316,61 @@ mod tests {
         let error = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
             .expect_err("the write fails");
 
-        assert!(matches!(error, CaptureError::Storage(_)));
+        assert!(matches!(error, CaptureError::Storage { .. }));
         assert_eq!(engine.pages_offered(), 1);
+    }
+
+    #[test]
+    fn a_run_cut_short_by_a_failed_write_still_reports_what_it_did() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![
+            page("ftp://example.com/a", 200, "<html>a</html>"),
+            page("https://example.com/b", 200, "<html>b</html>"),
+        ]);
+        // Blocked only after the archive exists, so the first page is refused for its
+        // address and the second one for the disk.
+        std::fs::write(dir.path().join("items"), b"not a directory")
+            .expect("the write target is blocked");
+
+        let error = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect_err("the write fails");
+
+        match error {
+            CaptureError::Storage { run, .. } => {
+                assert_eq!(run.unaddressable_pages.len(), 1);
+                assert_eq!(run.captures_written, 0);
+            }
+            other => panic!("expected a storage failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_url_no_server_answered_is_reported_and_never_archived() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![
+            PageEvent::NoResponse(FetchFailure {
+                url: "https://example.com/unreachable".to_owned(),
+                reason: "error sending request: dns error".to_owned(),
+            }),
+            page("https://example.com/b", 200, "<html>b</html>"),
+        ]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.captures_written, 1);
+        assert_eq!(run.failed_fetches.len(), 1);
+        assert_eq!(run.failed_fetches[0].url, "https://example.com/unreachable");
+        let url = CanonicalUrl::parse("https://example.com/unreachable").expect("valid url");
+        assert!(
+            archive
+                .list_captures(&url)
+                .expect("captures are listed")
+                .is_empty(),
+            "a fetch that reached no server left a record behind"
+        );
     }
 
     #[test]
@@ -338,7 +414,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let archive = archive_in(&dir);
         let mut redirected = page("https://example.com/final", 200, "<html>a</html>");
-        redirected.requested_url = "https://example.com/short-link".to_owned();
+        response_of(&mut redirected).requested_url = "https://example.com/short-link".to_owned();
         let engine = ScriptedCrawlEngine::new(vec![redirected]);
 
         capture_seed(&engine, &archive, &Seed::new("https://example.com/"))

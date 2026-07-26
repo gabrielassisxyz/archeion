@@ -111,5 +111,6 @@
 | A fresh clone runs no git hooks until `bin/install-hooks` is run once. Nothing reports this: commits simply pass ungated. | tripwire | none, it is a clone-time step |
 | `bin/slop-guard`, `scripts/md-unwrap.py`, `bin/worktree`, `bin/install-hooks` and the git hooks are byte-identical copies of a canonical source outside this repo. Fix the original and re-copy; a local edit is drift that the next sync silently reverts. | prose | none |
 | The release matrix names the runner labels `ubuntu-24.04-arm` and `macos-15-intel`. They are unverified until the first tag, and a wrong label fails the job at startup rather than at build time. | tripwire | none until the first release |
+| `br init` appends its own workflow section to this file, describing a setup this repo does not use (it claims the issue database is committed). Remove it with `br agents --remove`, never by hand, or the tool still believes it is installed. | tripwire | none, it fires at `br init` |
 
 **A hurdle promoted to a gate is deleted from this table, not duplicated.** The gate is the instruction; a line here restating it only dilutes the ones still unguarded.

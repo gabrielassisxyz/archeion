@@ -1,0 +1,23 @@
+name: Feature request
+description: Something the archive should be able to do and cannot
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you were trying to archive or retrieve, and where it broke down. Describe the situation, not the implementation you have in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would expect
+      description: Optional. If you already have a shape in mind, it helps to see it.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: I read ROADMAP.md and this is not listed as out of scope.
+          required: true

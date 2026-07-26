@@ -1,0 +1,32 @@
+name: Bug report
+description: Something behaves differently from what it says it does
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The exact command, and the URL or seed file if a capture is involved. A public URL that reproduces it is worth more than a description of one.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `archeion --version`, or the commit if built from source.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Operating system and architecture.
+    validations:
+      required: true

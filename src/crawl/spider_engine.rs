@@ -16,6 +16,7 @@ use std::sync::Once;
 use std::time::Duration;
 
 use jiff::Timestamp;
+use spider::configuration::RedirectPolicy;
 use spider::page::Page;
 use spider::reqwest::header::{CONTENT_LENGTH, HeaderMap};
 use spider::tokio::runtime::Runtime;
@@ -53,6 +54,9 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// The engine reads its byte ceiling from here and from nowhere else on the plain HTTP
 /// path: both of its configurable byte limits are browser-only.
 const RESPONSE_BYTE_CEILING: &str = "SPIDER_MAX_SIZE_BYTES";
+
+/// How long a redirect chain may get before the URL is abandoned.
+const MAX_REDIRECTS: usize = 7;
 
 pub struct SpiderEngine;
 
@@ -252,6 +256,16 @@ fn configured_website(start: &str, seed: &Seed) -> Website {
         // attempts it waits the longer of an exponential backoff and what the response
         // asked for, which for a 429 is its `Retry-After`. The default is no retry at all.
         .with_retry(seed.max_retries)
+        // A seed is one host, and identity comes from where the content ended up, so a
+        // redirect off that host files a page under an address the run was never pointed
+        // at. Under this policy a hop that leaves the seed's host is not followed: the
+        // redirect itself is archived, which is the honest record of what the host said.
+        // Every hop is screened for internal addresses under it, as under the looser one.
+        .with_redirect_policy(RedirectPolicy::Strict)
+        // A chain has to end somewhere, and a loop that ends by exhausting the crawl's
+        // budget spends the whole seed on one URL. Seven is the engine's own number, set
+        // here so it is a decision this file made rather than a default it inherited.
+        .with_redirect_limit(MAX_REDIRECTS)
         .with_respect_robots_txt(true)
         // A seed is a site, not a company: subdomains and other TLDs of the same name are
         // separate archives to ask for, not ones to acquire by accident.
@@ -870,5 +884,22 @@ mod tests {
             website.configuration.http_first_byte_timeout, None,
             "the watchdog that invents a status is on"
         );
+    }
+
+    /// A redirect is the one hop the seed guard never sees, and the engine screens it only
+    /// under a policy that says to. Which policy is in force is therefore the whole guard
+    /// on that side, and losing it looks like nothing at all from here: the crawl still
+    /// runs, the pages still arrive, and a hop into the metadata service is followed.
+    #[test]
+    fn a_redirect_is_screened_and_bounded_rather_than_followed_wherever_it_leads() {
+        let website =
+            configured_website("https://example.com/", &Seed::new("https://example.com/"));
+
+        assert_eq!(
+            website.configuration.redirect_policy,
+            RedirectPolicy::Strict,
+            "a redirect off the seed's host would be followed and archived under it"
+        );
+        assert_eq!(website.configuration.redirect_limit, MAX_REDIRECTS);
     }
 }

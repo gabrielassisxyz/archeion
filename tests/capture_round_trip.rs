@@ -3,6 +3,7 @@
 //! opens the directory in ten years, so the layout is asserted here and not just described.
 
 use archeion::CanonicalUrl;
+use archeion::metadata::{self, PageMetadata, PageSource};
 use archeion::storage::{Archive, ContentHash, Header, ItemId, NewAsset, NewCapture, StorageError};
 use jiff::Timestamp;
 use tempfile::TempDir;
@@ -491,6 +492,119 @@ fn an_address_host_lands_in_a_directory_a_filesystem_accepts() {
             .join("item.json")
             .is_file()
     );
+}
+
+/// The derived layer is a separate file on purpose: what was observed and what was made of
+/// it have different lifetimes, and only the first of the two is irreplaceable.
+#[test]
+fn what_was_read_out_of_a_page_is_stored_beside_it_and_not_inside_it() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+    let capture = archive
+        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .expect("capture is stored");
+
+    let extracted = extracted_from(PAGE);
+    archive
+        .write_metadata(&url, &capture.id, &extracted)
+        .expect("metadata is stored");
+
+    assert_eq!(
+        archive.read_metadata(&url, &capture.id).expect("read back"),
+        Some(extracted)
+    );
+    assert!(metadata_file(dir.path(), &url, &capture.id).is_file());
+    // The record of the fetch says exactly what it said before anything was derived from it.
+    assert_eq!(
+        archive.read_capture(&url, &capture.id).expect("capture"),
+        capture
+    );
+}
+
+#[test]
+fn a_derived_record_is_not_mistaken_for_a_capture() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+    let capture = archive
+        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .expect("capture is stored");
+
+    archive
+        .write_metadata(&url, &capture.id, &extracted_from(PAGE))
+        .expect("metadata is stored");
+
+    assert_eq!(
+        archive.list_captures(&url).expect("captures are listed"),
+        [capture.id]
+    );
+}
+
+#[test]
+fn a_capture_nothing_was_read_out_of_is_not_a_broken_archive() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+    let capture = archive
+        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .expect("capture is stored");
+
+    assert_eq!(
+        archive
+            .read_metadata(&url, &capture.id)
+            .expect("an absent reading is not an error"),
+        None
+    );
+}
+
+#[test]
+fn a_derived_record_edited_to_hold_something_else_is_refused() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+    let capture = archive
+        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .expect("capture is stored");
+    archive
+        .write_metadata(&url, &capture.id, &extracted_from(PAGE))
+        .expect("metadata is stored");
+
+    // Derived or not, a file read back off disk is input from outside this process.
+    let path = metadata_file(dir.path(), &url, &capture.id);
+    let record = std::fs::read_to_string(&path).expect("read record");
+    std::fs::write(
+        &path,
+        record.replace("\"extractor_version\": 1", "\"extractor_version\": []"),
+    )
+    .expect("write record");
+
+    assert!(matches!(
+        archive.read_metadata(&url, &capture.id),
+        Err(StorageError::MalformedRecord { .. })
+    ));
+}
+
+fn extracted_from(body: &[u8]) -> PageMetadata {
+    metadata::extract(PageSource {
+        body,
+        content_type: Some("text/html; charset=utf-8"),
+        final_url: "https://example.com/a-page",
+    })
+    .expect("the page is readable")
+    .expect("the page is html")
+}
+
+fn metadata_file(
+    root: &std::path::Path,
+    url: &CanonicalUrl,
+    capture: &archeion::storage::CaptureId,
+) -> std::path::PathBuf {
+    root.join("items")
+        .join(url.host_dir())
+        .join(ItemId::of(url).as_str())
+        .join("captures")
+        .join(format!("{capture}.metadata.json"))
 }
 
 fn capture_file(

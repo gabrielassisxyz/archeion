@@ -16,6 +16,7 @@ use serde::de::DeserializeOwned;
 
 use super::model::{Asset, Capture, CaptureId, ContentHash, Item, ItemId, NewCapture, StoredBody};
 use crate::canonical_url::CanonicalUrl;
+use crate::metadata::PageMetadata;
 
 const MARKER_FILE: &str = "archeion.json";
 const FORMAT_NAME: &str = "archeion-archive";
@@ -150,6 +151,39 @@ impl Archive {
         Ok(capture)
     }
 
+    /// Stores what was extracted from a capture, beside it rather than inside it.
+    ///
+    /// The capture record is what the archive observed and the only thing that cannot be
+    /// recovered; this is a reading of it, and a better extractor will want to replace it.
+    /// Keeping the two in separate files is what lets that later pass rewrite every
+    /// derived file in the archive without touching a single recorded one, and what makes
+    /// deleting the whole derived layer a safe thing to do.
+    ///
+    /// It is written after the capture for the same reason bodies are written before
+    /// records: a run cut short then leaves a capture with no reading of it, which the next
+    /// pass can produce, rather than a reading of a capture that was never stored.
+    pub fn write_metadata(
+        &self,
+        url: &CanonicalUrl,
+        capture: &CaptureId,
+        metadata: &PageMetadata,
+    ) -> Result<(), StorageError> {
+        write_json(&self.metadata_path(url, capture), metadata)
+    }
+
+    /// What was extracted from a capture, or `None`.
+    ///
+    /// Absent is an ordinary answer and not a broken archive: a capture of an image has
+    /// nothing to extract, one written before this existed has nothing stored, and a
+    /// derived file that was deliberately deleted is meant to be regenerated.
+    pub fn read_metadata(
+        &self,
+        url: &CanonicalUrl,
+        capture: &CaptureId,
+    ) -> Result<Option<PageMetadata>, StorageError> {
+        read_optional_json(&self.metadata_path(url, capture))
+    }
+
     pub fn read_item(&self, url: &CanonicalUrl) -> Result<Item, StorageError> {
         read_optional_json(&self.item_path(url))?.ok_or_else(|| StorageError::NoSuchItem {
             url: url.to_string(),
@@ -267,6 +301,16 @@ impl Archive {
         self.item_dir(url)
             .join("captures")
             .join(format!("{capture}.json"))
+    }
+
+    /// Beside the capture and named after it, so the pair is obvious in a directory listing
+    /// and neither has to be found through the other. The extra suffix is also what keeps
+    /// `list_captures` from reading a derived file as a capture: the stem it would parse is
+    /// no longer the shape of a capture id.
+    fn metadata_path(&self, url: &CanonicalUrl, capture: &CaptureId) -> PathBuf {
+        self.item_dir(url)
+            .join("captures")
+            .join(format!("{capture}.metadata.json"))
     }
 
     fn body_path(&self, hash: &ContentHash) -> PathBuf {

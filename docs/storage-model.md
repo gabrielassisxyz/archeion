@@ -22,6 +22,7 @@ An asset is stored inside its capture record rather than as a record of its own.
   blobs/sha256/<ab>/<cd>/<hash>                     response bodies, addressed by content
   items/<host>/<item-id>/item.json                  one item
   items/<host>/<item-id>/captures/<capture-id>.json one fetch of it
+  items/<host>/<item-id>/captures/<capture-id>.metadata.json  what was read out of that fetch
 ```
 
 A real archive holding a single capture of one page, with one stylesheet as its asset:
@@ -110,6 +111,14 @@ Both ends of that window widen as captures arrive, rather than only the last one
 
 Records are JSON, pretty printed. The format costs some bytes against the raw bodies it sits beside, and buys a file that `diff` and `grep` can work with and that any language will still parse in twenty years.
 
+### The derived record
+
+Beside each capture there may be a `<capture-id>.metadata.json`, holding what was read out of that response: its title, its author, its date, the tags behind them, its outbound links and the subresources it referenced. [`metadata-extraction.md`](metadata-extraction.md) has the fields and the rules.
+
+It is a separate file because the two have different lifetimes. The capture record is what the archive observed and is the part that cannot be recovered; this is a reading of it, and a better extractor is expected to replace every one of these without touching a single recorded file. A capture with no derived file beside it is an ordinary state: the response may not be a page at all, or nothing has read it yet.
+
+Its presence changes nothing else in this layout. Reading an archive that has none works exactly as before, the format version does not move, and the listing that walks an item's captures still sees captures, because the extra suffix keeps the file stem from being the shape of a capture id.
+
 ## Writing
 
 Two properties matter more than throughput, since a capture is cheap and re-fetching it may be impossible.
@@ -133,7 +142,7 @@ The alternative, holding the records in SQLite and keeping only blobs on disk, w
 ## What was deliberately left out
 
 - **The redirect chain.** `requested_url` and `final_url` already record that a redirect happened. The intermediate hops matter for the fetch policy work, which is where the field will be added when there is something to write into it.
-- **Extracted metadata, readability text and an item-level tag set.** All derived from bodies that are already stored, and all cheaper to add once the extraction that produces them exists.
+- **Readability text and an item-level tag set.** Both derived from bodies that are already stored, and both cheaper to add once the extraction that produces them exists. Extracted metadata was the first of these to arrive: it is a file of its own beside each capture, and [`metadata-extraction.md`](metadata-extraction.md) has why it is not a field on the capture record.
 - **Deleting anything.** Nothing in this layer removes a capture or reclaims an unreferenced blob. A retention policy is a decision about what an archive is allowed to forget, which deserves its own design rather than a default.
 
 ## The format version

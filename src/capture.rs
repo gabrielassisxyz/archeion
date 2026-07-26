@@ -12,6 +12,7 @@ use crate::crawl::{
     CrawlEngine, CrawlError, CrawlStop, FetchFailure, PageEvent, PageResponse, Seed,
     points_inside_a_network,
 };
+use crate::metadata::{self, PageMetadata, PageSource, UnreadablePage};
 use crate::storage::{Archive, Header, NewCapture, StorageError};
 
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +56,10 @@ pub struct CaptureRun {
     /// URLs no server answered. They are reported and not stored: there is no response to
     /// archive, and inventing one would put a status in the record nothing ever sent.
     pub failed_fetches: Vec<FetchFailure>,
+    /// Pages that were stored whole and whose markup the extractor could not read. Only the
+    /// derived reading is missing, so the run goes on: the response is in the archive, and
+    /// a later pass can read it again without fetching anything.
+    pub unreadable_pages: Vec<UnreadablePage>,
     /// Pages the engine fetched that never reached the archive, straight from the engine.
     pub pages_dropped: usize,
     /// Why the run ended. A run that stopped at its deadline archived a prefix of a site
@@ -175,14 +180,43 @@ fn capture_page(
         }
     };
 
-    match archive.write_capture(new_capture(canonical, page)) {
-        Ok(_) => {
-            run.captures_written += 1;
-            ControlFlow::Continue(())
-        }
+    // Read before the capture is written, because the bytes are still in hand, and stored
+    // after, because the response is what cannot be recovered: a run cut short then leaves
+    // a capture with no reading of it, which a later pass can produce on its own.
+    let extracted = read_page(&page, run);
+    let capture = match archive.write_capture(new_capture(canonical.clone(), page)) {
+        Ok(capture) => capture,
         Err(error) => {
             *write_failure = Some(error);
-            ControlFlow::Break(())
+            return ControlFlow::Break(());
+        }
+    };
+    run.captures_written += 1;
+
+    if let Some(metadata) = extracted
+        && let Err(error) = archive.write_metadata(&canonical, &capture.id, &metadata)
+    {
+        *write_failure = Some(error);
+        return ControlFlow::Break(());
+    }
+    ControlFlow::Continue(())
+}
+
+/// Reads what the page says about itself, or reports that it could not be read.
+///
+/// A page the parser gives up on is not a failed capture. The response was fetched and is
+/// about to be stored whole, and the only thing missing is a reading of it that costs
+/// nothing to redo later, so the run keeps going and says which page it was.
+fn read_page(page: &PageResponse, run: &mut CaptureRun) -> Option<PageMetadata> {
+    match metadata::extract(PageSource {
+        body: &page.body,
+        content_type: content_type_of(&page.headers),
+        final_url: &page.final_url,
+    }) {
+        Ok(extracted) => extracted,
+        Err(unreadable) => {
+            run.unreadable_pages.push(unreadable);
+            None
         }
     }
 }
@@ -208,17 +242,20 @@ fn new_capture(canonical_url: CanonicalUrl, page: PageResponse) -> NewCapture {
 /// Nothing is lost by narrowing it, since the header survives verbatim in the record, and
 /// the field then holds what its name promises instead of a string every reader re-parses.
 fn media_type_of(headers: &[Header]) -> Option<String> {
-    headers
-        .iter()
-        .find(|header| header.name.eq_ignore_ascii_case("content-type"))
-        .map(|header| {
-            let (media_type, _parameters) = header
-                .value
-                .split_once(';')
-                .unwrap_or((header.value.as_str(), ""));
+    content_type_of(headers)
+        .map(|content_type| {
+            let (media_type, _parameters) =
+                content_type.split_once(';').unwrap_or((content_type, ""));
             media_type.trim().to_ascii_lowercase()
         })
         .filter(|media_type| !media_type.is_empty())
+}
+
+fn content_type_of(headers: &[Header]) -> Option<&str> {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("content-type"))
+        .map(|header| header.value.as_str())
 }
 
 #[cfg(test)]
@@ -298,6 +335,99 @@ mod tests {
 
     fn archive_in(dir: &TempDir) -> Archive {
         Archive::open(dir.path()).expect("archive opens in an empty directory")
+    }
+
+    #[test]
+    fn a_page_is_archived_with_a_reading_of_it_beside_the_capture() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/a",
+            200,
+            r#"<html><head><title>A page</title></head>
+               <body><a href="/b">b</a></body></html>"#,
+        )]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.captures_written, 1);
+        assert!(run.unreadable_pages.is_empty());
+        let url = CanonicalUrl::parse("https://example.com/a").expect("valid url");
+        let captures = archive.list_captures(&url).expect("captures are listed");
+        let metadata = archive
+            .read_metadata(&url, &captures[0])
+            .expect("the reading is stored")
+            .expect("a page has a reading");
+
+        assert_eq!(metadata.title.expect("a title").value, "A page");
+        assert_eq!(metadata.links[0].url, "https://example.com/b");
+    }
+
+    /// The archive keeps whatever answered, and most of what answers a crawl is not a page.
+    /// A capture with nothing to read is the ordinary case, not a failure to record.
+    #[test]
+    fn a_capture_that_is_not_a_page_gets_no_reading_and_no_complaint() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut event = page(
+            "https://example.com/logo.png",
+            200,
+            "<html>not markup</html>",
+        );
+        response_of(&mut event).headers = vec![Header {
+            name: "content-type".to_owned(),
+            value: "image/png".to_owned(),
+        }];
+        let engine = ScriptedCrawlEngine::new(vec![event]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.captures_written, 1);
+        assert!(run.unreadable_pages.is_empty());
+        let url = CanonicalUrl::parse("https://example.com/logo.png").expect("valid url");
+        let captures = archive.list_captures(&url).expect("captures are listed");
+        assert_eq!(
+            archive
+                .read_metadata(&url, &captures[0])
+                .expect("no reading is not an error"),
+            None
+        );
+    }
+
+    /// The response is the part that cannot be fetched again, so a page whose encoding the
+    /// extractor has to work out is still archived byte for byte, and the reading of it is
+    /// what has to cope.
+    #[test]
+    fn a_page_in_a_legacy_encoding_is_stored_verbatim_and_read_correctly() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let body = b"<html><head><title>caf\xe9</title></head></html>".to_vec();
+        let mut event = page("https://example.com/a", 200, "");
+        let response = response_of(&mut event);
+        response.body = body.clone();
+        response.headers = vec![Header {
+            name: "content-type".to_owned(),
+            value: "text/html; charset=windows-1252".to_owned(),
+        }];
+        let engine = ScriptedCrawlEngine::new(vec![event]);
+
+        capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        let url = CanonicalUrl::parse("https://example.com/a").expect("valid url");
+        let captures = archive.list_captures(&url).expect("captures are listed");
+        let capture = archive
+            .read_capture(&url, &captures[0])
+            .expect("the capture reads back");
+        let metadata = archive
+            .read_metadata(&url, &captures[0])
+            .expect("the reading is stored")
+            .expect("a page has a reading");
+
+        assert_eq!(archive.read_body(&capture.body.sha256).expect("body"), body);
+        assert_eq!(metadata.title.expect("a title").value, "café");
     }
 
     #[test]

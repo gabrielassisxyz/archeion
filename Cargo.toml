@@ -11,7 +11,17 @@ keywords = ["archive", "crawler", "metadata", "local-first"]
 categories = ["command-line-utilities"]
 
 [dependencies]
+# Decoding a page's bytes is a separate decision from parsing its markup, so the encoding
+# rules live here rather than being delegated to whatever the parser happens to implement.
+# That also keeps a page in an encoding the streaming parser refuses outright, UTF-16 among
+# them, readable for metadata.
+encoding_rs = "0.8.35"
 jiff = { version = "0.2.35", default-features = false, features = ["std", "serde"] }
+# A streaming rewriter rather than a DOM, used here only to read. Everything metadata
+# extraction looks at is a tag and an attribute, and a page arriving from the open web is
+# hostile input whose parse must stay bounded: this one never holds more of the document
+# than the token it is on, while a tree would cost the whole page in memory.
+lol_html = "2.9"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"

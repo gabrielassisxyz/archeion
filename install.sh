@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # Install the archeion binary from a GitHub release.
 #
-#   curl -sSfL https://raw.githubusercontent.com/gabrielassisxyz/archeion/master/install.sh | sh
+#   curl -sSfL https://raw.githubusercontent.com/gabrielassisxyz/archeion/main/install.sh | sh
 #
 # Env: ARCHEION_VERSION (default: latest), ARCHEION_INSTALL_DIR (default: ~/.local/bin).
 # POSIX sh on purpose: the machine being installed to is not guaranteed to have bash.

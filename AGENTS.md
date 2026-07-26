@@ -62,7 +62,7 @@
 
 - Before any commit, show `git status` and `git diff --cached`, and confirm no secret is staged. If you spot one, STOP and report it. The gitleaks pre-commit hook is the deterministic backstop; this habit is the probabilistic one.
 - Real secrets stay out of git. Only an `.env.example` with fake values is committed.
-- The default branch is `master`. Never commit to it directly: branch, then open a pull request.
+- The default branch is `main`. Never commit to it directly: branch, then open a pull request.
 
 ## Tests (TDD)
 
@@ -73,7 +73,7 @@
 
 ## Small releases
 
-- Every commit on `master` passes `bin/ci` and is releasable. No "broken commit I fix in the next one".
+- Every commit on `main` passes `bin/ci` and is releasable. No "broken commit I fix in the next one".
 - Closed work is committed before switching tasks. Flag it when it has not been.
 
 ## Security (habit, not a phase)
@@ -93,7 +93,7 @@
 
 ## Release
 
-- A release is cut by tagging `vX.Y.Z` on `master`. The release workflow builds the Linux and macOS matrix, publishes one checksum per asset plus `checksums.txt`, and creates the GitHub Release.
+- A release is cut by tagging `vX.Y.Z` on `main`. The release workflow builds the Linux and macOS matrix, publishes one checksum per asset plus `checksums.txt`, and creates the GitHub Release.
 - `install.sh` maps `uname` output onto the asset names in that matrix. Adding or renaming a target means updating both, or the installer asks for an asset that does not exist.
 - Before tagging: `bin/ci` green, the version in `Cargo.toml` and the tag agree, `Cargo.lock` committed.
 

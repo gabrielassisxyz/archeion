@@ -13,7 +13,7 @@ Early, and honest about it: there is no usable command yet. The crawl engine has
 Every tagged release publishes prebuilt binaries for Linux and macOS, on x86-64 and arm64, with a SHA-256 checksum per asset.
 
 ```sh
-curl -sSfL https://raw.githubusercontent.com/gabrielassisxyz/archeion/master/install.sh | sh
+curl -sSfL https://raw.githubusercontent.com/gabrielassisxyz/archeion/main/install.sh | sh
 ```
 
 The installer verifies the published checksum before writing to `~/.local/bin`. Set `ARCHEION_INSTALL_DIR` to install elsewhere, or `ARCHEION_VERSION=vX.Y.Z` to pin a version instead of taking the latest.

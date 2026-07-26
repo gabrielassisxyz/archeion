@@ -13,22 +13,43 @@ use jiff::Timestamp;
 use crate::storage::Header;
 
 /// Where a crawl starts and the limits it has to stay inside.
+///
+/// A seed is one host: subdomains and other TLDs of the same name are separate seeds, so
+/// the budget one seed gets is also the budget that host gets. There is no second, narrower
+/// per-domain knob because there is no second domain for it to apply to.
 #[derive(Debug, Clone)]
 pub struct Seed {
     pub url: String,
     pub max_pages: u32,
     pub max_depth: usize,
     pub concurrency: usize,
-    /// How long to wait between requests, which is the only politeness knob here: a slow
-    /// domain still consumes a whole run, and stopping that is the execution policy the
-    /// archive owns rather than a limit passed to an engine.
+    /// How long to wait between requests, which is the politeness knob rather than a limit:
+    /// raising it slows the crawl down without bounding it.
     pub delay: Duration,
+    /// The wall clock the whole crawl has. It bounds fetching, not the writing of what was
+    /// already fetched: pages sitting in the queue when it expires are still archived,
+    /// because they cost their bytes already and a local write is not what ran out.
+    ///
+    /// `None` is a run that is deliberately unbounded, which is a decision to make on
+    /// purpose rather than one to reach by leaving a field alone.
+    pub deadline: Option<Duration>,
+    /// How long one request may take before it counts as no response at all. Unlike the
+    /// deadline this has no way to be turned off: a request with no ceiling holds one of
+    /// `concurrency` slots for as long as a server feels like holding it open, and nothing
+    /// in the record would say the run was one slot narrower for the rest of its life.
+    pub request_timeout: Duration,
+    /// How many times a request that failed in a way worth repeating is repeated. What is
+    /// worth repeating and how long to wait between attempts belongs to the engine, since
+    /// it is the only thing that can fetch again; how much of the budget to spend on it is
+    /// the archive's call and lives here.
+    pub max_retries: u8,
 }
 
 impl Seed {
-    /// The defaults are the settings the engine comparison ran under. They are a starting
-    /// point that produced a known result, not a recommendation: the comparison also
-    /// showed a per-page limit is not by itself an execution policy.
+    /// The page count, depth, concurrency and delay are the settings the engine comparison
+    /// ran under, so a run started with them produces a known result. The rest is the
+    /// policy that comparison showed was missing: one of its domains spent 402 seconds of a
+    /// 573 second run, which a per-page limit did nothing about.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -36,8 +57,33 @@ impl Seed {
             max_depth: 2,
             concurrency: 16,
             delay: Duration::ZERO,
+            // Under the deadline the run that went wrong would have been cut with two
+            // thirds of its pages already archived, instead of owning the whole afternoon.
+            deadline: Some(Duration::from_secs(300)),
+            // The engine's own default is 120 seconds, which at the default concurrency is
+            // one dead connection holding a sixteenth of the run for a third of its
+            // deadline. Thirty seconds is long for a page and short against the budget.
+            request_timeout: Duration::from_secs(30),
+            // This number multiplies the one above: a URL that keeps timing out is paid for
+            // once per attempt, so the ceiling for a single dead URL is ninety seconds and
+            // the backoff between them, not thirty. Two is what keeps that under a third of
+            // the deadline while still giving a 429 somewhere to land.
+            max_retries: 2,
         }
     }
+}
+
+/// Why a crawl ended. A run that archived less than expected says which of these it was,
+/// rather than leaving a page count to be compared against an expectation nobody wrote down.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CrawlStop {
+    /// Nothing was left to fetch inside the seed's limits.
+    #[default]
+    Exhausted,
+    /// The seed's wall-clock budget ran out and the rest of the crawl was cancelled.
+    DeadlineReached,
+    /// The caller asked to stop, on a page it was handed.
+    CallerStopped,
 }
 
 /// What a crawl produced for one URL: a response, or the report that there was none.
@@ -87,6 +133,7 @@ pub struct CrawlOutcome {
     /// Pages the engine fetched and the archive never saw, because it could not keep up
     /// with them. Bytes were spent on those fetches and nothing was kept.
     pub pages_dropped: usize,
+    pub stopped: CrawlStop,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -109,8 +156,15 @@ pub enum CrawlError {
 /// would let the dependency dictate the shape of everything above it.
 ///
 /// `on_page` answers with a `ControlFlow` because the caller is the one that knows when
-/// continuing is pointless. A failed write to the archive is the case that exists today:
-/// the next two hundred pages will fail the same way, so the crawl stops on the first.
+/// continuing is pointless. A failed write to the archive is one case: the next two hundred
+/// pages will fail the same way, so the crawl stops on the first.
+///
+/// Enforcing `Seed::deadline` is the engine's job, and it is not optional: an engine that
+/// stalls with nothing to report never calls `on_page` at all, so nothing above this line
+/// gets a turn to end it. What an engine is expected to do when the budget expires is stop
+/// fetching, hand over what it already fetched, and answer `CrawlStop::DeadlineReached`. The
+/// caller keeps a backstop for an engine that ignores the field, but it fires a good margin
+/// after the budget, precisely so that handover is never the thing it cuts short.
 pub trait CrawlEngine {
     fn crawl(
         &self,

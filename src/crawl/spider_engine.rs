@@ -9,19 +9,21 @@
 //! is confined to this file. `docs/crawl-boundary.md` has the reasoning and what a second
 //! adapter would have to provide.
 
+use std::future::Future;
 use std::ops::ControlFlow;
+use std::time::Duration;
 
 use jiff::Timestamp;
 use spider::page::Page;
 use spider::reqwest::header::HeaderMap;
 use spider::tokio::runtime::Runtime;
 use spider::tokio::sync::broadcast::Receiver;
-use spider::tokio::sync::broadcast::error::RecvError;
+use spider::tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use spider::website::Website;
 use url::Url;
 
 use super::boundary::{
-    CrawlEngine, CrawlError, CrawlOutcome, FetchFailure, PageEvent, PageResponse, Seed,
+    CrawlEngine, CrawlError, CrawlOutcome, CrawlStop, FetchFailure, PageEvent, PageResponse, Seed,
 };
 use crate::storage::Header;
 
@@ -60,29 +62,66 @@ async fn crawl_seed(
     let mut pages = website.subscribe(fetch_concurrency(seed) * 4);
     let mut outcome = CrawlOutcome::default();
 
-    let crawl = async {
-        website.crawl().await;
-        // Drops the sender, which is what ends the drain below once it is empty.
-        website.unsubscribe();
+    // Scoped so the borrow of the website ends with the crawl it was driving.
+    let mut stopped = {
+        let crawl = async {
+            website.crawl().await;
+            // Drops the sender, which is what ends the drain below once it is empty.
+            website.unsubscribe();
+        };
+        crawl_until(crawl, seed.deadline, &mut pages, on_page, &mut outcome).await
     };
 
-    let stopped_by_caller = spider::tokio::select! {
-        () = crawl => false,
-        stopped = drain(&mut pages, on_page, &mut outcome) => stopped,
-    };
-
-    // The crawl finishing does not mean the queue is empty, and cancelling the drain to
-    // learn that would throw away pages already fetched. Only a caller that asked to stop
-    // leaves the rest unread, and what it leaves is counted like any other loss: those
-    // pages cost a fetch each and the archive does not have them. The count is a floor,
-    // since a task still in flight can queue another page after the length is read.
-    if stopped_by_caller {
-        outcome.pages_dropped += pages.len();
-    } else {
-        drain(&mut pages, on_page, &mut outcome).await;
+    match stopped {
+        // The crawl finishing does not mean the queue is empty, and cancelling the drain to
+        // learn that would throw away pages already fetched.
+        CrawlStop::Exhausted => {
+            if drain(&mut pages, on_page, &mut outcome).await {
+                outcome.pages_dropped += pages.len();
+                stopped = CrawlStop::CallerStopped;
+            }
+        }
+        // What the caller leaves unread is counted like any other loss: those pages cost a
+        // fetch each and the archive does not have them. The count is a floor, since a task
+        // still in flight can queue another page after the length is read.
+        CrawlStop::CallerStopped => outcome.pages_dropped += pages.len(),
+        CrawlStop::DeadlineReached => drain_queued(&mut pages, on_page, &mut outcome),
     }
 
+    outcome.stopped = stopped;
     outcome
+}
+
+/// Runs a crawl against the caller and the clock, and answers which of the three ended it.
+///
+/// The crawl arrives as a future rather than as a website because this is the only place a
+/// deadline is enforced, and a deadline that can only be exercised by crawling something is
+/// a deadline nothing headless can prove. Given a future that never finishes, this is the
+/// stalled host the deadline exists for.
+async fn crawl_until(
+    crawl: impl Future<Output = ()>,
+    deadline: Option<Duration>,
+    pages: &mut Receiver<Page>,
+    on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
+    outcome: &mut CrawlOutcome,
+) -> CrawlStop {
+    spider::tokio::select! {
+        () = crawl => CrawlStop::Exhausted,
+        () = budget_spent(deadline) => CrawlStop::DeadlineReached,
+        stopped = drain(pages, on_page, outcome) => {
+            if stopped { CrawlStop::CallerStopped } else { CrawlStop::Exhausted }
+        }
+    }
+}
+
+/// Completes when the seed's budget is gone, and never when it has none. A branch that
+/// answered straight away for a seed without a deadline would end every unbounded crawl on
+/// its first poll.
+async fn budget_spent(deadline: Option<Duration>) {
+    match deadline {
+        Some(budget) => spider::tokio::time::sleep(budget).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Hands pages to the caller until the queue closes. Answers whether the caller asked to
@@ -110,6 +149,32 @@ async fn drain(
     }
 }
 
+/// Hands over what is already queued and stops there, without waiting for the queue to
+/// close. Those pages were paid for before the budget ran out and writing them is local
+/// work, but a cancelled crawl leaves senders in tasks that are still winding down: waiting
+/// for the queue to close would hand the end of the run back to the thing the deadline just
+/// took it from. What the caller does not read is counted, as everywhere else.
+fn drain_queued(
+    pages: &mut Receiver<Page>,
+    on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
+    outcome: &mut CrawlOutcome,
+) {
+    loop {
+        match pages.try_recv() {
+            Ok(page) => {
+                if on_page(page_event(page)).is_break() {
+                    outcome.pages_dropped += pages.len();
+                    return;
+                }
+            }
+            Err(TryRecvError::Lagged(lost)) => {
+                outcome.pages_dropped += usize::try_from(lost).unwrap_or(usize::MAX);
+            }
+            Err(TryRecvError::Empty | TryRecvError::Closed) => return,
+        }
+    }
+}
+
 /// Zero permits is a crawl that waits forever on its own semaphore, with no page to stop it
 /// through and no deadline to end it, so a zero is corrected rather than obeyed. It is read
 /// through here and not at the call sites, which is what keeps the queue sized against the
@@ -125,6 +190,16 @@ fn configured_website(start: &str, seed: &Seed) -> Website {
         .with_depth(seed.max_depth)
         .with_concurrency_limit(Some(fetch_concurrency(seed)))
         .with_delay(u64::try_from(seed.delay.as_millis()).unwrap_or(u64::MAX))
+        // A ceiling on one request, not on the crawl. It reaches the HTTP client, so a
+        // request that outlives it is cancelled and reported as the failure it was, with no
+        // status invented for it. The engine's own default is 120 seconds.
+        .with_request_timeout(Some(seed.request_timeout))
+        // The engine repeats a request whose status says repeating might work, which is a
+        // 429, a 408 or a server error other than 501, 505 and 511, and never a DNS failure
+        // or a redirect loop, since none of those answer differently the second time. Between
+        // attempts it waits the longer of an exponential backoff and what the response
+        // asked for, which for a 429 is its `Retry-After`. The default is no retry at all.
+        .with_retry(seed.max_retries)
         .with_respect_robots_txt(true)
         // A seed is a site, not a company: subdomains and other TLDs of the same name are
         // separate archives to ask for, not ones to acquire by accident.
@@ -213,8 +288,6 @@ fn usable_seed_url(url: &str) -> Result<String, CrawlError> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use spider::tokio::sync::broadcast;
 
     use super::*;
@@ -375,5 +448,149 @@ mod tests {
             assert!(stopped);
             assert_eq!(received, 1);
         });
+    }
+
+    /// The run this whole policy exists for: a host that accepts the connection and then
+    /// says nothing. There is no page to hand over, so nothing but the clock can end it.
+    #[test]
+    fn a_crawl_that_produces_nothing_ends_when_the_seed_budget_does() {
+        let runtime = Runtime::new().expect("a runtime for the test");
+        runtime.block_on(async {
+            // The sender stays alive throughout, which is what a stalled crawl looks like
+            // from here: the queue never closes on its own.
+            let (_sender, mut pages) = broadcast::channel::<Page>(4);
+            let mut outcome = CrawlOutcome::default();
+
+            let stop = spider::tokio::time::timeout(
+                Duration::from_secs(5),
+                crawl_until(
+                    std::future::pending::<()>(),
+                    Some(Duration::from_millis(50)),
+                    &mut pages,
+                    &mut |_| ControlFlow::Continue(()),
+                    &mut outcome,
+                ),
+            )
+            .await
+            .expect("the crawl ended at its deadline instead of waiting on the host");
+
+            assert_eq!(stop, CrawlStop::DeadlineReached);
+        });
+    }
+
+    #[test]
+    fn a_crawl_that_finishes_inside_its_budget_is_not_reported_as_cut_short() {
+        let runtime = Runtime::new().expect("a runtime for the test");
+        runtime.block_on(async {
+            let (_sender, mut pages) = broadcast::channel::<Page>(4);
+            let mut outcome = CrawlOutcome::default();
+
+            let stop = crawl_until(
+                std::future::ready(()),
+                Some(Duration::from_secs(300)),
+                &mut pages,
+                &mut |_| ControlFlow::Continue(()),
+                &mut outcome,
+            )
+            .await;
+
+            assert_eq!(stop, CrawlStop::Exhausted);
+        });
+    }
+
+    /// A seed with no deadline has no timer, and the branch that would carry one has to stay
+    /// pending forever rather than answer at once: an eager `None` would end every unbounded
+    /// crawl on its first poll, which is the opposite of what it asked for.
+    #[test]
+    fn a_seed_with_no_deadline_is_not_cut_immediately() {
+        let runtime = Runtime::new().expect("a runtime for the test");
+        runtime.block_on(async {
+            let (_sender, mut pages) = broadcast::channel::<Page>(4);
+            let mut outcome = CrawlOutcome::default();
+
+            let stop = crawl_until(
+                spider::tokio::time::sleep(Duration::from_millis(20)),
+                None,
+                &mut pages,
+                &mut |_| ControlFlow::Continue(()),
+                &mut outcome,
+            )
+            .await;
+
+            assert_eq!(stop, CrawlStop::Exhausted);
+        });
+    }
+
+    /// What the deadline cancels is the fetching. Pages that were already paid for are in
+    /// memory, and writing them is local work the budget never covered.
+    #[test]
+    fn the_pages_already_fetched_when_the_budget_ran_out_are_still_handed_over() {
+        // The sender stays alive, as it does when a crawl is cancelled with tasks still
+        // winding down. A drain that waited for the queue to close would never return.
+        let (sender, mut pages) = broadcast::channel::<Page>(4);
+        for _ in 0..3 {
+            sender.send(Page::default()).expect("the receiver is alive");
+        }
+
+        let mut received = 0usize;
+        let mut outcome = CrawlOutcome::default();
+        drain_queued(
+            &mut pages,
+            &mut |_| {
+                received += 1;
+                ControlFlow::Continue(())
+            },
+            &mut outcome,
+        );
+
+        assert_eq!(received, 3);
+        assert_eq!(outcome.pages_dropped, 0);
+    }
+
+    #[test]
+    fn a_caller_that_stops_after_the_deadline_still_costs_what_it_leaves_queued() {
+        let (sender, mut pages) = broadcast::channel::<Page>(4);
+        for _ in 0..3 {
+            sender.send(Page::default()).expect("the receiver is alive");
+        }
+
+        let mut received = 0usize;
+        let mut outcome = CrawlOutcome::default();
+        drain_queued(
+            &mut pages,
+            &mut |_| {
+                received += 1;
+                ControlFlow::Break(())
+            },
+            &mut outcome,
+        );
+
+        assert_eq!(received, 1);
+        assert_eq!(outcome.pages_dropped, 2);
+    }
+
+    /// The seed's policy is worth nothing if it stops at this adapter, and the network path
+    /// that would show that up is the one path no test may take. What can be checked without
+    /// a socket is that the numbers arrive where the engine reads them.
+    #[test]
+    fn the_seeds_execution_policy_reaches_the_engine_configuration() {
+        let mut seed = Seed::new("https://example.com/");
+        seed.request_timeout = Duration::from_secs(7);
+        seed.max_retries = 3;
+
+        let website = configured_website("https://example.com/", &seed);
+
+        assert_eq!(
+            website.configuration.request_timeout,
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(website.configuration.retry, 3);
+        // The engine's first-byte watchdog answers a stalled request with a 504 it made up,
+        // carrying no body and no error mark, which this adapter would read as a response a
+        // server sent. The request timeout above is the guard that reports a failure as one.
+        assert_eq!(
+            website.configuration.http_first_byte_timeout, None,
+            "the watchdog that invents a status is on"
+        );
     }
 }

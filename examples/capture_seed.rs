@@ -9,6 +9,8 @@
 //! cargo run --example capture_seed -- http://127.0.0.1:8000/index.html /tmp/archive
 //! ```
 
+use std::time::Duration;
+
 use archeion::capture::capture_seed;
 use archeion::crawl::{Seed, SpiderEngine};
 use archeion::storage::Archive;
@@ -26,6 +28,9 @@ fn main() {
     let mut seed = Seed::new(seed_url);
     seed.max_pages = 10;
     seed.concurrency = 4;
+    // Short enough that a server which stalls ends the run while you are still watching it,
+    // which is the half of the execution policy no test can reach.
+    seed.deadline = Some(Duration::from_secs(20));
 
     let run = capture_seed(&SpiderEngine, &archive, &seed).expect("the run completes");
     println!("{run:#?}");

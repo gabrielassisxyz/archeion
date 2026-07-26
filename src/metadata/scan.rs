@@ -259,7 +259,9 @@ impl Scanner {
             return;
         }
         let mut capped = String::new();
-        push_capped(&mut capped, &content, MAX_TEXT_FIELD_BYTES);
+        if push_capped(&mut capped, &content, MAX_TEXT_FIELD_BYTES) {
+            self.page.truncated.insert(Bound::MetaContent);
+        }
         self.page.metas.push((name, capped));
     }
 
@@ -307,7 +309,9 @@ impl Scanner {
         }
         if relations.clone().any(|token| token == "stylesheet") {
             self.see_asset(href, AssetKind::Stylesheet);
-        } else if relations.any(|token| token.ends_with("icon")) {
+            // `icon`, `shortcut icon`, `apple-touch-icon`, `mask-icon`: the token is the
+            // whole word or a suffix behind a dash, never an arbitrary ending.
+        } else if relations.any(|token| token == "icon" || token.ends_with("-icon")) {
             self.see_asset(href, AssetKind::Icon);
         }
     }
@@ -316,7 +320,10 @@ impl Scanner {
         let Some(href) = href else {
             return;
         };
+        // A dropped link is one the record does not hold, which is the same claim the
+        // ceiling on their number makes, so it is recorded the same way.
         if href.len() > MAX_URL_BYTES {
+            self.page.truncated.insert(Bound::Links);
             return;
         }
         if self.page.links.len() >= MAX_LINKS {
@@ -333,6 +340,7 @@ impl Scanner {
 
     fn see_asset(&mut self, url: String, kind: AssetKind) {
         if url.len() > MAX_URL_BYTES {
+            self.page.truncated.insert(Bound::Assets);
             return;
         }
         if self.page.assets.len() >= MAX_ASSETS {

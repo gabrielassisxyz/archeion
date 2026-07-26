@@ -578,12 +578,32 @@ mod tests {
 
     #[test]
     fn a_url_long_enough_to_be_a_payload_is_not_a_link() {
+        let payload = "p".repeat(4096);
         let page = extract_html(&format!(
-            r#"<a href="/{}">x</a><a href="/short">x</a>"#,
-            "p".repeat(4096)
+            r#"<a href="/{payload}">x</a><a href="/short">x</a><img src="/{payload}.png">"#
         ));
+
         assert_eq!(page.links.len(), 1);
         assert_eq!(page.links[0].url, "https://example.com/short");
+        assert!(page.assets.is_empty());
+        // Dropped, so the record must not read as holding everything the page linked.
+        assert_eq!(page.truncated, [Bound::Links, Bound::Assets]);
+    }
+
+    #[test]
+    fn a_meta_tag_too_long_to_keep_whole_says_so() {
+        let page = extract_html(&format!(
+            r#"<meta property="og:description" content="{}">"#,
+            "c".repeat(9000)
+        ));
+
+        assert_eq!(page.meta.len(), 1);
+        assert_eq!(page.meta[0].content.len(), 4 * 1024);
+        assert_eq!(page.truncated, [Bound::MetaContent]);
+        assert_eq!(
+            page.description.expect("a description").value.len(),
+            4 * 1024
+        );
     }
 
     /// Malformed markup a template that ran twice produces, and a hostile page can produce

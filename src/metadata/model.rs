@@ -100,7 +100,11 @@ pub enum AssetKind {
 #[serde(rename_all = "snake_case")]
 pub enum Bound {
     Title,
+    /// The list of `<meta>` tags stopped short.
     MetaTags,
+    /// A `<meta>` tag's content was cut, which is a different claim from the one above:
+    /// every tag is there, and one of them holds less than the page wrote.
+    MetaContent,
     JsonLd,
     Links,
     Assets,

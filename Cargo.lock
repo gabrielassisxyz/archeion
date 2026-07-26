@@ -63,7 +63,9 @@ dependencies = [
 name = "archeion"
 version = "0.1.0"
 dependencies = [
+ "encoding_rs",
  "jiff",
+ "lol_html",
  "serde",
  "serde_json",
  "sha2",

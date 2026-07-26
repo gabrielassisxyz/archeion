@@ -26,8 +26,12 @@ const MAX_ASSETS: usize = 2048;
 /// A URL longer than this is not a URL anyone linked, it is a payload. Browsers stop caring
 /// somewhere near here too.
 const MAX_URL_BYTES: usize = 2048;
-/// What the parser may hold while it works. It never buffers more than the token it is on
-/// except across chunk boundaries, so reaching this means the page was built to make it.
+/// What the parser may hold on top of the document it was handed.
+///
+/// It is a backstop and not a limit this reaches: the page arrives in one piece, so the
+/// parser reads tokens out of it in place and buffers only what a token spanning two writes
+/// would need, which is nothing here. The ceiling is what keeps that true if the document
+/// ever starts arriving in chunks.
 const MAX_PARSER_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 
 /// What one page said, before any of it is interpreted. URLs are still relative, dates are

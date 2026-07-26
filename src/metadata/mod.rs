@@ -24,6 +24,11 @@ const HTML_MEDIA_TYPES: [&str; 2] = ["text/html", "application/xhtml+xml"];
 
 /// A page the parser gave up on. It names the URL because the point of reporting it is to
 /// go and look at the stored body, and a count would leave nothing to look at.
+///
+/// Malformed markup does not produce this: the parse is deliberately forgiving and reads a
+/// broken page as far as it goes. What is left is the parser's own ceilings, which is why
+/// this is plumbed through as a report rather than asserted away: the input is remote, and
+/// a parse of remote input that cannot fail is a parse that panics instead.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("{url} could not be read as HTML: {reason}")]
 pub struct UnreadablePage {

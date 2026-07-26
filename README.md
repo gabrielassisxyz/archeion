@@ -6,7 +6,7 @@ Archeion captures a page, keeps the raw response exactly as it arrived, and reco
 
 ## Status
 
-Early, and honest about it: there is no usable command yet. The crawl engine has been chosen and benchmarked, and the item, capture and asset model is in place, so a capture can be written to an archive and read back. Nothing fetches one yet, and running `archeion` today prints that and exits. [`docs/storage-model.md`](docs/storage-model.md) describes what an archive on disk looks like. [`ROADMAP.md`](ROADMAP.md) tracks what exists, what is missing, and what is deliberately out of scope.
+Early, and honest about it: there is no usable command yet. Crawling a seed into an archive works as a library, with the engine behind an interface this project owns, but running `archeion` today prints that there is no command surface and exits. [`docs/storage-model.md`](docs/storage-model.md) describes what an archive on disk looks like, [`docs/crawl-boundary.md`](docs/crawl-boundary.md) what the archive asks a crawl engine for. [`ROADMAP.md`](ROADMAP.md) tracks what exists, what is missing, and what is deliberately out of scope.
 
 ## Install
 

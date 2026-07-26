@@ -585,4 +585,21 @@ mod tests {
         assert_eq!(page.links.len(), 1);
         assert_eq!(page.links[0].url, "https://example.com/short");
     }
+
+    /// Malformed markup a template that ran twice produces, and a hostile page can produce
+    /// on purpose. A browser ignores the second tag's attributes.
+    #[test]
+    fn a_second_html_tag_neither_replaces_the_language_nor_erases_it() {
+        let replaced = extract_html("<html lang=\"en\"><body>x<html lang=\"zz\">");
+        let erased = extract_html("<html lang=\"en\"><body>x<html>");
+
+        assert_eq!(
+            value_of(replaced.language),
+            Some(("en".to_owned(), MetadataSource::Html))
+        );
+        assert_eq!(
+            value_of(erased.language),
+            Some(("en".to_owned(), MetadataSource::Html))
+        );
+    }
 }

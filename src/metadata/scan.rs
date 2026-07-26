@@ -69,8 +69,16 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
         let mut rewriter = HtmlRewriter::new(
             Settings {
                 element_content_handlers: vec![
+                    // First wins, as everywhere else here. A document with a second `<html>`
+                    // tag is malformed markup that template concatenation produces by
+                    // accident and a hostile page can produce on purpose, and assigning
+                    // unconditionally let the later one either replace the language or, when
+                    // it carried no `lang` at all, erase it.
                     element!("html", |el| {
-                        scanner.borrow_mut().page.language = el.get_attribute("lang");
+                        let mut scanner = scanner.borrow_mut();
+                        if scanner.page.language.is_none() {
+                            scanner.page.language = el.get_attribute("lang");
+                        }
                         Ok(())
                     }),
                     // Matching on `head > title` would have missed every page that leaves the

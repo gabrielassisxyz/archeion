@@ -2,9 +2,8 @@
 //! takes on disk is the documented one: `docs/storage-model.md` is a promise to whoever
 //! opens the directory in ten years, so the layout is asserted here and not just described.
 
-use archeion::storage::{
-    Archive, CanonicalUrl, ContentHash, Header, ItemId, NewAsset, NewCapture, StorageError,
-};
+use archeion::CanonicalUrl;
+use archeion::storage::{Archive, ContentHash, Header, ItemId, NewAsset, NewCapture, StorageError};
 use jiff::Timestamp;
 use tempfile::TempDir;
 
@@ -142,6 +141,49 @@ fn recapturing_unchanged_bytes_adds_a_capture_and_not_a_copy() {
     assert_eq!(stored_body_count(dir.path()), 2);
 }
 
+/// The other half of dedupe, and the reason canonicalization exists: the spellings a page
+/// is linked by around the web are one address here, so they share one item directory and
+/// one history rather than archiving the same site once per spelling.
+#[test]
+fn every_spelling_of_a_page_lands_on_one_item() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let spellings = [
+        ("https://example.com/a-page", "2026-07-25T14:03:22Z"),
+        ("https://WWW.Example.com/a-page", "2026-07-26T14:03:22Z"),
+        ("https://example.com.:443/a-page", "2026-07-27T14:03:22Z"),
+        (
+            "https://example.com/a-page#section-2",
+            "2026-07-28T14:03:22Z",
+        ),
+        (
+            "https://example.com/a-page?utm_source=newsletter",
+            "2026-07-29T14:03:22Z",
+        ),
+    ];
+
+    for (spelling, fetched_at) in spellings {
+        let url = CanonicalUrl::parse(spelling).expect("valid url");
+        archive
+            .write_capture(page_capture(&url, at(fetched_at), PAGE))
+            .expect("capture is stored");
+    }
+
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+    assert_eq!(item_record_count(dir.path()), 1);
+    assert_eq!(
+        archive
+            .list_captures(&url)
+            .expect("captures are listed")
+            .len(),
+        spellings.len()
+    );
+    assert_eq!(stored_body_count(dir.path()), 2);
+    let item = archive.read_item(&url).expect("item is found");
+    assert_eq!(item.first_captured_at, at("2026-07-25T14:03:22Z"));
+    assert_eq!(item.last_captured_at, at("2026-07-29T14:03:22Z"));
+}
+
 #[test]
 fn a_backfilled_older_capture_widens_the_item_window() {
     let dir = TempDir::new().expect("temp dir");
@@ -231,6 +273,24 @@ fn stored_body_count(root: &std::path::Path) -> usize {
     let mut files = 0;
     walk(&root.join("blobs"), &mut files);
     files
+}
+
+fn item_record_count(root: &std::path::Path) -> usize {
+    fn walk(path: &std::path::Path, records: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                walk(&entry.path(), records);
+            } else if entry.file_name() == "item.json" {
+                *records += 1;
+            }
+        }
+    }
+    let mut records = 0;
+    walk(&root.join("items"), &mut records);
+    records
 }
 
 #[test]

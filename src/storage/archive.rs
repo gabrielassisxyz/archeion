@@ -1,0 +1,434 @@
+//! The store over an archive directory.
+//!
+//! The directory is the record, not a cache of one: every write lands as a file whose
+//! meaning is readable without this program, and nothing here keeps state a reader would
+//! have to trust. An index, when the collection grows enough to need one, is derived from
+//! this tree and can be deleted and rebuilt at any time.
+
+use std::fs::{self, File};
+use std::io::{self, Write as _};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use jiff::Timestamp;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use super::model::{
+    Asset, CanonicalUrl, Capture, CaptureId, ContentHash, Header, Item, ItemId, NewCapture,
+    StoredBody,
+};
+
+const MARKER_FILE: &str = "archeion.json";
+const FORMAT_NAME: &str = "archeion-archive";
+const FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, serde::Deserialize)]
+struct FormatMarker {
+    format: String,
+    version: u32,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StorageError {
+    #[error("{path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("{path}: malformed record: {source}")]
+    MalformedRecord {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("{path} holds something else, not an Archeion archive")]
+    NotAnArchive { path: PathBuf },
+    #[error("{path} is an archive in format version {found}, this build reads version {readable}")]
+    UnreadableFormat {
+        path: PathBuf,
+        found: u32,
+        readable: u32,
+    },
+    #[error("nothing archived for {url}")]
+    NoSuchItem { url: String },
+    #[error("{url} has no capture {capture}")]
+    NoSuchCapture { url: String, capture: String },
+    #[error("body {hash} is referenced by a record but missing from the archive")]
+    MissingBody { hash: String },
+    #[error("body {hash} does not hash to the name it is stored under")]
+    CorruptBody { hash: String },
+    #[error("{path}: this record cannot be written as JSON: {source}")]
+    UnserializableRecord {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+pub struct Archive {
+    root: PathBuf,
+}
+
+impl Archive {
+    /// Opens the archive at `root`, creating it when the directory is empty or absent. A
+    /// directory that holds anything else is refused rather than adopted: pointing this
+    /// at the wrong path should fail loudly, not scatter records into it.
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self, StorageError> {
+        let root = root.into();
+        let marker_path = root.join(MARKER_FILE);
+
+        match read_optional_json::<FormatMarker>(&marker_path)? {
+            Some(marker) if marker.format != FORMAT_NAME => {
+                return Err(StorageError::NotAnArchive { path: root });
+            }
+            Some(marker) if marker.version > FORMAT_VERSION => {
+                return Err(StorageError::UnreadableFormat {
+                    path: root,
+                    found: marker.version,
+                    readable: FORMAT_VERSION,
+                });
+            }
+            Some(_) => {}
+            None => {
+                if directory_has_visible_entries(&root)? {
+                    return Err(StorageError::NotAnArchive { path: root });
+                }
+                write_json(
+                    &marker_path,
+                    &FormatMarker {
+                        format: FORMAT_NAME.to_owned(),
+                        version: FORMAT_VERSION,
+                    },
+                )?;
+            }
+        }
+
+        Ok(Self { root })
+    }
+
+    /// Stores one fetch of one item: its bytes, its assets' bytes, the item record and the
+    /// capture record.
+    ///
+    /// The write order is what a run cut short leaves behind, so it is chosen rather than
+    /// incidental. Bodies come first, because an unreferenced blob costs disk space and
+    /// nothing else while a record pointing at absent bytes is broken. The item record
+    /// comes next, because it holds the canonical URL that the hashed directory name does
+    /// not: a capture stranded without it cannot be read back to the address it came from.
+    pub fn write_capture(&self, new: NewCapture) -> Result<Capture, StorageError> {
+        let body = self.write_body(&new.body)?;
+        let mut assets = Vec::with_capacity(new.assets.len());
+        for asset in &new.assets {
+            assets.push(Asset {
+                requested_url: asset.requested_url.clone(),
+                final_url: asset.final_url.clone(),
+                status: asset.status,
+                media_type: asset.media_type.clone(),
+                body: self.write_body(&asset.body)?,
+            });
+        }
+
+        let fingerprint = fingerprint_of(
+            &new.requested_url,
+            &new.final_url,
+            new.status,
+            new.media_type.as_deref(),
+            &new.response_headers,
+            &body.sha256,
+            &assets,
+        );
+        let capture = Capture {
+            id: CaptureId::new(new.fetched_at, &fingerprint),
+            item_id: ItemId::of(&new.canonical_url),
+            requested_url: new.requested_url,
+            final_url: new.final_url,
+            status: new.status,
+            media_type: new.media_type,
+            response_headers: new.response_headers,
+            body,
+            fetched_at: new.fetched_at,
+            assets,
+        };
+
+        self.record_item(&new.canonical_url, new.fetched_at)?;
+        write_json(
+            &self.capture_path(&new.canonical_url, &capture.id),
+            &capture,
+        )?;
+        Ok(capture)
+    }
+
+    pub fn read_item(&self, url: &CanonicalUrl) -> Result<Item, StorageError> {
+        read_optional_json(&self.item_path(url))?.ok_or_else(|| StorageError::NoSuchItem {
+            url: url.to_string(),
+        })
+    }
+
+    pub fn read_capture(
+        &self,
+        url: &CanonicalUrl,
+        capture: &CaptureId,
+    ) -> Result<Capture, StorageError> {
+        read_optional_json(&self.capture_path(url, capture))?.ok_or_else(|| {
+            StorageError::NoSuchCapture {
+                url: url.to_string(),
+                capture: capture.to_string(),
+            }
+        })
+    }
+
+    /// Every capture of an item, oldest first, which is the order the ids already sort in.
+    pub fn list_captures(&self, url: &CanonicalUrl) -> Result<Vec<CaptureId>, StorageError> {
+        let dir = self.item_dir(url).join("captures");
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(StorageError::Io { path: dir, source }),
+        };
+
+        let mut captures = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| StorageError::Io {
+                path: dir.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json")
+                && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+                && let Ok(id) = CaptureId::try_from(stem.to_owned())
+            {
+                captures.push(id);
+            }
+        }
+        captures.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        Ok(captures)
+    }
+
+    /// Reads a stored body and checks it against the name it was filed under. The address
+    /// is the hash, so the check costs one pass over bytes already in memory and turns
+    /// "the archive is intact" from an assumption into something the read proves.
+    pub fn read_body(&self, hash: &ContentHash) -> Result<Vec<u8>, StorageError> {
+        let path = self.body_path(hash);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Err(StorageError::MissingBody {
+                    hash: hash.to_string(),
+                });
+            }
+            Err(source) => return Err(StorageError::Io { path, source }),
+        };
+        if ContentHash::of(&bytes) == *hash {
+            Ok(bytes)
+        } else {
+            Err(StorageError::CorruptBody {
+                hash: hash.to_string(),
+            })
+        }
+    }
+
+    /// Bytes already in the store are left alone: the address is the content, so an
+    /// existing file is by definition the file that would have been written.
+    fn write_body(&self, bytes: &[u8]) -> Result<StoredBody, StorageError> {
+        let sha256 = ContentHash::of(bytes);
+        let path = self.body_path(&sha256);
+        if !path.exists() {
+            write_atomically(&path, bytes)?;
+        }
+        Ok(StoredBody {
+            sha256,
+            byte_len: bytes.len() as u64,
+        })
+    }
+
+    /// The item record is rewritten on every capture so its window covers all of them.
+    /// Both ends widen rather than only the last one, because captures are not always
+    /// written in the order they were fetched: a backfilled older capture moves the start.
+    fn record_item(&self, url: &CanonicalUrl, fetched_at: Timestamp) -> Result<(), StorageError> {
+        let path = self.item_path(url);
+        let known: Option<Item> = read_optional_json(&path)?;
+        let item = Item {
+            id: ItemId::of(url),
+            canonical_url: url.clone(),
+            first_captured_at: known
+                .as_ref()
+                .map_or(fetched_at, |item| item.first_captured_at.min(fetched_at)),
+            last_captured_at: known
+                .as_ref()
+                .map_or(fetched_at, |item| item.last_captured_at.max(fetched_at)),
+        };
+        write_json(&path, &item)
+    }
+
+    fn item_dir(&self, url: &CanonicalUrl) -> PathBuf {
+        self.root
+            .join("items")
+            .join(url.host_dir())
+            .join(ItemId::of(url).as_str())
+    }
+
+    fn item_path(&self, url: &CanonicalUrl) -> PathBuf {
+        self.item_dir(url).join("item.json")
+    }
+
+    fn capture_path(&self, url: &CanonicalUrl, capture: &CaptureId) -> PathBuf {
+        self.item_dir(url)
+            .join("captures")
+            .join(format!("{capture}.json"))
+    }
+
+    fn body_path(&self, hash: &ContentHash) -> PathBuf {
+        let (first, second) = hash.shard();
+        self.root
+            .join("blobs")
+            .join("sha256")
+            .join(first)
+            .join(second)
+            .join(hash.as_str())
+    }
+}
+
+/// Whether a directory holds anything that would make adopting it as an archive a
+/// mistake. Dotted entries do not count: a crash during the very first write leaves this
+/// store's own temporary file behind, and letting that permanently block the directory it
+/// was created in would be the store poisoning its own root.
+fn directory_has_visible_entries(path: &Path) -> Result<bool, StorageError> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(StorageError::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|source| StorageError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+        if !entry.file_name().to_string_lossy().starts_with('.') {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The name a capture is filed under, derived from everything about the response that
+/// distinguishes it from another one. Two fetches that agree on all of it are the same
+/// capture and share a file; anything that differs, including a status or a header behind
+/// identical bytes, gets a name of its own.
+///
+/// The fields are hashed length-prefixed rather than serialized. A capture id is a
+/// filename that has to stay the same forever, and JSON output is a moving target: a
+/// renamed field or a changed formatter would silently rename every capture written after
+/// it, filing a re-write of an existing capture beside the original instead of over it.
+fn fingerprint_of(
+    requested_url: &str,
+    final_url: &str,
+    status: u16,
+    media_type: Option<&str>,
+    response_headers: &[Header],
+    body: &ContentHash,
+    assets: &[Asset],
+) -> ContentHash {
+    fn push_field(buffer: &mut Vec<u8>, value: &str) {
+        buffer.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        buffer.extend_from_slice(value.as_bytes());
+    }
+
+    let mut buffer = Vec::new();
+    push_field(&mut buffer, requested_url);
+    push_field(&mut buffer, final_url);
+    push_field(&mut buffer, &status.to_string());
+    // An absent media type is not an empty one, and a name must not conflate them.
+    buffer.push(u8::from(media_type.is_some()));
+    push_field(&mut buffer, media_type.unwrap_or(""));
+    for header in response_headers {
+        push_field(&mut buffer, &header.name);
+        push_field(&mut buffer, &header.value);
+    }
+    push_field(&mut buffer, body.as_str());
+    for asset in assets {
+        push_field(&mut buffer, asset.body.sha256.as_str());
+    }
+    ContentHash::of(&buffer)
+}
+
+fn read_optional_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, StorageError> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(StorageError::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|source| StorageError::MalformedRecord {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+fn write_json<T: Serialize>(path: &Path, record: &T) -> Result<(), StorageError> {
+    // Pretty printed because the archive is meant to be read by whoever finds it, and a
+    // one-line JSON object is a wall no `diff` or `grep` can help with.
+    let mut bytes =
+        serde_json::to_vec_pretty(record).map_err(|source| StorageError::UnserializableRecord {
+            path: path.to_owned(),
+            source,
+        })?;
+    bytes.push(b'\n');
+    write_atomically(path, &bytes)
+}
+
+/// Counter behind the temporary file names, so two writes in the same process cannot pick
+/// the same one.
+static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Writes through a temporary file in the destination directory and renames it into
+/// place. A reader therefore sees either the previous record or the complete new one,
+/// never the half of it that had been flushed when the machine lost power.
+///
+/// Both the file and the directory holding it are flushed. Syncing only the file makes the
+/// content durable but not the name it was given, and a record whose name did not survive
+/// is a record the archive lost.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+    let dir = path.parent().ok_or_else(|| StorageError::Io {
+        path: path.to_owned(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory"),
+    })?;
+    fs::create_dir_all(dir).map_err(|source| StorageError::Io {
+        path: dir.to_owned(),
+        source,
+    })?;
+
+    let temp = dir.join(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = File::create(&temp).map_err(|source| StorageError::Io {
+        path: temp.clone(),
+        source,
+    })?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&temp, path))
+        .and_then(|()| File::open(dir)?.sync_all());
+    if let Err(source) = written {
+        let _ = fs::remove_file(&temp);
+        return Err(StorageError::Io {
+            path: path.to_owned(),
+            source,
+        });
+    }
+    Ok(())
+}

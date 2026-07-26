@@ -1,7 +1,6 @@
-// The archival core does not exist yet. This entry point is deliberately empty rather
-// than a stub of the future CLI: the command surface follows the item/capture/asset
-// model, which is the next thing to be designed, and a guessed surface would have to be
-// unlearned.
+// The storage layer exists, but nothing fetches into it yet. This entry point stays
+// deliberately empty rather than growing a stub of the future CLI: the command surface
+// follows the capture path, and a guessed surface would have to be unlearned.
 fn main() {
     println!(
         "{} {}: the archival core is not implemented yet",

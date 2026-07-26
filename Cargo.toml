@@ -11,9 +11,18 @@ keywords = ["archive", "crawler", "metadata", "local-first"]
 categories = ["command-line-utilities"]
 
 [dependencies]
+jiff = { version = "0.2.35", default-features = false, features = ["std", "serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+thiserror = "2.0.19"
+url = "2.5.8"
 
 [profile.release]
 # A local-first archiver is IO bound, so the binary is downloaded far more often than it
 # is CPU limited: trading a slower build for a smaller artifact is the better deal.
 lto = "thin"
 strip = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

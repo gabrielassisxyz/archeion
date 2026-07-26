@@ -108,13 +108,19 @@ fn rewrite_host(url: &mut Url) -> Result<(), InvalidCanonicalUrl> {
     };
 
     let name = name.to_owned();
-    let rooted = name.trim_end_matches('.');
-    let stripped = match rooted.strip_prefix("www.") {
+    let mut stripped = name.trim_end_matches('.');
+    // Stripping one label and stopping there is not canonicalization but one step of it:
+    // `www.www.example.com` would reduce to a different address on a second pass, and
+    // every record read back off disk goes through these rules again. Repeating until the
+    // prefix is gone is what makes the result a fixed point.
+    while let Some(rest) = stripped.strip_prefix("www.") {
         // Without a dot left, `www` was the site and not a prefix of it: `www.com` is a
         // registrable name, and reducing it to `com` would key on a different host.
-        Some(rest) if rest.contains('.') => rest,
-        _ => rooted,
-    };
+        if !rest.contains('.') {
+            break;
+        }
+        stripped = rest;
+    }
     if stripped == name {
         return Ok(());
     }
@@ -247,6 +253,11 @@ mod tests {
                 "https://m.example.com/a",
             ),
             (
+                "an internationalized host has one ASCII spelling",
+                "https://bücher.example/a",
+                "https://xn--bcher-kva.example/a",
+            ),
+            (
                 "the default port is the port",
                 "https://example.com:443/a",
                 "https://example.com/a",
@@ -318,24 +329,49 @@ mod tests {
         }
     }
 
+    /// A record on disk is re-canonicalized when it is read back, so a rule that reaches a
+    /// different address on the second pass writes a record this program cannot read, or
+    /// one whose stored URL no longer names the directory it sits in.
     #[test]
     fn canonicalizing_a_canonical_url_changes_nothing() {
         for url in [
             "https://www.example.com/a?utm_source=news&b=2&a=1#top",
             "https://example.com./",
             "http://[2001:db8::1]:8080/a",
+            "https://www.www.example.com/page",
+            "https://www.www.www.co.uk./a?b=2&utm_id=1&a=1#top",
+            "https://www.www.com/a",
         ] {
             let once = canonical(url);
-            assert_eq!(canonical(&once), once);
+            assert_eq!(canonical(&once), once, "{url}");
         }
+    }
+
+    /// A repeated prefix is the case that broke the fixed point: the host must come out of
+    /// one pass in the form a second pass would leave it in.
+    #[test]
+    fn a_repeated_www_is_stripped_all_the_way_down() {
+        assert_eq!(
+            canonical("https://www.www.www.example.com/a"),
+            "https://example.com/a"
+        );
+        // An empty label behind the prefix leaves a host no directory can be named after,
+        // and it is refused here rather than stored as a record nothing can read back.
+        assert!(matches!(
+            CanonicalUrl::parse("https://www.www..example.com/page"),
+            Err(InvalidCanonicalUrl::UnsafeHost { .. })
+        ));
     }
 
     #[test]
     fn two_spellings_of_one_page_are_one_url() {
-        assert_eq!(
-            CanonicalUrl::parse("https://WWW.rust-lang.org.:443/learn?utm_medium=email#top"),
-            CanonicalUrl::parse("https://rust-lang.org/learn"),
-        );
+        let spelled_out =
+            CanonicalUrl::parse("https://WWW.rust-lang.org.:443/learn?utm_medium=email#top")
+                .expect("valid url");
+        let plain = CanonicalUrl::parse("https://rust-lang.org/learn").expect("valid url");
+
+        assert_eq!(spelled_out.as_str(), "https://rust-lang.org/learn");
+        assert_eq!(spelled_out, plain);
     }
 
     #[test]
@@ -360,7 +396,7 @@ mod tests {
     #[test]
     fn host_directory_keeps_an_ipv6_address_filename_safe() {
         let url = CanonicalUrl::parse("http://[2001:db8::1]/a").expect("valid url");
-        assert!(!url.host_dir().contains(':'));
+        assert_eq!(url.host_dir(), "2001-db8--1");
     }
 
     #[test]

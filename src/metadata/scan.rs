@@ -73,13 +73,25 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
                         scanner.borrow_mut().page.language = el.get_attribute("lang");
                         Ok(())
                     }),
-                    // The namespace is what separates the page's title from the `<title>` of
-                    // an inline SVG, which is that graphic's accessible name. Matching on
-                    // `head > title` instead would have missed every page that leaves the
+                    // Matching on `head > title` would have missed every page that leaves the
                     // `<head>` tag out and lets the parser imply it, which is legal and
-                    // common, because a token stream has no implied elements to match.
-                    element!("title", |el| {
-                        scanner.borrow_mut().see_title_start(el.namespace_uri());
+                    // common, because a token stream has no implied elements to match. What
+                    // that would have excluded is handled by the next handler instead.
+                    element!("title", |_| {
+                        scanner.borrow_mut().see_title_start();
+                        Ok(())
+                    }),
+                    // The `<title>` of an inline graphic is that graphic's accessible name,
+                    // not the page's, and a logo in the header of a page whose own title
+                    // comes later would otherwise win on document order. An ancestor is the
+                    // only thing that separates the two: the namespace does not, because
+                    // this element is an HTML integration point and the parser reports it in
+                    // the HTML namespace exactly as it reports the page's own title.
+                    //
+                    // It runs after the handler above and undoes it, which is why the order
+                    // of this list is not incidental.
+                    element!("svg title", |_| {
+                        scanner.borrow_mut().reject_title();
                         Ok(())
                     }),
                     text!("title", |chunk| {
@@ -190,7 +202,6 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
 }
 
 const JSON_LD_TYPE: &str = "application/ld+json";
-const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
 
 #[derive(Debug, Default)]
 struct Scanner {
@@ -206,9 +217,13 @@ struct Scanner {
 impl Scanner {
     /// The first title the page's own markup declares is the one, so a second `<title>`,
     /// which is malformed markup, cannot overwrite it.
-    fn see_title_start(&mut self, namespace: &str) {
-        self.inside_page_title =
-            namespace == HTML_NAMESPACE && self.title.is_empty() && !self.title_ended;
+    fn see_title_start(&mut self) {
+        self.inside_page_title = self.title.is_empty() && !self.title_ended;
+    }
+
+    /// This `<title>` belongs to something inside the page rather than to the page.
+    fn reject_title(&mut self) {
+        self.inside_page_title = false;
     }
 
     fn see_title(&mut self, chunk: &str) {

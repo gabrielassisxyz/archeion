@@ -182,16 +182,31 @@ mod tests {
         assert_eq!(page.links.len(), 1);
     }
 
+    /// The graphic comes first on purpose. A logo sits in the header of most pages, so the
+    /// icon's accessible name is what document order offers before the page's own title,
+    /// and a test that puts the real title first proves only that first-wins works.
     #[test]
     fn a_title_inside_an_inline_svg_is_not_the_page_title() {
         let page = extract_html(
-            "<html><head><title>the page</title></head>\
-             <body><svg><title>an icon</title></svg></body></html>",
+            "<body><header><svg><title>an icon</title></svg></header>\
+             <title>the page</title></body>",
         );
         assert_eq!(
             value_of(page.title),
             Some(("the page".to_owned(), MetadataSource::Html))
         );
+    }
+
+    /// The case the rule above exists for: a page that has no title of its own, and an
+    /// inline graphic that does. Nothing is better than the name of a logo.
+    #[test]
+    fn a_page_with_only_a_graphic_title_has_no_title() {
+        let page = extract_html(
+            r#"<head><meta name="description" content="An article about bread."></head>
+               <body><header><svg><title>Recipes Weekly logo</title></svg></header>
+               <h1>How to bake bread</h1></body>"#,
+        );
+        assert_eq!(value_of(page.title), None);
     }
 
     #[test]

@@ -26,6 +26,7 @@ fn page_capture(url: &CanonicalUrl, fetched_at: Timestamp, body: &[u8]) -> NewCa
             value: "text/html; charset=utf-8".to_owned(),
         }],
         body: body.to_vec(),
+        body_truncated: false,
         fetched_at,
         assets: vec![NewAsset {
             requested_url: "https://example.com/style.css".to_owned(),
@@ -318,6 +319,63 @@ fn two_fetches_in_the_same_second_with_the_same_bytes_stay_two_captures() {
             .status,
         200
     );
+}
+
+/// The same bytes can be the whole page once and all that survived of it the next time,
+/// and the two are different captures. Naming them alike would file the short one over the
+/// complete one and leave the archive claiming a page it no longer holds.
+#[test]
+fn a_body_that_arrived_short_is_not_filed_over_the_complete_one() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+    let moment = at("2026-07-25T14:03:22Z");
+
+    let complete = archive
+        .write_capture(page_capture(&url, moment, PAGE))
+        .expect("complete capture");
+    let mut short = page_capture(&url, moment, PAGE);
+    short.body_truncated = true;
+    let short = archive.write_capture(short).expect("short capture");
+
+    assert_ne!(complete.id, short.id);
+    assert_eq!(archive.list_captures(&url).expect("listing").len(), 2);
+    assert!(
+        archive
+            .read_capture(&url, &short.id)
+            .expect("short capture reads back")
+            .body_truncated
+    );
+}
+
+/// A capture written before the archive tracked shortfalls says nothing about one, and
+/// nothing has to keep reading as the whole page rather than as an unreadable record.
+#[test]
+fn a_record_written_before_the_field_existed_still_reads() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+    let capture = archive
+        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .expect("capture is stored");
+
+    let path = capture_file(dir.path(), &url, &capture.id);
+    let record = std::fs::read_to_string(&path).expect("read record");
+    let older: String = record
+        .lines()
+        .filter(|line| !line.contains("\"body_truncated\""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !older.contains("body_truncated"),
+        "the field was not removed"
+    );
+    std::fs::write(&path, older).expect("write record");
+
+    let read_back = archive
+        .read_capture(&url, &capture.id)
+        .expect("an older record still reads");
+    assert!(!read_back.body_truncated);
 }
 
 #[test]

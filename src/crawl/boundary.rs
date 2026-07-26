@@ -5,10 +5,12 @@
 //! the archive's terms rather than the engine's, so swapping the engine is a new adapter
 //! and not a rewrite of the code that stores what it produced.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::ControlFlow;
 use std::time::Duration;
 
 use jiff::Timestamp;
+use url::{Host, Url};
 
 use crate::storage::Header;
 
@@ -43,6 +45,15 @@ pub struct Seed {
     /// it is the only thing that can fetch again; how much of the budget to spend on it is
     /// the archive's call and lives here.
     pub max_retries: u8,
+    /// Whether the seed may name an address that exists only inside a network: loopback, a
+    /// private range, link-local, or one of the names a cloud metadata service answers on.
+    /// It is off, so a URL cannot talk the archive into reading the machine it runs on or
+    /// the network around it.
+    ///
+    /// Turning it on is how a locally served site is archived at all, and it is also the
+    /// only way the fetch path itself is ever exercised, since every check of it points at
+    /// a server on localhost.
+    pub allow_private_addresses: bool,
 }
 
 impl Seed {
@@ -69,8 +80,83 @@ impl Seed {
             // the backoff between them, not thirty. Two is what keeps that under a third of
             // the deadline while still giving a 429 somewhere to land.
             max_retries: 2,
+            // A seed arrives from outside and the ranges below are the ones an outside URL
+            // has no business naming, so the default is the safe half of the choice and
+            // reaching a local server is the part that has to be asked for.
+            allow_private_addresses: false,
         }
     }
+}
+
+/// Whether a URL names an address that exists only inside a network.
+///
+/// It answers for both ends of a fetch, which is why it lives on the boundary rather than
+/// in an adapter: a seed is refused before anything is dialled, and a page that ended on
+/// one of these addresses is refused before it is stored. The second half is not the first
+/// one repeated. A redirect is screened inside the engine, by a guard this project neither
+/// owns nor can extend, so a hop that guard misses arrives up here as an ordinary page
+/// carrying whatever answered at the address it reached.
+///
+/// A URL that does not parse, or that names no host, is not an address this can judge.
+/// Both answer false and are refused further along for what they actually are.
+pub(crate) fn points_inside_a_network(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    parsed.host().is_some_and(|host| is_internal_host(&host))
+}
+
+/// Whether a host exists only inside a network. It is the archive's half of the guard the
+/// engine applies to every redirect hop, and it is deliberately the same shape as that one.
+///
+/// Neither half resolves the name. A domain answering with a private address passes both,
+/// and closing that gap means resolving before the connect and pinning the answer at connect
+/// time, since a name is free to answer differently the second time it is asked. That is a
+/// resolving connector rather than a string check, and it does not exist here yet.
+pub(super) fn is_internal_host(host: &Host<&str>) -> bool {
+    match host {
+        Host::Domain(name) => is_internal_name(name),
+        Host::Ipv4(address) => is_internal_ipv4(*address),
+        Host::Ipv6(address) => is_internal_ipv6(*address),
+    }
+}
+
+fn is_internal_name(name: &str) -> bool {
+    // A trailing dot is the same name spelled as a fully qualified one, and a guard that
+    // matched on the string alone would be walked past by typing it.
+    let name = name.trim_end_matches('.');
+    name == "localhost"
+        || name.ends_with(".localhost")
+        // The cloud metadata services answer on these as well as on 169.254.169.254, and
+        // that address is the credential store of whatever machine the archive runs on.
+        || name == "metadata.google.internal"
+        || name == "metadata.goog"
+}
+
+fn is_internal_ipv4(address: Ipv4Addr) -> bool {
+    // Link-local covers 169.254.169.254, so the metadata address needs no line of its own.
+    address.is_loopback()
+        || address.is_private()
+        || address.is_link_local()
+        || address.is_unspecified()
+        || address.is_broadcast()
+        // 0.0.0.0/8 is "this network" in RFC 1122, and the whole block is a way of naming
+        // the local host: is_unspecified() only recognises 0.0.0.0 itself, so without this
+        // the other sixteen million addresses in the range walk past the guard.
+        || address.octets()[0] == 0
+}
+
+fn is_internal_ipv6(address: Ipv6Addr) -> bool {
+    address.is_loopback()
+        || address.is_unspecified()
+        // fc00::/7 is the private range, and one of the cloud metadata services answers
+        // inside it, on fd00:ec2::254. That is the same credential store 169.254.169.254
+        // is, reached by its other address.
+        || address.is_unique_local()
+        // fe80::/10, which is what 169.254.0.0/16 is on the other side.
+        || address.is_unicast_link_local()
+        // An address written as ::ffff:127.0.0.1 reaches the same machine as 127.0.0.1 does.
+        || address.to_ipv4_mapped().is_some_and(is_internal_ipv4)
 }
 
 /// Why a crawl ended. A run that archived less than expected says which of these it was,
@@ -120,6 +206,12 @@ pub struct PageResponse {
     pub status: u16,
     pub headers: Vec<Header>,
     pub body: Vec<u8>,
+    /// Whether the body above is less than the response promised. A transfer can end early
+    /// for reasons that have nothing to do with the server changing its mind: a stream that
+    /// errored, one that went idle, one that ran past a size limit. Archiving what arrived
+    /// under a status that promises the whole page, with nothing saying which of the two it
+    /// is, makes the archive quietly wrong instead of visibly short.
+    pub body_truncated: bool,
     /// Stamped where the page crosses the boundary, which is the closest an adapter can
     /// get to the fetch it is reporting. A clock read further in would date the write
     /// instead, and would leave the pipeline with a hidden input no test can fix.

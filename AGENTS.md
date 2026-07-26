@@ -67,8 +67,9 @@
 ## Tests (TDD)
 
 - Every feature is born with a test, every bugfix with a regression test.
-- Tests run with ONE command (`cargo test`): no manual setup, no network, no credential. A test that cannot run headless is wrong.
+- Tests run with ONE command (`cargo test`): no manual setup, no credential, nothing that leaves the machine. A test that cannot run headless is wrong.
 - Network and filesystem are mocked at the boundary with a named fake, never an inline stub. A test that reaches the live web is not a test, it is a crawl.
+- A server the test starts on loopback is the exception, and it is for guards that live inside a dependency and have no reachable entry point. It stays an exception: it costs a socket and a thread, and it is worth that only when asserting the configuration would prove the configuration rather than the behavior.
 - Before saying "done", run `bin/ci` and report the result.
 
 ## Small releases
@@ -110,7 +111,9 @@
 |---|---|---|
 | A fresh clone runs no git hooks until `bin/install-hooks` is run once. Nothing reports this: commits simply pass ungated. | tripwire | none, it is a clone-time step |
 | `bin/slop-guard`, `scripts/md-unwrap.py`, `bin/worktree`, `bin/install-hooks` and the git hooks are byte-identical copies of a canonical source outside this repo. Fix the original and re-copy; a local edit is drift that the next sync silently reverts. | prose | none |
-| The network path of the crawl adapter (`src/crawl/spider_engine.rs`) is what no test reaches, since a test may not use the network. A change to how the engine is configured compiles and passes `bin/ci` while being broken. `cargo run --example capture_seed -- <url> <dir>` against a server on localhost is the check. | tripwire | none, it is a manual run |
+| The network path of the crawl adapter (`src/crawl/spider_engine.rs`) is what no test reaches, since a test may not use the network. A change to how the engine is configured compiles and passes `bin/ci` while being broken. `cargo run --example capture_seed -- <url> <dir>` against a server on localhost is the check. | tripwire | partial: `tests/fetch_hardening.rs` drives the redirect guard against a server it starts on loopback |
+| A redirect cannot be verified by `cargo run --example capture_seed` against localhost. The engine screens every hop for internal addresses before it checks anything else, so a redirect whose target is on loopback is refused no matter which policy is in force, and the run reports it as a URL that answered nothing. What a local site does exercise is a redirect leaving it, since the target is then not loopback. | tripwire | none, it is a property of the manual run |
+| The response byte ceiling reaches the engine through `SPIDER_MAX_SIZE_BYTES`, because both of its configurable byte limits are browser-only and do nothing in this build. It is therefore process-wide, read by the engine on its first fetch, and no test can observe it landing. Renaming the variable, or letting anything run before `SpiderEngine::crawl` sets it, silently removes the ceiling. | tripwire | none, the reason is in the file |
 | The crawl engine's feature list in `Cargo.toml` is a set of decisions, not a bundle: two features of its `basic` set corrupt an archive silently, one spooling large bodies to disk and reporting them as empty, one attaching a browser fingerprint to every request. Adding features back, or taking `basic` for convenience, reintroduces them. | tripwire | none, the reason is in the file |
 | The release matrix names the runner labels `ubuntu-24.04-arm` and `macos-15-intel`. They are unverified until the first tag, and a wrong label fails the job at startup rather than at build time. | tripwire | none until the first release |
 

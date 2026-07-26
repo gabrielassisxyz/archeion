@@ -7,6 +7,7 @@
 mod boundary;
 mod spider_engine;
 
+pub(crate) use boundary::points_inside_a_network;
 pub use boundary::{
     CrawlEngine, CrawlError, CrawlOutcome, CrawlStop, FetchFailure, PageEvent, PageResponse, Seed,
 };

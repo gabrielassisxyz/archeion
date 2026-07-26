@@ -14,9 +14,7 @@ use jiff::Timestamp;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::model::{
-    Asset, Capture, CaptureId, ContentHash, Header, Item, ItemId, NewCapture, StoredBody,
-};
+use super::model::{Asset, Capture, CaptureId, ContentHash, Item, ItemId, NewCapture, StoredBody};
 use crate::canonical_url::CanonicalUrl;
 
 const MARKER_FILE: &str = "archeion.json";
@@ -129,15 +127,7 @@ impl Archive {
             });
         }
 
-        let fingerprint = fingerprint_of(
-            &new.requested_url,
-            &new.final_url,
-            new.status,
-            new.media_type.as_deref(),
-            &new.response_headers,
-            &body.sha256,
-            &assets,
-        );
+        let fingerprint = fingerprint_of(&new, &body.sha256, &assets);
         let capture = Capture {
             id: CaptureId::new(new.fetched_at, &fingerprint),
             item_id: ItemId::of(&new.canonical_url),
@@ -147,6 +137,7 @@ impl Archive {
             media_type: new.media_type,
             response_headers: new.response_headers,
             body,
+            body_truncated: new.body_truncated,
             fetched_at: new.fetched_at,
             assets,
         };
@@ -325,32 +316,29 @@ fn directory_has_visible_entries(path: &Path) -> Result<bool, StorageError> {
 /// filename that has to stay the same forever, and JSON output is a moving target: a
 /// renamed field or a changed formatter would silently rename every capture written after
 /// it, filing a re-write of an existing capture beside the original instead of over it.
-fn fingerprint_of(
-    requested_url: &str,
-    final_url: &str,
-    status: u16,
-    media_type: Option<&str>,
-    response_headers: &[Header],
-    body: &ContentHash,
-    assets: &[Asset],
-) -> ContentHash {
+fn fingerprint_of(new: &NewCapture, body: &ContentHash, assets: &[Asset]) -> ContentHash {
     fn push_field(buffer: &mut Vec<u8>, value: &str) {
         buffer.extend_from_slice(&(value.len() as u64).to_le_bytes());
         buffer.extend_from_slice(value.as_bytes());
     }
 
+    let media_type = new.media_type.as_deref();
     let mut buffer = Vec::new();
-    push_field(&mut buffer, requested_url);
-    push_field(&mut buffer, final_url);
-    push_field(&mut buffer, &status.to_string());
+    push_field(&mut buffer, &new.requested_url);
+    push_field(&mut buffer, &new.final_url);
+    push_field(&mut buffer, &new.status.to_string());
     // An absent media type is not an empty one, and a name must not conflate them.
     buffer.push(u8::from(media_type.is_some()));
     push_field(&mut buffer, media_type.unwrap_or(""));
-    for header in response_headers {
+    for header in &new.response_headers {
         push_field(&mut buffer, &header.name);
         push_field(&mut buffer, &header.value);
     }
     push_field(&mut buffer, body.as_str());
+    // Two fetches can agree on every byte they kept and disagree on whether that was all
+    // of them, and the whole promise of this name is that a difference gets a file rather
+    // than overwriting the capture it differs from.
+    buffer.push(u8::from(new.body_truncated));
     for asset in assets {
         push_field(&mut buffer, asset.body.sha256.as_str());
     }

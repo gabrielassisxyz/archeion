@@ -57,7 +57,7 @@ async fn crawl_seed(
     // absorb the difference. Sizing it to the fetch concurrency alone drops pages the
     // moment a write is slower than a fetch; sizing it to the page limit would hold a
     // whole crawl's bodies in memory. What overflows anyway is counted, never ignored.
-    let mut pages = website.subscribe(seed.concurrency * 4);
+    let mut pages = website.subscribe(fetch_concurrency(seed) * 4);
     let mut outcome = CrawlOutcome::default();
 
     let crawl = async {
@@ -74,7 +74,8 @@ async fn crawl_seed(
     // The crawl finishing does not mean the queue is empty, and cancelling the drain to
     // learn that would throw away pages already fetched. Only a caller that asked to stop
     // leaves the rest unread, and what it leaves is counted like any other loss: those
-    // pages cost a fetch each and the archive does not have them.
+    // pages cost a fetch each and the archive does not have them. The count is a floor,
+    // since a task still in flight can queue another page after the length is read.
     if stopped_by_caller {
         outcome.pages_dropped += pages.len();
     } else {
@@ -109,14 +110,20 @@ async fn drain(
     }
 }
 
+/// Zero permits is a crawl that waits forever on its own semaphore, with no page to stop it
+/// through and no deadline to end it, so a zero is corrected rather than obeyed. It is read
+/// through here and not at the call sites, which is what keeps the queue sized against the
+/// concurrency the engine was actually given.
+fn fetch_concurrency(seed: &Seed) -> usize {
+    seed.concurrency.max(1)
+}
+
 fn configured_website(start: &str, seed: &Seed) -> Website {
     let mut website = Website::new(start);
     website
         .with_limit(seed.max_pages)
         .with_depth(seed.max_depth)
-        // Zero permits is a crawl that waits forever on its own semaphore, with no page to
-        // stop it through and no deadline to end it, so it is corrected rather than obeyed.
-        .with_concurrency_limit(Some(seed.concurrency.max(1)))
+        .with_concurrency_limit(Some(fetch_concurrency(seed)))
         .with_delay(u64::try_from(seed.delay.as_millis()).unwrap_or(u64::MAX))
         .with_respect_robots_txt(true)
         // A seed is a site, not a company: subdomains and other TLDs of the same name are
@@ -179,8 +186,9 @@ fn headers_of(headers: Option<&HeaderMap>) -> Vec<Header> {
 /// Refuses a seed before the engine dials anything. The scheme decides what gets opened,
 /// and `file:` or `data:` reaching a crawler is the archive reading the local machine.
 ///
-/// This is the cheap half of the guard. Redirects into private ranges are the other half,
-/// and they are not checked here: they happen inside the engine, after this call.
+/// What this does not check is the address itself: a seed naming a private or link-local
+/// host is accepted here. Redirects into those ranges are already refused by the engine, so
+/// the seed is the open half of the guard, not the closed one.
 fn usable_seed_url(url: &str) -> Result<String, CrawlError> {
     let parsed = Url::parse(url).map_err(|error| CrawlError::UnusableSeed {
         url: url.to_owned(),
@@ -205,6 +213,8 @@ fn usable_seed_url(url: &str) -> Result<String, CrawlError> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use spider::tokio::sync::broadcast;
 
     use super::*;
@@ -287,7 +297,16 @@ mod tests {
         match page_event(page) {
             PageEvent::Response(response) => {
                 assert_eq!(response.final_url, "https://example.com/final");
-                assert_ne!(response.requested_url, response.final_url);
+            }
+            PageEvent::NoResponse(failure) => panic!("a response was lost: {}", failure.reason),
+        }
+    }
+
+    #[test]
+    fn a_page_that_did_not_redirect_ends_where_it_started() {
+        match page_event(Page::default()) {
+            PageEvent::Response(response) => {
+                assert_eq!(response.final_url, response.requested_url);
             }
             PageEvent::NoResponse(failure) => panic!("a response was lost: {}", failure.reason),
         }
@@ -336,15 +355,22 @@ mod tests {
 
             let mut received = 0usize;
             let mut outcome = CrawlOutcome::default();
-            let stopped = drain(
-                &mut pages,
-                &mut |_| {
-                    received += 1;
-                    ControlFlow::Break(())
-                },
-                &mut outcome,
+            // Under a deadline, because the failure being guarded against is a drain that
+            // keeps reading: without one, the regression stops the test run instead of
+            // failing it.
+            let stopped = spider::tokio::time::timeout(
+                Duration::from_secs(5),
+                drain(
+                    &mut pages,
+                    &mut |_| {
+                        received += 1;
+                        ControlFlow::Break(())
+                    },
+                    &mut outcome,
+                ),
             )
-            .await;
+            .await
+            .expect("the drain answered the caller instead of reading on");
 
             assert!(stopped);
             assert_eq!(received, 1);

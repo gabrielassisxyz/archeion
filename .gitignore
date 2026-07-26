@@ -5,6 +5,11 @@
 # Crawl and benchmark output: regenerated on demand, never reviewed.
 /runs
 
+# Issue tracker state: the maintainer's work queue, not part of the deliverable.
+# ROADMAP.md is its public counterpart. No trailing slash, see the note below.
+.beads
+.bv
+
 # >>> repo-harness:gitignore-private-boundary >>>
 # Maintainer notes — not part of the project; they live in the private notes repo,
 # reachable through the `local` symlink. NO trailing slash on any path in this block:

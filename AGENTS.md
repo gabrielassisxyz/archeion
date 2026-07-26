@@ -11,6 +11,7 @@
 - **Run:** `cargo run`
 - **Test:** `cargo test`
 - **Every gate at once:** `bin/ci`, which is exactly what CI runs. Green locally means green in CI.
+- **Planned work:** `br ready` for what can be started now, `br` for the rest. The queue is maintainer state and is not committed; `ROADMAP.md` is its public counterpart.
 - **Once after cloning:** `bin/install-hooks`
 - **Before the first write of a session:** `bin/worktree new <type>/<kebab-description>`
 

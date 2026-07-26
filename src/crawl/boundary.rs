@@ -64,6 +64,10 @@ impl Seed {
             // one dead connection holding a sixteenth of the run for a third of its
             // deadline. Thirty seconds is long for a page and short against the budget.
             request_timeout: Duration::from_secs(30),
+            // This number multiplies the one above: a URL that keeps timing out is paid for
+            // once per attempt, so the ceiling for a single dead URL is ninety seconds and
+            // the backoff between them, not thirty. Two is what keeps that under a third of
+            // the deadline while still giving a 429 somewhere to land.
             max_retries: 2,
         }
     }

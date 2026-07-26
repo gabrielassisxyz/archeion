@@ -195,7 +195,8 @@ fn configured_website(start: &str, seed: &Seed) -> Website {
         // status invented for it. The engine's own default is 120 seconds.
         .with_request_timeout(Some(seed.request_timeout))
         // The engine repeats a request whose status says repeating might work, which is a
-        // 429, a 408 or a server error, and never a DNS failure or a redirect loop. Between
+        // 429, a 408 or a server error other than 501, 505 and 511, and never a DNS failure
+        // or a redirect loop, since none of those answer differently the second time. Between
         // attempts it waits the longer of an exponential backoff and what the response
         // asked for, which for a 429 is its `Retry-After`. The default is no retry at all.
         .with_retry(seed.max_retries)

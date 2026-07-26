@@ -5,7 +5,7 @@
 //! canonicalization decides the address the page is filed under.
 
 use std::ops::ControlFlow;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::canonical_url::{CanonicalUrl, InvalidCanonicalUrl};
 use crate::crawl::{
@@ -55,10 +55,11 @@ pub struct CaptureRun {
 
 /// Crawls a seed and stores every page it produces, for as long as the seed's budget lasts.
 ///
-/// The deadline is enforced here as well as inside the engine, and the two catch different
-/// failures. An engine that stalls with nothing to report never reaches this callback, so
-/// only the engine can end that one; an engine that ignores the seed's deadline is ended
-/// here instead, on the next page it produces.
+/// The deadline is the engine's to enforce, because a host that accepts a connection and
+/// then says nothing produces no page, and a callback that is never called cannot end
+/// anything. What lives here is the backstop for the opposite failure, an engine that
+/// ignores the field, and it deliberately fires late rather than on the instant: see
+/// `engine_overran_its_deadline`.
 pub fn capture_seed(
     engine: &dyn CrawlEngine,
     archive: &Archive,
@@ -68,7 +69,7 @@ pub fn capture_seed(
     let mut write_failure: Option<StorageError> = None;
     let started = Instant::now();
     let deadline = seed.deadline;
-    let mut out_of_budget = false;
+    let mut engine_overran = false;
 
     let outcome = engine.crawl(seed, &mut |event| {
         if capture_page(event, archive, &mut run, &mut write_failure).is_break() {
@@ -76,8 +77,8 @@ pub fn capture_seed(
         }
         // Read after the page is filed rather than before: it arrived already fetched, and
         // refusing to write what is in hand spends the bytes without keeping anything.
-        if deadline.is_some_and(|budget| started.elapsed() >= budget) {
-            out_of_budget = true;
+        if engine_overran_its_deadline(deadline, started.elapsed()) {
+            engine_overran = true;
             return ControlFlow::Break(());
         }
         ControlFlow::Continue(())
@@ -85,7 +86,7 @@ pub fn capture_seed(
 
     run.pages_dropped = outcome.pages_dropped;
     // The engine reports that its caller stopped it. This is that caller, and it knows why.
-    run.stopped = if out_of_budget {
+    run.stopped = if engine_overran {
         CrawlStop::DeadlineReached
     } else {
         outcome.stopped
@@ -94,6 +95,17 @@ pub fn capture_seed(
         return Err(CaptureError::Storage { source, run });
     }
     Ok(run)
+}
+
+/// Whether the engine is still handing over pages long after the budget it was given.
+///
+/// The margin is the whole point. An engine that honors the deadline cancels its fetching
+/// when the budget expires and then hands over the pages it had already paid for, and a
+/// guard that fired on the same instant would break out on the first of them and count the
+/// rest as lost. That handover is local writes, so a tenth of the budget is far more room
+/// than it needs, while still bounding an engine that ignores the field.
+fn engine_overran_its_deadline(deadline: Option<Duration>, elapsed: Duration) -> bool {
+    deadline.is_some_and(|budget| elapsed >= budget.saturating_add(budget / 10))
 }
 
 /// Files one page under the address the archive knows it by.
@@ -430,6 +442,7 @@ mod tests {
 
     /// The engine here replays a list and knows nothing about a deadline, which is exactly
     /// the case this guard is for: an engine that ignores the field is stopped from above.
+    /// A budget of zero has a margin of zero, so the guard is armed on the first page.
     #[test]
     fn a_seed_out_of_budget_stops_after_the_page_it_is_holding() {
         let dir = TempDir::new().expect("temp dir");
@@ -464,6 +477,38 @@ mod tests {
 
         assert_eq!(run.captures_written, 1);
         assert_eq!(run.stopped, CrawlStop::Exhausted);
+    }
+
+    /// An engine that honors the deadline is mid-handover when the budget expires, passing
+    /// up the pages it had already fetched. Cutting it on the instant would lose exactly the
+    /// pages the deadline was careful to keep, so the guard above it has to arrive later.
+    #[test]
+    fn an_engine_still_handing_over_at_its_deadline_is_left_to_finish() {
+        let budget = Duration::from_secs(300);
+
+        assert!(!engine_overran_its_deadline(Some(budget), budget));
+        assert!(!engine_overran_its_deadline(
+            Some(budget),
+            budget + Duration::from_secs(29)
+        ));
+    }
+
+    #[test]
+    fn an_engine_fetching_well_past_the_budget_is_cut_from_above() {
+        let budget = Duration::from_secs(300);
+
+        assert!(engine_overran_its_deadline(
+            Some(budget),
+            budget + Duration::from_secs(31)
+        ));
+    }
+
+    #[test]
+    fn a_seed_that_asked_for_no_deadline_is_never_cut_from_above() {
+        assert!(!engine_overran_its_deadline(
+            None,
+            Duration::from_secs(86_400)
+        ));
     }
 
     /// The engine has its own reach on the deadline: it can end a crawl that produced no

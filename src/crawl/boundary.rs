@@ -153,11 +153,14 @@ pub enum CrawlError {
 ///
 /// `on_page` answers with a `ControlFlow` because the caller is the one that knows when
 /// continuing is pointless. A failed write to the archive is one case: the next two hundred
-/// pages will fail the same way, so the crawl stops on the first. The seed's deadline is the
-/// other, and the caller enforces it there even though the engine is asked to enforce it
-/// too. The two reach different failures. An engine that stalls with nothing to report never
-/// calls `on_page` at all, so only the engine can cut that one; an engine that ignores the
-/// field is cut by the caller instead, on whatever page it does produce.
+/// pages will fail the same way, so the crawl stops on the first.
+///
+/// Enforcing `Seed::deadline` is the engine's job, and it is not optional: an engine that
+/// stalls with nothing to report never calls `on_page` at all, so nothing above this line
+/// gets a turn to end it. What an engine is expected to do when the budget expires is stop
+/// fetching, hand over what it already fetched, and answer `CrawlStop::DeadlineReached`. The
+/// caller keeps a backstop for an engine that ignores the field, but it fires a good margin
+/// after the budget, precisely so that handover is never the thing it cuts short.
 pub trait CrawlEngine {
     fn crawl(
         &self,

@@ -294,10 +294,34 @@ fn named_entity(nodes: &[&Value], field: &str) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
+/// Types that describe the site, its navigation, or something the page merely mentions,
+/// rather than the page in front of the reader.
+///
+/// A `@graph` almost always opens with one of them, and they carry the same field names the
+/// page's own node does: a `WebSite` has a `name` and it is the name of the site, a `Person`
+/// has one and it is the author's. `WebPage` is deliberately absent: that node is the page,
+/// and its `name` is the page's.
+const NOT_THE_PAGE: [&str; 8] = [
+    "website",
+    "breadcrumblist",
+    "sitenavigationelement",
+    "organization",
+    "itemlist",
+    "listitem",
+    "person",
+    "imageobject",
+];
+
 /// Flattens the shapes a JSON-LD block arrives in into the objects that carry fields: a
 /// bare object, a list of them, or a `@graph` holding the list. Nesting deeper than that is
 /// not followed, because a field found at an arbitrary depth belongs to some sub-entity of
 /// the page rather than to the page.
+///
+/// The nodes that describe the site rather than its content are dropped, since they answer
+/// to the same field names and usually come first. When every node is one of those, the
+/// list is kept whole: a page whose only structured data describes the site is better read
+/// from it than from nothing, and that is also the behavior a reader of an older record
+/// would recognize.
 fn schema_nodes(blocks: &[Value]) -> Vec<&Value> {
     let mut nodes = Vec::new();
     for block in blocks {
@@ -312,5 +336,31 @@ fn schema_nodes(blocks: &[Value]) -> Vec<&Value> {
             _ => {}
         }
     }
-    nodes
+
+    let about_the_page: Vec<&Value> = nodes
+        .iter()
+        .copied()
+        .filter(|node| !describes_the_site(node))
+        .collect();
+    if about_the_page.is_empty() {
+        nodes
+    } else {
+        about_the_page
+    }
+}
+
+/// `@type` is a string on most nodes and a list on some, and either can name a type this
+/// does not want to read the page's fields out of.
+fn describes_the_site(node: &Value) -> bool {
+    fn is_structural(value: &Value) -> bool {
+        value
+            .as_str()
+            .is_some_and(|kind| NOT_THE_PAGE.contains(&kind.trim().to_ascii_lowercase().as_str()))
+    }
+
+    match node.get("@type") {
+        Some(Value::Array(kinds)) => kinds.iter().any(is_structural),
+        Some(kind) => is_structural(kind),
+        None => false,
+    }
 }

@@ -244,6 +244,56 @@ mod tests {
         }
     }
 
+    /// The shape most sites emit: a graph whose first node describes the site. Every node
+    /// in it answers to `name`, so reading the first one that has the field archives the
+    /// name of the site, of a breadcrumb trail or of the author as the page's title.
+    #[test]
+    fn the_page_is_read_from_its_own_node_and_not_from_the_site_around_it() {
+        let page = extract_html(
+            r#"<title>How to bake bread</title>
+               <script type="application/ld+json">{"@graph":[
+                 {"@type":"WebSite","name":"Recipes Weekly"},
+                 {"@type":"BreadcrumbList","name":"Breadcrumbs"},
+                 {"@type":"Person","name":"J. Writer"},
+                 {"@type":"Article","name":"How to bake bread, properly"}]}</script>"#,
+        );
+        assert_eq!(
+            value_of(page.title),
+            Some((
+                "How to bake bread, properly".to_owned(),
+                MetadataSource::SchemaOrg
+            ))
+        );
+    }
+
+    #[test]
+    fn a_page_whose_only_structured_data_describes_the_site_still_reads_it() {
+        let page = extract_html(
+            r#"<script type="application/ld+json">
+                 {"@type":"WebSite","name":"Recipes Weekly"}</script>"#,
+        );
+        assert_eq!(
+            value_of(page.title),
+            Some(("Recipes Weekly".to_owned(), MetadataSource::SchemaOrg))
+        );
+    }
+
+    /// A node naming several types is structural if any of them is, and the page's own node
+    /// is the one that survives.
+    #[test]
+    fn a_node_that_names_several_types_is_judged_by_all_of_them() {
+        let page = extract_html(
+            r#"<title>the tab</title>
+               <script type="application/ld+json">{"@graph":[
+                 {"@type":["CreativeWork","BreadcrumbList"],"name":"Breadcrumbs"},
+                 {"@type":["Article","NewsArticle"],"name":"The article"}]}</script>"#,
+        );
+        assert_eq!(
+            value_of(page.title),
+            Some(("The article".to_owned(), MetadataSource::SchemaOrg))
+        );
+    }
+
     #[test]
     fn a_graph_is_looked_into_and_deeper_nesting_is_not() {
         let page = extract_html(

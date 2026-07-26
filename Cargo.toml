@@ -15,14 +15,16 @@ jiff = { version = "0.2.35", default-features = false, features = ["std", "serde
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
-# Not the `basic` bundle: it pulls the engine's own SQL-backed spool, and this archive is
-# the thing that owns disk. Everything else `basic` turns on is listed here one by one, so
-# the engine behaves as it did when it was benchmarked and the dependency tree stays
-# something a single operator can audit.
+# Spelled out rather than taken as the `basic` bundle, because three of the features in it
+# are wrong for an archive and silent about it. `balance` spools a large response body to a
+# temporary file and then reports an empty body, which would store the page as if it had
+# arrived. `real_browser` attaches a browser fingerprint to every request, which is the
+# opposite of a crawler that says who it is. `disk_native_tls` pulls a SQL driver this
+# archive has no use for, and with it a crate under an advisory that has no fixed version.
+# Removing any entry below changes how the engine crawls, so remove one on purpose.
 spider = { version = "2.52", default-features = false, features = [
     "adaptive_concurrency",
     "auto_throttle",
-    "balance",
     "cookies",
     "dns_cache",
     "encoding",
@@ -30,7 +32,6 @@ spider = { version = "2.52", default-features = false, features = [
     "headers",
     "priority_frontier",
     "rate_limit",
-    "real_browser",
     "request_coalesce",
     "reqwest_native_tls_native_roots",
     "string_interner_buffer_backend",

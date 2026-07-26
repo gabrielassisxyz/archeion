@@ -10,6 +10,7 @@
 //! adapter would have to provide.
 
 use std::future::Future;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::ControlFlow;
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ use spider::tokio::runtime::Runtime;
 use spider::tokio::sync::broadcast::Receiver;
 use spider::tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use spider::website::Website;
-use url::Url;
+use url::{Host, Url};
 
 use super::boundary::{
     CrawlEngine, CrawlError, CrawlOutcome, CrawlStop, FetchFailure, PageEvent, PageResponse, Seed,
@@ -43,7 +44,7 @@ impl CrawlEngine for SpiderEngine {
         seed: &Seed,
         on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
     ) -> Result<CrawlOutcome, CrawlError> {
-        let start = usable_seed_url(&seed.url)?;
+        let start = usable_seed_url(seed)?;
         let runtime = Runtime::new().map_err(|source| CrawlError::EngineUnavailable { source })?;
         Ok(runtime.block_on(crawl_seed(&start, seed, on_page)))
     }
@@ -259,31 +260,83 @@ fn headers_of(headers: Option<&HeaderMap>) -> Vec<Header> {
 }
 
 /// Refuses a seed before the engine dials anything. The scheme decides what gets opened,
-/// and `file:` or `data:` reaching a crawler is the archive reading the local machine.
-///
-/// What this does not check is the address itself: a seed naming a private or link-local
-/// host is accepted here. Redirects into those ranges are already refused by the engine, so
-/// the seed is the open half of the guard, not the closed one.
-fn usable_seed_url(url: &str) -> Result<String, CrawlError> {
-    let parsed = Url::parse(url).map_err(|error| CrawlError::UnusableSeed {
-        url: url.to_owned(),
-        reason: error.to_string(),
-    })?;
+/// and `file:` or `data:` reaching a crawler is the archive reading the local machine. The
+/// address decides what gets reached, and it is checked here because the engine screens
+/// every redirect hop for the same ranges but never the seed, which it dials directly.
+fn usable_seed_url(seed: &Seed) -> Result<String, CrawlError> {
+    let unusable = |reason: String| CrawlError::UnusableSeed {
+        url: seed.url.clone(),
+        reason,
+    };
+    let parsed = Url::parse(&seed.url).map_err(|error| unusable(error.to_string()))?;
 
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(CrawlError::UnusableSeed {
-            url: url.to_owned(),
-            reason: format!("{} is not a scheme this archive fetches", parsed.scheme()),
-        });
+        return Err(unusable(format!(
+            "{} is not a scheme this archive fetches",
+            parsed.scheme()
+        )));
     }
-    if parsed.host_str().is_none() {
-        return Err(CrawlError::UnusableSeed {
-            url: url.to_owned(),
-            reason: "no host to crawl".to_owned(),
-        });
+    let Some(host) = parsed.host() else {
+        return Err(unusable("no host to crawl".to_owned()));
+    };
+    if !seed.allow_private_addresses && is_internal_host(&host) {
+        return Err(unusable(format!(
+            "{host} is inside a network rather than on the web"
+        )));
     }
 
     Ok(parsed.to_string())
+}
+
+/// Whether a host exists only inside a network. It is the seed half of the guard the engine
+/// applies to every redirect hop, and it is deliberately the same shape as that one.
+///
+/// Neither half resolves the name. A domain answering with a private address passes both,
+/// and closing that gap means resolving before the connect and pinning the answer at connect
+/// time, since a name is free to answer differently the second time it is asked. That is a
+/// resolving connector rather than a string check, and it does not exist here yet.
+fn is_internal_host(host: &Host<&str>) -> bool {
+    match host {
+        Host::Domain(name) => is_internal_name(name),
+        Host::Ipv4(address) => is_internal_ipv4(*address),
+        Host::Ipv6(address) => is_internal_ipv6(*address),
+    }
+}
+
+fn is_internal_name(name: &str) -> bool {
+    // A trailing dot is the same name spelled as a fully qualified one, and a guard that
+    // matched on the string alone would be walked past by typing it.
+    let name = name.trim_end_matches('.');
+    name == "localhost"
+        || name.ends_with(".localhost")
+        // The cloud metadata services answer on these as well as on 169.254.169.254, and
+        // that address is the credential store of whatever machine the archive runs on.
+        || name == "metadata.google.internal"
+        || name == "metadata.goog"
+}
+
+fn is_internal_ipv4(address: Ipv4Addr) -> bool {
+    // Link-local covers 169.254.169.254, so the metadata address needs no line of its own.
+    address.is_loopback()
+        || address.is_private()
+        || address.is_link_local()
+        || address.is_unspecified()
+        || address.is_broadcast()
+}
+
+fn is_internal_ipv6(address: Ipv6Addr) -> bool {
+    if address.is_loopback() || address.is_unspecified() {
+        return true;
+    }
+    // The two ranges below are exactly what this guard is for, and the standard library
+    // still has both predicates behind an unstable flag: fc00::/7 is the private range and
+    // fe80::/10 is where a link-local address lives.
+    let first = address.segments()[0];
+    if first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80 {
+        return true;
+    }
+    // An address written as ::ffff:127.0.0.1 reaches the same machine as 127.0.0.1 does.
+    address.to_ipv4_mapped().is_some_and(is_internal_ipv4)
 }
 
 #[cfg(test)]
@@ -302,18 +355,87 @@ mod tests {
             "example.com/a",
             "",
         ] {
-            assert!(usable_seed_url(hostile).is_err(), "{hostile} was accepted");
+            assert!(
+                usable_seed_url(&Seed::new(hostile)).is_err(),
+                "{hostile} was accepted"
+            );
+        }
+    }
+
+    /// The half of the guard the engine leaves open: it screens every redirect hop for
+    /// these ranges and dials the seed straight, so a seed pointed at the cloud metadata
+    /// service, at the machine's own ports or at the network around it is refused here or
+    /// nowhere.
+    #[test]
+    fn a_seed_pointed_inside_a_network_is_refused() {
+        for internal in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://metadata.goog/",
+            "http://localhost:8000/",
+            "http://LocalHost./",
+            "http://api.localhost/",
+            "http://127.0.0.1/",
+            "http://127.1/",
+            "http://10.0.0.1/",
+            "http://192.168.1.1/",
+            "http://172.16.0.1/",
+            "http://0.0.0.0/",
+            "http://255.255.255.255/",
+            "http://[::1]/",
+            "http://[::]/",
+            "http://[fc00::1]/",
+            "http://[fe80::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://[::ffff:10.0.0.1]/",
+        ] {
+            assert!(
+                usable_seed_url(&Seed::new(internal)).is_err(),
+                "{internal} was accepted"
+            );
+        }
+    }
+
+    /// Archiving a site served locally is a real thing to ask for, and it is the only way
+    /// the fetch path is ever exercised. It has to be asked for, which is the whole
+    /// difference between this and the test above.
+    #[test]
+    fn a_seed_inside_a_network_is_reachable_when_the_run_asked_for_it() {
+        let mut seed = Seed::new("http://127.0.0.1:8000/index.html");
+        seed.allow_private_addresses = true;
+
+        assert_eq!(
+            usable_seed_url(&seed).expect("a local seed the run asked for"),
+            "http://127.0.0.1:8000/index.html"
+        );
+    }
+
+    /// A public address is not refused by a guard that reads every private range as a
+    /// prefix, which is the failure that turns a security check into an outage.
+    #[test]
+    fn a_seed_on_the_public_web_is_not_mistaken_for_a_private_one() {
+        for public in [
+            "https://example.com/a",
+            "http://8.8.8.8/",
+            "http://172.32.0.1/",
+            "http://[2001:db8::1]/",
+            "http://notlocalhost.com/",
+        ] {
+            assert!(
+                usable_seed_url(&Seed::new(public)).is_ok(),
+                "{public} was refused"
+            );
         }
     }
 
     #[test]
     fn a_usable_seed_survives_the_check_as_the_engine_will_see_it() {
         assert_eq!(
-            usable_seed_url("https://example.com/a").expect("usable seed"),
+            usable_seed_url(&Seed::new("https://example.com/a")).expect("usable seed"),
             "https://example.com/a"
         );
         assert_eq!(
-            usable_seed_url("http://example.com").expect("usable seed"),
+            usable_seed_url(&Seed::new("http://example.com")).expect("usable seed"),
             "http://example.com/"
         );
     }

@@ -43,6 +43,15 @@ pub struct Seed {
     /// it is the only thing that can fetch again; how much of the budget to spend on it is
     /// the archive's call and lives here.
     pub max_retries: u8,
+    /// Whether the seed may name an address that exists only inside a network: loopback, a
+    /// private range, link-local, or one of the names a cloud metadata service answers on.
+    /// It is off, so a URL cannot talk the archive into reading the machine it runs on or
+    /// the network around it.
+    ///
+    /// Turning it on is how a locally served site is archived at all, and it is also the
+    /// only way the fetch path itself is ever exercised, since every check of it points at
+    /// a server on localhost.
+    pub allow_private_addresses: bool,
 }
 
 impl Seed {
@@ -69,6 +78,10 @@ impl Seed {
             // the backoff between them, not thirty. Two is what keeps that under a third of
             // the deadline while still giving a 429 somewhere to land.
             max_retries: 2,
+            // A seed arrives from outside and the ranges below are the ones an outside URL
+            // has no business naming, so the default is the safe half of the choice and
+            // reaching a local server is the part that has to be asked for.
+            allow_private_addresses: false,
         }
     }
 }

@@ -28,6 +28,9 @@ fn main() {
     let mut seed = Seed::new(seed_url);
     seed.max_pages = 10;
     seed.concurrency = 4;
+    // The whole point of this example is a server on localhost, which is an address a seed
+    // is refused for unless the run says it meant it.
+    seed.allow_private_addresses = true;
     // Short enough that a server which stalls ends the run while you are still watching it,
     // which is the half of the execution policy no test can reach.
     seed.deadline = Some(Duration::from_secs(20));

@@ -8,17 +8,17 @@ Direction, not a schedule. It answers three questions for someone arriving at th
 - The engineering harness: a secret scan and a prose gate on every commit, `bin/ci` as the single gate runner, CI and a tagged release pipeline with checksums and an installer.
 - The storage model. Item, capture and asset as records, response bodies addressed by content hash, and a store that writes a capture and reads it back. The archive is a directory whose files are the record: an index, when one is needed, is derived from it and disposable. [`docs/storage-model.md`](docs/storage-model.md) has the layout and the reasoning.
 - The crawl boundary, and a seed captured into an archive through it. The engine reaches the archive as page events and nothing else, so it can be replaced by writing one adapter, and a run reports what it archived, what it could not address and what it lost. [`docs/crawl-boundary.md`](docs/crawl-boundary.md) has what crosses the line and why it has that shape.
+- The execution policy. A seed carries a wall-clock deadline, a ceiling on one request and a retry budget, so no single host can own a whole run and a run that ends early says whether it ran out of pages, of time, or of patience with a disk. [`docs/crawl-boundary.md`](docs/crawl-boundary.md) has where each of the three is enforced and why the deadline is enforced twice.
 - Canonicalization and dedupe. Every spelling of a page reduces to one address, so `www.example.com` and `example.com` are one item and a campaign parameter does not make a second one, while identical bytes stay one stored file however many captures reference them. [`docs/canonicalization.md`](docs/canonicalization.md) has the rules, the ones deliberately rejected, and the reason a lossy rule is safe to apply.
 
 ## What is missing
 
 Roughly in dependency order, since each item unlocks the next.
 
-1. **Execution policy.** Per-seed deadlines, per-domain timeout, retry and backoff. Without these a single slow domain silently consumes an entire run.
-2. **Metadata extraction.** Title, author, publication date, OpenGraph and schema.org, outbound links, referenced assets.
-3. **Asset capture.** The images, stylesheets and media a page needs to still make sense once the source is gone.
-4. **Query and export.** An index over the collection, and an export format that outlives this tool.
-5. **Readability extraction.** Article text separated from page furniture, kept alongside the raw response and never in place of it.
+1. **Metadata extraction.** Title, author, publication date, OpenGraph and schema.org, outbound links, referenced assets.
+2. **Asset capture.** The images, stylesheets and media a page needs to still make sense once the source is gone.
+3. **Query and export.** An index over the collection, and an export format that outlives this tool.
+4. **Readability extraction.** Article text separated from page furniture, kept alongside the raw response and never in place of it.
 
 ## Out of scope
 

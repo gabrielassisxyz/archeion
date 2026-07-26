@@ -110,6 +110,7 @@
 |---|---|---|
 | A fresh clone runs no git hooks until `bin/install-hooks` is run once. Nothing reports this: commits simply pass ungated. | tripwire | none, it is a clone-time step |
 | `bin/slop-guard`, `scripts/md-unwrap.py`, `bin/worktree`, `bin/install-hooks` and the git hooks are byte-identical copies of a canonical source outside this repo. Fix the original and re-copy; a local edit is drift that the next sync silently reverts. | prose | none |
+| The crawl adapter (`src/crawl/spider_engine.rs`) is the one part of the capture path no test covers, since a test may not reach the network. A change there compiles and passes `bin/ci` while being broken. `cargo run --example capture_seed -- <url> <dir>` against a server on localhost is the check. | tripwire | none, it is a manual run |
 | The release matrix names the runner labels `ubuntu-24.04-arm` and `macos-15-intel`. They are unverified until the first tag, and a wrong label fails the job at startup rather than at build time. | tripwire | none until the first release |
 
 **A hurdle promoted to a gate is deleted from this table, not duplicated.** The gate is the instruction; a line here restating it only dilutes the ones still unguarded.

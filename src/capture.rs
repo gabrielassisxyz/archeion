@@ -5,9 +5,12 @@
 //! canonicalization decides the address the page is filed under.
 
 use std::ops::ControlFlow;
+use std::time::Instant;
 
 use crate::canonical_url::{CanonicalUrl, InvalidCanonicalUrl};
-use crate::crawl::{CrawlEngine, CrawlError, FetchFailure, PageEvent, PageResponse, Seed};
+use crate::crawl::{
+    CrawlEngine, CrawlError, CrawlStop, FetchFailure, PageEvent, PageResponse, Seed,
+};
 use crate::storage::{Archive, Header, NewCapture, StorageError};
 
 #[derive(Debug, thiserror::Error)]
@@ -45,14 +48,17 @@ pub struct CaptureRun {
     pub failed_fetches: Vec<FetchFailure>,
     /// Pages the engine fetched that never reached the archive, straight from the engine.
     pub pages_dropped: usize,
+    /// Why the run ended. A run that stopped at its deadline archived a prefix of a site
+    /// rather than the site, and the difference is not visible in any of the counts above.
+    pub stopped: CrawlStop,
 }
 
-/// Crawls a seed and stores every page it produces.
+/// Crawls a seed and stores every page it produces, for as long as the seed's budget lasts.
 ///
-/// A page the archive cannot address is skipped and reported: one URL the canonical rules
-/// refuse says nothing about the other two hundred. A failed write is the opposite, and
-/// stops the run: the disk that rejected this capture will reject the next one, and a
-/// crawl that keeps fetching after that spends a site's bandwidth on nothing.
+/// The deadline is enforced here as well as inside the engine, and the two catch different
+/// failures. An engine that stalls with nothing to report never reaches this callback, so
+/// only the engine can end that one; an engine that ignores the seed's deadline is ended
+/// here instead, on the next page it produces.
 pub fn capture_seed(
     engine: &dyn CrawlEngine,
     archive: &Archive,
@@ -60,47 +66,80 @@ pub fn capture_seed(
 ) -> Result<CaptureRun, CaptureError> {
     let mut run = CaptureRun::default();
     let mut write_failure: Option<StorageError> = None;
+    let started = Instant::now();
+    let deadline = seed.deadline;
+    let mut out_of_budget = false;
 
     let outcome = engine.crawl(seed, &mut |event| {
-        let page = match event {
-            PageEvent::Response(page) => page,
-            PageEvent::NoResponse(failure) => {
-                run.failed_fetches.push(failure);
-                return ControlFlow::Continue(());
-            }
-        };
-
-        // The final URL and not the requested one: after a redirect, the content is at the
-        // destination, and filing it under the address that pointed there would give the
-        // same page a second identity for every link that reaches it.
-        let canonical = match CanonicalUrl::parse(&page.final_url) {
-            Ok(canonical) => canonical,
-            Err(reason) => {
-                run.unaddressable_pages.push(UnaddressablePage {
-                    url: page.final_url,
-                    reason,
-                });
-                return ControlFlow::Continue(());
-            }
-        };
-
-        match archive.write_capture(new_capture(canonical, page)) {
-            Ok(_) => {
-                run.captures_written += 1;
-                ControlFlow::Continue(())
-            }
-            Err(error) => {
-                write_failure = Some(error);
-                ControlFlow::Break(())
-            }
+        if capture_page(event, archive, &mut run, &mut write_failure).is_break() {
+            return ControlFlow::Break(());
         }
+        // Read after the page is filed rather than before: it arrived already fetched, and
+        // refusing to write what is in hand spends the bytes without keeping anything.
+        if deadline.is_some_and(|budget| started.elapsed() >= budget) {
+            out_of_budget = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
     })?;
 
     run.pages_dropped = outcome.pages_dropped;
+    // The engine reports that its caller stopped it. This is that caller, and it knows why.
+    run.stopped = if out_of_budget {
+        CrawlStop::DeadlineReached
+    } else {
+        outcome.stopped
+    };
     if let Some(source) = write_failure {
         return Err(CaptureError::Storage { source, run });
     }
     Ok(run)
+}
+
+/// Files one page under the address the archive knows it by.
+///
+/// A page the archive cannot address is skipped and reported: one URL the canonical rules
+/// refuse says nothing about the other two hundred. A failed write is the opposite, and
+/// stops the run: the disk that rejected this capture will reject the next one, and a
+/// crawl that keeps fetching after that spends a site's bandwidth on nothing.
+fn capture_page(
+    event: PageEvent,
+    archive: &Archive,
+    run: &mut CaptureRun,
+    write_failure: &mut Option<StorageError>,
+) -> ControlFlow<()> {
+    let page = match event {
+        PageEvent::Response(page) => page,
+        PageEvent::NoResponse(failure) => {
+            run.failed_fetches.push(failure);
+            return ControlFlow::Continue(());
+        }
+    };
+
+    // The final URL and not the requested one: after a redirect, the content is at the
+    // destination, and filing it under the address that pointed there would give the
+    // same page a second identity for every link that reaches it.
+    let canonical = match CanonicalUrl::parse(&page.final_url) {
+        Ok(canonical) => canonical,
+        Err(reason) => {
+            run.unaddressable_pages.push(UnaddressablePage {
+                url: page.final_url,
+                reason,
+            });
+            return ControlFlow::Continue(());
+        }
+    };
+
+    match archive.write_capture(new_capture(canonical, page)) {
+        Ok(_) => {
+            run.captures_written += 1;
+            ControlFlow::Continue(())
+        }
+        Err(error) => {
+            *write_failure = Some(error);
+            ControlFlow::Break(())
+        }
+    }
 }
 
 fn new_capture(canonical_url: CanonicalUrl, page: PageResponse) -> NewCapture {
@@ -139,6 +178,7 @@ fn media_type_of(headers: &[Header]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::time::Duration;
 
     use tempfile::TempDir;
 
@@ -386,6 +426,60 @@ mod tests {
 
         assert_eq!(run.captures_written, 1);
         assert_eq!(run.pages_dropped, 3);
+    }
+
+    /// The engine here replays a list and knows nothing about a deadline, which is exactly
+    /// the case this guard is for: an engine that ignores the field is stopped from above.
+    #[test]
+    fn a_seed_out_of_budget_stops_after_the_page_it_is_holding() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![
+            page("https://example.com/a", 200, "<html>a</html>"),
+            page("https://example.com/b", 200, "<html>b</html>"),
+            page("https://example.com/c", 200, "<html>c</html>"),
+        ]);
+        let mut seed = Seed::new("https://example.com/");
+        seed.deadline = Some(Duration::ZERO);
+
+        let run = capture_seed(&engine, &archive, &seed).expect("the run completes");
+
+        assert_eq!(engine.pages_offered(), 1);
+        assert_eq!(
+            run.captures_written, 1,
+            "the page in hand was fetched already and should not be thrown away"
+        );
+        assert_eq!(run.stopped, CrawlStop::DeadlineReached);
+    }
+
+    #[test]
+    fn a_run_inside_its_budget_says_it_ran_out_of_pages_and_not_of_time() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine =
+            ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, "<html>a</html>")]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.captures_written, 1);
+        assert_eq!(run.stopped, CrawlStop::Exhausted);
+    }
+
+    /// The engine has its own reach on the deadline: it can end a crawl that produced no
+    /// page at all, which is a stop nothing above it would ever see happen.
+    #[test]
+    fn a_crawl_the_engine_cut_short_says_so_in_the_run() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut engine =
+            ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, "<html>a</html>")]);
+        engine.outcome.stopped = CrawlStop::DeadlineReached;
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.stopped, CrawlStop::DeadlineReached);
     }
 
     #[test]

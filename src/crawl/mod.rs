@@ -8,6 +8,6 @@ mod boundary;
 mod spider_engine;
 
 pub use boundary::{
-    CrawlEngine, CrawlError, CrawlOutcome, FetchFailure, PageEvent, PageResponse, Seed,
+    CrawlEngine, CrawlError, CrawlOutcome, CrawlStop, FetchFailure, PageEvent, PageResponse, Seed,
 };
 pub use spider_engine::SpiderEngine;

@@ -6,7 +6,7 @@ The premise the whole design hangs on: **the archive outlives the tool**. Raw re
 
 ## The three records
 
-- **Item.** A canonical URL, and the identity everything else hangs off. One item exists per canonical URL, forever, no matter how many times it is fetched.
+- **Item.** A canonical URL, and the identity everything else hangs off. One item exists per canonical URL, forever, no matter how many times it is fetched. The rules that reduce every spelling of a page to that one URL are in [`canonicalization.md`](canonicalization.md); this layer only ever sees the result.
 - **Capture.** One fetch of an item at a point in time: status, headers, media type, the address of the body that came back. An item has as many captures as it has been fetched.
 - **Asset.** A subresource a capture needed to still make sense: an image, a stylesheet, a font.
 
@@ -128,7 +128,6 @@ The alternative, holding the records in SQLite and keeping only blobs on disk, w
 ## Known limits
 
 - **One writer at a time.** The item record is a read, a widening and a write, with no lock around it. Two processes capturing the same item at the same moment can lose one end of the window. Nothing else in the layout is order sensitive, and a single local operator is the case being built for, so the fix waits for a second writer to actually exist.
-- **A trailing dot makes a second host directory.** `example.com.` and `example.com` are the same host to DNS and two directories here. Collapsing them is canonicalization, which is deliberately not this layer's job, so it is listed here rather than patched at the filesystem.
 - **Bodies are read whole.** Nothing streams and nothing is capped, so a body costs its full size in memory when it is read back. The bound belongs where bytes first arrive, which is the fetch path, and it is noted here so that it is not mistaken for a property this layer already provides.
 
 ## What was deliberately left out

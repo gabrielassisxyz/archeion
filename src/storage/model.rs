@@ -9,101 +9,8 @@ use std::fmt::{self, Write as _};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use url::{Host, Url};
 
-/// The archive addresses everything by a URL that canonicalization has already settled.
-/// Canonicalization itself lives outside the storage layer, so the wrapper exists to keep
-/// that boundary visible at every call site rather than to re-check the rules here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct CanonicalUrl {
-    url: Url,
-    host_dir: String,
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum InvalidCanonicalUrl {
-    #[error("{url} cannot be parsed as a URL: {reason}")]
-    Unparseable { url: String, reason: String },
-    #[error("{url} has no host, so it names nothing that can be archived")]
-    Hostless { url: String },
-    #[error("{host} is not a host this archive will create a directory for")]
-    UnsafeHost { host: String },
-}
-
-impl CanonicalUrl {
-    pub fn parse(url: &str) -> Result<Self, InvalidCanonicalUrl> {
-        let parsed = Url::parse(url).map_err(|reason| InvalidCanonicalUrl::Unparseable {
-            url: url.to_owned(),
-            reason: reason.to_string(),
-        })?;
-        let host = parsed.host().ok_or_else(|| InvalidCanonicalUrl::Hostless {
-            url: url.to_owned(),
-        })?;
-        let host_dir = host_directory(&host)?;
-        Ok(Self {
-            url: parsed,
-            host_dir,
-        })
-    }
-
-    pub fn as_str(&self) -> &str {
-        self.url.as_str()
-    }
-
-    /// The directory the archive groups this item under, so the tree stays readable by
-    /// domain instead of being a flat field of hashes.
-    pub fn host_dir(&self) -> &str {
-        &self.host_dir
-    }
-}
-
-/// A host reaches the filesystem as a directory name, which makes it the one place remote
-/// data could climb out of the archive root. Anything outside a conservative set is
-/// refused rather than escaped, because an archive has no use for a host that needs it.
-fn host_directory(host: &Host<&str>) -> Result<String, InvalidCanonicalUrl> {
-    match host {
-        Host::Domain(name) => {
-            let lowered = name.to_ascii_lowercase();
-            let safe = !lowered.is_empty()
-                && !lowered.starts_with('.')
-                && lowered
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
-            if safe {
-                Ok(lowered)
-            } else {
-                Err(InvalidCanonicalUrl::UnsafeHost {
-                    host: name.to_string(),
-                })
-            }
-        }
-        Host::Ipv4(addr) => Ok(addr.to_string()),
-        // Colons are illegal in a filename on Windows and awkward everywhere else, and the
-        // bracketed URL form buys nothing in a directory name.
-        Host::Ipv6(addr) => Ok(addr.to_string().replace(':', "-")),
-    }
-}
-
-impl TryFrom<String> for CanonicalUrl {
-    type Error = InvalidCanonicalUrl;
-
-    fn try_from(url: String) -> Result<Self, Self::Error> {
-        Self::parse(&url)
-    }
-}
-
-impl From<CanonicalUrl> for String {
-    fn from(url: CanonicalUrl) -> Self {
-        url.url.into()
-    }
-}
-
-impl fmt::Display for CanonicalUrl {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+use crate::canonical_url::CanonicalUrl;
 
 /// An identifier that came from outside this process and turned out not to be one.
 ///
@@ -390,38 +297,6 @@ mod tests {
         assert_eq!(ItemId::of(&url), ItemId::of(&same));
         assert_ne!(ItemId::of(&url), ItemId::of(&other));
         assert_eq!(ItemId::of(&url).as_str().len(), 64);
-    }
-
-    #[test]
-    fn host_directory_lowercases_a_domain() {
-        let url = CanonicalUrl::parse("https://Example.COM/a").expect("valid url");
-        assert_eq!(url.host_dir(), "example.com");
-    }
-
-    #[test]
-    fn host_directory_refuses_to_be_a_path() {
-        assert!(matches!(
-            CanonicalUrl::parse("https://../../etc/passwd"),
-            Err(InvalidCanonicalUrl::UnsafeHost { .. })
-        ));
-        assert!(matches!(
-            CanonicalUrl::parse("foo://%2e%2e/etc/passwd"),
-            Err(InvalidCanonicalUrl::UnsafeHost { .. })
-        ));
-    }
-
-    #[test]
-    fn host_directory_keeps_an_ipv6_address_filename_safe() {
-        let url = CanonicalUrl::parse("http://[2001:db8::1]/a").expect("valid url");
-        assert!(!url.host_dir().contains(':'));
-    }
-
-    #[test]
-    fn a_url_without_a_host_is_not_archivable() {
-        assert!(matches!(
-            CanonicalUrl::parse("mailto:someone@example.com"),
-            Err(InvalidCanonicalUrl::Hostless { .. })
-        ));
     }
 
     #[test]

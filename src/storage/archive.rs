@@ -15,9 +15,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::model::{
-    Asset, CanonicalUrl, Capture, CaptureId, ContentHash, Header, Item, ItemId, NewCapture,
-    StoredBody,
+    Asset, Capture, CaptureId, ContentHash, Header, Item, ItemId, NewCapture, StoredBody,
 };
+use crate::canonical_url::CanonicalUrl;
 
 const MARKER_FILE: &str = "archeion.json";
 const FORMAT_NAME: &str = "archeion-archive";

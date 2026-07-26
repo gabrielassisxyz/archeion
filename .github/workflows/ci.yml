@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
     # `edited` is load-bearing: without it the PR-text gate below only reruns on the next
     # push and reads that event's payload, so a title fixed afterwards still fails and a

@@ -17,7 +17,7 @@ bin/ci              # every gate, exactly what CI runs
 
 - **Branches** follow [Conventional Branch](https://conventionalbranch.org): `<type>/<kebab-description>`, with `feature/`, `bugfix/`, `hotfix/`, `chore/`, `release/` or `docs/`.
 - **Commits** follow [Conventional Commits](https://conventionalcommits.org): `<type>(scope): <description>`. One logical change per commit, each one independently green and revertible.
-- **The default branch is `master`.** It is never committed to directly.
+- **The default branch is `main`.** It is never committed to directly.
 - **Every feature is born with a test, every bugfix with a regression test.** Tests run with `cargo test` alone: no network, no credential, no manual setup.
 - **Pull requests describe what and why.** The diff already shows what changed. The body is for the decisions, the trade-offs and the alternatives that were rejected.
 

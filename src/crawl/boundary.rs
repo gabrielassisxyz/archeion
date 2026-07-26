@@ -147,18 +147,16 @@ fn is_internal_ipv4(address: Ipv4Addr) -> bool {
 }
 
 fn is_internal_ipv6(address: Ipv6Addr) -> bool {
-    if address.is_loopback() || address.is_unspecified() {
-        return true;
-    }
-    // The two ranges below are exactly what this guard is for, and the standard library
-    // still has both predicates behind an unstable flag: fc00::/7 is the private range and
-    // fe80::/10 is where a link-local address lives.
-    let first = address.segments()[0];
-    if first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80 {
-        return true;
-    }
-    // An address written as ::ffff:127.0.0.1 reaches the same machine as 127.0.0.1 does.
-    address.to_ipv4_mapped().is_some_and(is_internal_ipv4)
+    address.is_loopback()
+        || address.is_unspecified()
+        // fc00::/7 is the private range, and one of the cloud metadata services answers
+        // inside it, on fd00:ec2::254. That is the same credential store 169.254.169.254
+        // is, reached by its other address.
+        || address.is_unique_local()
+        // fe80::/10, which is what 169.254.0.0/16 is on the other side.
+        || address.is_unicast_link_local()
+        // An address written as ::ffff:127.0.0.1 reaches the same machine as 127.0.0.1 does.
+        || address.to_ipv4_mapped().is_some_and(is_internal_ipv4)
 }
 
 /// Why a crawl ended. A run that archived less than expected says which of these it was,

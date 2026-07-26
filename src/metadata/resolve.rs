@@ -55,7 +55,8 @@ pub(super) fn resolve(page: ScannedPage, final_url: &str) -> PageMetadata {
         declared_canonical_url: page
             .declared_canonical
             .as_deref()
-            .and_then(|href| address.absolute(href)),
+            .and_then(|href| address.absolute(href))
+            .map(String::from),
         meta: page
             .metas
             .iter()
@@ -101,23 +102,18 @@ impl PageAddress {
     /// The fragment goes, for the reason canonicalization drops it: it is resolved by the
     /// client against bytes the server already sent, so two links differing only there name
     /// one fetch and would otherwise be counted twice.
-    fn absolute(&self, reference: &str) -> Option<String> {
+    fn absolute(&self, reference: &str) -> Option<Url> {
         let mut url = self.base.join(reference.trim()).ok()?;
         if !matches!(url.scheme(), "http" | "https") {
             return None;
         }
         url.set_fragment(None);
-        Some(url.into())
+        Some(url)
     }
 
-    fn is_same_host(&self, url: &str) -> bool {
-        match (
-            &self.host,
-            Url::parse(url)
-                .ok()
-                .and_then(|url| url.host_str().map(str::to_owned)),
-        ) {
-            (Some(page), Some(target)) => *page == target,
+    fn is_same_host(&self, url: &Url) -> bool {
+        match (&self.host, url.host_str()) {
+            (Some(page), Some(target)) => page == target,
             _ => false,
         }
     }
@@ -223,13 +219,15 @@ fn resolve_links(page: &ScannedPage, address: &PageAddress) -> Vec<OutboundLink>
         let Some(url) = address.absolute(&link.href) else {
             continue;
         };
+        let same_host = address.is_same_host(&url);
+        let url = String::from(url);
         if !seen.insert(url.clone()) {
             continue;
         }
         links.push(OutboundLink {
-            same_host: address.is_same_host(&url),
             url,
             rel: link.rel.clone(),
+            same_host,
         });
     }
     links
@@ -244,6 +242,7 @@ fn resolve_assets(page: &ScannedPage, address: &PageAddress) -> Vec<ReferencedAs
         let Some(url) = address.absolute(reference) else {
             continue;
         };
+        let url = String::from(url);
         if !seen.insert(url.clone()) {
             continue;
         }

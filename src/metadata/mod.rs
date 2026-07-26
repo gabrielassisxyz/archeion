@@ -337,6 +337,28 @@ mod tests {
         );
     }
 
+    /// The assumption the record's raw field exists to keep recoverable, so it is pinned
+    /// rather than left to be inferred from the code.
+    #[test]
+    fn a_date_written_without_an_offset_is_read_as_utc() {
+        for (written, expected) in [
+            ("2026-07-25T14:03:22", "2026-07-25T14:03:22Z"),
+            ("2026-07-25", "2026-07-25T00:00:00Z"),
+        ] {
+            let published = extract_html(&format!(
+                r#"<meta property="article:published_time" content="{written}">"#
+            ))
+            .published_at
+            .expect("a date");
+
+            assert_eq!(published.raw, written);
+            assert_eq!(
+                published.timestamp.map(|at| at.to_string()),
+                Some(expected.to_owned())
+            );
+        }
+    }
+
     #[test]
     fn a_date_this_build_cannot_read_is_kept_rather_than_dropped() {
         let published = extract_html(

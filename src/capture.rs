@@ -164,6 +164,7 @@ fn new_capture(canonical_url: CanonicalUrl, page: PageResponse) -> NewCapture {
         media_type,
         response_headers: page.headers,
         body: page.body,
+        body_truncated: page.body_truncated,
         fetched_at: page.fetched_at,
         // Assets are captured by their own pass over the page, which does not exist yet.
         assets: Vec::new(),
@@ -250,6 +251,7 @@ mod tests {
                 value: "text/html; charset=utf-8".to_owned(),
             }],
             body: body.as_bytes().to_vec(),
+            body_truncated: false,
             fetched_at: "2026-07-25T14:03:22Z".parse().expect("valid timestamp"),
         })
     }
@@ -525,6 +527,28 @@ mod tests {
             .expect("the run completes");
 
         assert_eq!(run.stopped, CrawlStop::DeadlineReached);
+    }
+
+    /// The reason the flag exists rather than being inferred: a body cut short still parses
+    /// and still arrives under a status that promises the whole page, so the only place the
+    /// shortfall can be seen is a record that says so.
+    #[test]
+    fn a_page_that_arrived_short_is_archived_saying_so() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut cut_short = page("https://example.com/a", 200, "<html>a");
+        response_of(&mut cut_short).body_truncated = true;
+        let engine = ScriptedCrawlEngine::new(vec![cut_short]);
+
+        capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        let url = CanonicalUrl::parse("https://example.com/a").expect("valid url");
+        let captures = archive.list_captures(&url).expect("captures are listed");
+        let capture = archive
+            .read_capture(&url, &captures[0])
+            .expect("the capture reads back");
+        assert!(capture.body_truncated);
     }
 
     #[test]

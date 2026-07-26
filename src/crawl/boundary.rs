@@ -133,6 +133,12 @@ pub struct PageResponse {
     pub status: u16,
     pub headers: Vec<Header>,
     pub body: Vec<u8>,
+    /// Whether the body above is less than the response promised. A transfer can end early
+    /// for reasons that have nothing to do with the server changing its mind: a stream that
+    /// errored, one that went idle, one that ran past a size limit. Archiving what arrived
+    /// under a status that promises the whole page, with nothing saying which of the two it
+    /// is, makes the archive quietly wrong instead of visibly short.
+    pub body_truncated: bool,
     /// Stamped where the page crosses the boundary, which is the closest an adapter can
     /// get to the fetch it is reporting. A clock read further in would date the write
     /// instead, and would leave the pipeline with a hidden input no test can fix.

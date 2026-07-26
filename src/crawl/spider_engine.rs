@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use spider::page::Page;
-use spider::reqwest::header::HeaderMap;
+use spider::reqwest::header::{CONTENT_LENGTH, HeaderMap};
 use spider::tokio::runtime::Runtime;
 use spider::tokio::sync::broadcast::Receiver;
 use spider::tokio::sync::broadcast::error::{RecvError, TryRecvError};
@@ -229,18 +229,51 @@ fn page_event(page: Page) -> PageEvent {
         .final_redirect_destination
         .clone()
         .unwrap_or_else(|| requested_url.clone());
+    let body = page.get_html_bytes_u8().to_vec();
 
     PageEvent::Response(PageResponse {
         requested_url,
         final_url,
         status: page.status_code.as_u16(),
+        body_truncated: body_is_incomplete(&page, &body),
         headers: headers_of(page.headers.as_ref()),
-        body: page.get_html_bytes_u8().to_vec(),
+        body,
         // The engine does not date its responses, so this is when the page reached the
         // archive: later than the fetch by the time it sat in the queue, and the closest
         // honest value available here.
         fetched_at: Timestamp::now(),
     })
+}
+
+/// Whether less arrived than the response said would.
+///
+/// Two shapes reach here and only one of them is labelled. The engine marks a body it cut
+/// short itself, which is a stream that errored, one that went idle mid-transfer, or one
+/// that ran past a size limit. The shape it does not mark is a response whose declared
+/// length was over that limit: it is handed over with the status and headers a server
+/// really sent and no body at all, and read as an empty page that is the exact corruption
+/// a size limit exists to prevent.
+fn body_is_incomplete(page: &Page, body: &[u8]) -> bool {
+    if page.content_truncated {
+        return true;
+    }
+    body.is_empty() && status_carries_a_body(page.status_code.as_u16()) && declared_length(page) > 0
+}
+
+/// A status that sends no body of its own has nothing to be short of. The 304 is the one
+/// that matters, because the etag cache produces them and a 304 repeats the length of the
+/// entity it is deliberately not sending.
+fn status_carries_a_body(status: u16) -> bool {
+    !matches!(status, 100..=199 | 204 | 304)
+}
+
+fn declared_length(page: &Page) -> u64 {
+    page.headers
+        .as_ref()
+        .and_then(|headers| headers.get(CONTENT_LENGTH))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
 }
 
 fn headers_of(headers: Option<&HeaderMap>) -> Vec<Header> {
@@ -495,6 +528,64 @@ mod tests {
             }
             PageEvent::NoResponse(failure) => panic!("a response was lost: {}", failure.reason),
         }
+    }
+
+    fn response_of(event: PageEvent) -> PageResponse {
+        match event {
+            PageEvent::Response(response) => response,
+            PageEvent::NoResponse(failure) => panic!("a response was lost: {}", failure.reason),
+        }
+    }
+
+    fn page_declaring(status: u16, content_length: &str) -> Page {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_LENGTH,
+            content_length.parse().expect("valid header value"),
+        );
+        let mut page = Page::default();
+        page.status_code = status.try_into().expect("valid status");
+        page.headers = Some(headers);
+        page
+    }
+
+    /// A body cut short is the failure the archive can least afford, because nothing about
+    /// the record shows it: the status still says 200 and the bytes still parse.
+    #[test]
+    fn a_body_the_engine_cut_short_is_marked_as_short_in_the_record() {
+        let mut page = Page::default();
+        page.content_truncated = true;
+
+        assert!(response_of(page_event(page)).body_truncated);
+    }
+
+    /// The shape the engine does not mark. A response whose declared length is over the
+    /// size limit arrives with the status and headers a server really sent and no body,
+    /// which stored as an empty page is what a size limit is supposed to prevent.
+    #[test]
+    fn a_response_whose_body_was_refused_for_its_size_is_not_stored_as_an_empty_page() {
+        let response = response_of(page_event(page_declaring(200, "5242880")));
+
+        assert!(response.body.is_empty());
+        assert!(response.body_truncated);
+    }
+
+    /// A status that sends no body of its own is not short of one, and the etag cache makes
+    /// the 304 a page this crawl really produces.
+    #[test]
+    fn a_status_that_sends_no_body_is_not_reported_as_truncated() {
+        for status in [204, 304] {
+            assert!(
+                !response_of(page_event(page_declaring(status, "5242880"))).body_truncated,
+                "{status} was read as a page missing its body"
+            );
+        }
+    }
+
+    #[test]
+    fn a_whole_page_is_not_marked_as_short() {
+        assert!(!response_of(page_event(Page::default())).body_truncated);
+        assert!(!response_of(page_event(page_declaring(200, "0"))).body_truncated);
     }
 
     #[test]

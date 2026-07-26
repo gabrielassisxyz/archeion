@@ -230,6 +230,11 @@ pub struct Capture {
     pub media_type: Option<String>,
     pub response_headers: Vec<Header>,
     pub body: StoredBody,
+    /// Whether the stored body is less than the response promised. A record written before
+    /// the archive tracked this reads as false, which is what it always meant: the field
+    /// says a shortfall was seen, never that none happened.
+    #[serde(default)]
+    pub body_truncated: bool,
     pub fetched_at: Timestamp,
     pub assets: Vec<Asset>,
 }
@@ -258,6 +263,7 @@ pub struct NewCapture {
     pub media_type: Option<String>,
     pub response_headers: Vec<Header>,
     pub body: Vec<u8>,
+    pub body_truncated: bool,
     /// The clock is an input rather than something the store reads, so the same capture
     /// written twice produces the same record and a test needs no clock of its own.
     pub fetched_at: Timestamp,

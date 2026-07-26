@@ -420,6 +420,10 @@ fn is_internal_ipv4(address: Ipv4Addr) -> bool {
         || address.is_link_local()
         || address.is_unspecified()
         || address.is_broadcast()
+        // 0.0.0.0/8 is "this network" in RFC 1122, and the whole block is a way of naming
+        // the local host: is_unspecified() only recognises 0.0.0.0 itself, so without this
+        // the other sixteen million addresses in the range walk past the guard.
+        || address.octets()[0] == 0
 }
 
 fn is_internal_ipv6(address: Ipv6Addr) -> bool {
@@ -479,6 +483,8 @@ mod tests {
             "http://192.168.1.1/",
             "http://172.16.0.1/",
             "http://0.0.0.0/",
+            "http://0.0.0.1/",
+            "http://0.1.2.3/",
             "http://255.255.255.255/",
             "http://[::1]/",
             "http://[::]/",

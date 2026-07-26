@@ -12,6 +12,7 @@
 use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::ControlFlow;
+use std::sync::Once;
 use std::time::Duration;
 
 use jiff::Timestamp;
@@ -36,6 +37,23 @@ const USER_AGENT: &str = concat!(
     " (+https://github.com/gabrielassisxyz/archeion)"
 );
 
+/// The most one response may spend before the archive stops reading it.
+///
+/// This is the only limit here whose absence costs more than the record it applies to. A
+/// response that declares no length is read until it ends, and one that never ends fills
+/// memory until the process dies with the whole run still inside it. The engine's own
+/// ceiling is two gigabytes and applies only to a response that declares its length, which
+/// is to say only to the responses that were never the problem.
+///
+/// Sixty-four megabytes is far above any page and far below what losing a run costs. What
+/// exceeds it is kept up to the ceiling and marked as short, which is the trade the number
+/// buys: a partial record that says it is partial, rather than no run at all.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The engine reads its byte ceiling from here and from nowhere else on the plain HTTP
+/// path: both of its configurable byte limits are browser-only.
+const RESPONSE_BYTE_CEILING: &str = "SPIDER_MAX_SIZE_BYTES";
+
 pub struct SpiderEngine;
 
 impl CrawlEngine for SpiderEngine {
@@ -44,9 +62,42 @@ impl CrawlEngine for SpiderEngine {
         seed: &Seed,
         on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
     ) -> Result<CrawlOutcome, CrawlError> {
+        apply_response_byte_ceiling();
         let start = usable_seed_url(seed)?;
         let runtime = Runtime::new().map_err(|source| CrawlError::EngineUnavailable { source })?;
         Ok(runtime.block_on(crawl_seed(&start, seed, on_page)))
+    }
+}
+
+/// Puts the byte ceiling where the engine will look for it, once per process.
+///
+/// The environment is the only channel available, so the ceiling is process-wide rather
+/// than a number on the seed, and the engine reads it on its first fetch and keeps that
+/// value for the life of the process. This runs before the runtime that performs a fetch is
+/// built, which is what makes the write both effective and the last moment it can happen.
+///
+/// It is also the reason the write is placed here and not deeper: nothing this crate starts
+/// is running yet. A caller that crawls from two threads at once is outside what that
+/// argument covers, and can settle the variable itself before starting either.
+fn apply_response_byte_ceiling() {
+    static APPLIED: Once = Once::new();
+    APPLIED.call_once(|| {
+        let settled = std::env::var_os(RESPONSE_BYTE_CEILING);
+        if let Some(ceiling) = response_byte_ceiling(settled.is_some()) {
+            // SAFETY: the first crawl of the process, before its runtime exists.
+            unsafe { std::env::set_var(RESPONSE_BYTE_CEILING, ceiling) };
+        }
+    });
+}
+
+/// What to put in the environment, given whether it already carries something. An operator
+/// who set a ceiling is making this same decision with a number they chose, so theirs
+/// stands, including a zero that turns the ceiling off.
+fn response_byte_ceiling(already_settled: bool) -> Option<String> {
+    if already_settled {
+        None
+    } else {
+        Some(MAX_RESPONSE_BYTES.to_string())
     }
 }
 
@@ -547,6 +598,20 @@ mod tests {
         page.status_code = status.try_into().expect("valid status");
         page.headers = Some(headers);
         page
+    }
+
+    /// The ceiling is process-wide because the engine gives no other channel for it, so the
+    /// one decision left to make is what happens when the process already carries one. An
+    /// operator who set a number chose it, including a zero meaning no ceiling at all, and
+    /// overwriting that would be this file deciding something it was told.
+    #[test]
+    fn the_byte_ceiling_is_ours_to_set_and_not_ours_to_override() {
+        assert_eq!(
+            response_byte_ceiling(false).as_deref(),
+            Some("67108864"),
+            "the ceiling reaching the engine is not the one this file decided on"
+        );
+        assert_eq!(response_byte_ceiling(true), None);
     }
 
     /// A body cut short is the failure the archive can least afford, because nothing about

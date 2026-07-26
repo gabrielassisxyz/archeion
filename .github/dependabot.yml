@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # Actions are pinned to a major tag, which does not move for a new major: without this
+  # the workflows silently age into a deprecated runtime.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR per week for patch and minor bumps: a crawler pulls a wide dependency
+      # tree, and one PR per crate would bury the ones that matter.
+      minor-and-patch:
+        update-types: [minor, patch]

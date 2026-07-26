@@ -46,15 +46,42 @@ fn label_to_encoding(label: &str) -> Option<&'static Encoding> {
 /// This is deliberately a substring scan and not a parse. The full standard prescan is a
 /// tokenizer of its own, run before the encoding is known, and every case where the two
 /// disagree is a page carrying the word `charset` inside markup that precedes its own
-/// declaration. The label is validated by the encoding table afterwards, so the worst a
-/// stray match can do is fail to name an encoding and fall through to the next rule.
+/// declaration.
+///
+/// Two things keep it from being fooled anyway, and both are needed. Every occurrence is
+/// tried rather than the first, so one that names nothing cannot take the real declaration
+/// below it out of reach. And an occurrence only counts inside a `<meta>` tag, because the
+/// most common stray one names a perfectly valid encoding: a stylesheet linked as
+/// `/s.css?charset=utf8` would otherwise decide the encoding of the whole document, and
+/// trying further matches would not help, since that one parses.
 fn prescan_meta_charset(bytes: &[u8]) -> Option<String> {
     let head = &bytes[..bytes.len().min(PRESCAN_BYTES)];
     let head = String::from_utf8_lossy(head).to_ascii_lowercase();
-    let at = head.find("charset")? + "charset".len();
-    let rest = head[at..].trim_start();
-    let rest = rest.strip_prefix('=')?.trim_start();
+    head.match_indices("charset")
+        .filter(|&(at, _)| is_inside_a_meta_tag(&head, at))
+        .find_map(|(at, word)| charset_label_at(&head[at + word.len()..]))
+}
 
+/// Whether the byte at `at` sits inside an open `<meta` tag.
+///
+/// The nearest `<` before it has to open one, and nothing may have closed that tag in
+/// between. It is a cheap stand-in for knowing the token, and it costs a backwards scan
+/// over markup already in memory.
+fn is_inside_a_meta_tag(head: &str, at: usize) -> bool {
+    let Some(opening) = head[..at].rfind('<') else {
+        return false;
+    };
+    if head[opening..at].contains('>') {
+        return false;
+    }
+    head[opening + 1..]
+        .strip_prefix("meta")
+        .is_some_and(|after| after.starts_with([' ', '\t', '\n', '\r', '/', '>']))
+}
+
+/// Reads the label out of what follows a `charset` occurrence, or refuses it.
+fn charset_label_at(rest: &str) -> Option<String> {
+    let rest = rest.trim_start().strip_prefix('=')?.trim_start();
     let label: String = match rest.chars().next()? {
         quote @ ('"' | '\'') => rest[1..].chars().take_while(|&c| c != quote).collect(),
         _ => rest
@@ -62,7 +89,9 @@ fn prescan_meta_charset(bytes: &[u8]) -> Option<String> {
             .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '"' | '\'' | '/' | '>'))
             .collect(),
     };
-    (!label.is_empty()).then_some(label)
+    // Validated here rather than by the caller, so an occurrence that names no encoding
+    // leaves the scan looking at the ones after it instead of ending it.
+    label_to_encoding(&label).map(|_| label)
 }
 
 #[cfg(test)]
@@ -118,6 +147,22 @@ mod tests {
         let mut body = vec![0xef, 0xbb, 0xbf];
         body.extend_from_slice("café".as_bytes());
         assert_eq!(decode_html(&body, Some("windows-1252")), "café");
+    }
+
+    /// Every one of these carries the word before the real declaration, and all of them
+    /// occur on pages nobody wrote to be hostile.
+    #[test]
+    fn a_stray_mention_of_the_word_does_not_decide_the_encoding() {
+        for ahead in [
+            "<link rel=stylesheet href=\"/s.css?charset=utf8\">",
+            "<!-- charset -->",
+            "<meta name=description content=\"charset explained\">",
+            "<meta charset=\"not-an-encoding\">",
+        ] {
+            let mut body = ahead.as_bytes().to_vec();
+            body.extend_from_slice(b"<meta charset=\"windows-1252\"><title>caf\xe9</title>");
+            assert!(decode_html(&body, None).contains("café"), "after {ahead}");
+        }
     }
 
     #[test]

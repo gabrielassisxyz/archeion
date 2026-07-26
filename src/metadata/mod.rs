@@ -169,6 +169,19 @@ mod tests {
         );
     }
 
+    /// The parser matches a token stream and not a tree, so no element is ever implied. A
+    /// selector written as `head > title` compiles, reads every page that spells its `<head>`
+    /// out, and silently finds nothing on the many that leave it to the parser.
+    #[test]
+    fn a_page_that_leaves_out_the_tags_a_parser_would_imply_is_still_read() {
+        let page = extract_html("<title>a page</title><a href=\"/one\">one</a>");
+        assert_eq!(
+            value_of(page.title),
+            Some(("a page".to_owned(), MetadataSource::Html))
+        );
+        assert_eq!(page.links.len(), 1);
+    }
+
     #[test]
     fn a_title_inside_an_inline_svg_is_not_the_page_title() {
         let page = extract_html(

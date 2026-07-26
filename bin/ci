@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# The exact checks CI runs, runnable locally, so "green locally" means "green in CI".
+# Keep this in sync with .github/workflows/ci.yml: the workflow installs the tools and
+# then calls this script, it never re-implements a check.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+fail=0
+
+# A tool this project cannot run without is a dependency, not a hurdle to document. Each
+# one is named with the command that installs it, and a missing tool FAILS: a gate that
+# skips itself when its binary is absent reports protection it is not providing.
+require() {
+    command -v "$1" >/dev/null 2>&1 || { echo "missing: $1 (install: $2)" >&2; fail=1; }
+}
+require cargo    "https://rustup.rs"
+require gitleaks "https://github.com/gitleaks/gitleaks/releases"
+require python3  "your package manager"
+cargo audit --version >/dev/null 2>&1 || {
+    echo "missing: cargo-audit (install: cargo install cargo-audit --locked)" >&2
+    fail=1
+}
+[ "$fail" -eq 0 ] || { echo "==> bin/ci FAILED (missing tools)"; exit 1; }
+
+echo "==> rustfmt"
+cargo fmt --all --check || fail=1
+
+echo "==> clippy"
+cargo clippy --all-targets --all-features -- -D warnings || fail=1
+
+echo "==> test"
+cargo test --all-features || fail=1
+
+echo "==> cargo audit (dependency CVEs)"
+cargo audit || fail=1
+
+echo "==> gitleaks (secret scan)"
+gitleaks git --no-banner --redact . || fail=1
+
+echo "==> markdown is soft-wrapped"
+# One paragraph, one line. Rewrapping belongs to whatever renders the text, which is the
+# only thing that knows the reader's width. It is a gate and not a written rule because a
+# written rule is what failed elsewhere: hard wrap spreads by contact, since every editor
+# and agent inherits the wrap of the file it is editing. It also prevents a real defect:
+# a break landing in front of `#`, `-`, `>` or `1.` turns the continuation into a block.
+python3 scripts/md-unwrap.py --check . || fail=1
+
+# Last, so a prose finding never hides a broken build.
+echo "==> slop-guard (prose gate)"
+bin/slop-guard || fail=1
+
+if [ "$fail" -ne 0 ]; then
+    echo "==> bin/ci FAILED"
+    exit 1
+fi
+echo "==> bin/ci OK"

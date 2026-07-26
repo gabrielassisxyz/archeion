@@ -1,0 +1,19 @@
+[package]
+name = "archeion"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "Local-first archival tool for web content and its metadata"
+repository = "https://github.com/gabrielassisxyz/archeion"
+license = "MIT"
+readme = "README.md"
+keywords = ["archive", "crawler", "metadata", "local-first"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+
+[profile.release]
+# A local-first archiver is IO bound, so the binary is downloaded far more often than it
+# is CPU limited: trading a slower build for a smaller artifact is the better deal.
+lto = "thin"
+strip = true

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use crate::canonical_url::{CanonicalUrl, InvalidCanonicalUrl};
 use crate::crawl::{
     CrawlEngine, CrawlError, CrawlStop, FetchFailure, PageEvent, PageResponse, Seed,
+    points_inside_a_network,
 };
 use crate::storage::{Archive, Header, NewCapture, StorageError};
 
@@ -24,7 +25,10 @@ pub enum CaptureError {
     Storage {
         #[source]
         source: StorageError,
-        run: CaptureRun,
+        /// Behind a pointer because the report grows with every kind of loss a run can
+        /// have, and carrying it inline would make every `Result` on this path as wide as
+        /// the widest report rather than as wide as an error.
+        run: Box<CaptureRun>,
     },
 }
 
@@ -43,6 +47,11 @@ pub struct UnaddressablePage {
 pub struct CaptureRun {
     pub captures_written: usize,
     pub unaddressable_pages: Vec<UnaddressablePage>,
+    /// Pages that ended on an address existing only inside a network, which a run that did
+    /// not ask for those addresses had no business reaching. They are reported rather than
+    /// counted: the address is the whole reason the page was refused, and it is also the
+    /// only evidence that something redirected the crawl there.
+    pub pages_inside_a_network: Vec<String>,
     /// URLs no server answered. They are reported and not stored: there is no response to
     /// archive, and inventing one would put a status in the record nothing ever sent.
     pub failed_fetches: Vec<FetchFailure>,
@@ -72,7 +81,14 @@ pub fn capture_seed(
     let mut engine_overran = false;
 
     let outcome = engine.crawl(seed, &mut |event| {
-        if capture_page(event, archive, &mut run, &mut write_failure).is_break() {
+        let answer = capture_page(
+            event,
+            archive,
+            seed.allow_private_addresses,
+            &mut run,
+            &mut write_failure,
+        );
+        if answer.is_break() {
             return ControlFlow::Break(());
         }
         // Read after the page is filed rather than before: it arrived already fetched, and
@@ -92,7 +108,10 @@ pub fn capture_seed(
         outcome.stopped
     };
     if let Some(source) = write_failure {
-        return Err(CaptureError::Storage { source, run });
+        return Err(CaptureError::Storage {
+            source,
+            run: Box::new(run),
+        });
     }
     Ok(run)
 }
@@ -110,13 +129,16 @@ fn engine_overran_its_deadline(deadline: Option<Duration>, elapsed: Duration) ->
 
 /// Files one page under the address the archive knows it by.
 ///
-/// A page the archive cannot address is skipped and reported: one URL the canonical rules
-/// refuse says nothing about the other two hundred. A failed write is the opposite, and
-/// stops the run: the disk that rejected this capture will reject the next one, and a
-/// crawl that keeps fetching after that spends a site's bandwidth on nothing.
+/// Two shapes are skipped and reported rather than stored, and neither ends the run: a page
+/// the archive cannot address, since one URL the canonical rules refuse says nothing about
+/// the other two hundred, and a page that ended inside a network the run was not pointed
+/// at. A failed write is the opposite, and stops the run: the disk that rejected this
+/// capture will reject the next one, and a crawl that keeps fetching after that spends a
+/// site's bandwidth on nothing.
 fn capture_page(
     event: PageEvent,
     archive: &Archive,
+    allow_private_addresses: bool,
     run: &mut CaptureRun,
     write_failure: &mut Option<StorageError>,
 ) -> ControlFlow<()> {
@@ -127,6 +149,17 @@ fn capture_page(
             return ControlFlow::Continue(());
         }
     };
+
+    // A seed is screened before anything is dialled, so a page that ends on one of these
+    // addresses got there by redirect, through a guard inside the engine that this project
+    // does not own. What that guard misses arrives here looking like any other page, and
+    // storing it is what turns a blind fetch into a durable copy of whatever answered on
+    // the machine the archive runs on. The run that asked for local addresses gets them,
+    // which is the only way a locally served site is archived at all.
+    if !allow_private_addresses && points_inside_a_network(&page.final_url) {
+        run.pages_inside_a_network.push(page.final_url);
+        return ControlFlow::Continue(());
+    }
 
     // The final URL and not the requested one: after a redirect, the content is at the
     // destination, and filing it under the address that pointed there would give the
@@ -351,6 +384,59 @@ mod tests {
         assert_eq!(run.unaddressable_pages.len(), 1);
         assert_eq!(run.unaddressable_pages[0].url, "ftp://example.com/a");
         assert_eq!(engine.pages_offered(), 2);
+    }
+
+    /// The page arrives with two URLs because that is the only way it can exist: the seed
+    /// guard refused this address before the crawl started, so a page wearing it got there
+    /// by a redirect the engine followed.
+    fn page_redirected_inside_a_network(final_url: &str) -> PageEvent {
+        let mut event = page("https://example.com/a", 200, "<html>internal</html>");
+        response_of(&mut event).final_url = final_url.to_owned();
+        event
+    }
+
+    #[test]
+    fn a_page_that_ended_inside_a_network_is_refused_and_the_crawl_goes_on() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![
+            page_redirected_inside_a_network("http://0.0.0.1/"),
+            page("https://example.com/b", 200, "<html>b</html>"),
+        ]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.captures_written, 1);
+        assert_eq!(run.pages_inside_a_network, vec!["http://0.0.0.1/"]);
+        assert_eq!(engine.pages_offered(), 2);
+        let url = CanonicalUrl::parse("http://0.0.0.1/").expect("valid url");
+        assert_eq!(
+            archive
+                .list_captures(&url)
+                .expect("captures are listed")
+                .len(),
+            0,
+            "the response from inside the network reached the archive"
+        );
+    }
+
+    /// The refusal above is a guard against an address the run never asked for, so a run
+    /// that did ask has to keep working. Archiving a locally served site is the whole
+    /// purpose of the flag, and it is also the only way the real fetch path is exercised.
+    #[test]
+    fn a_run_that_asked_for_local_addresses_still_archives_them() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine =
+            ScriptedCrawlEngine::new(vec![page_redirected_inside_a_network("http://127.0.0.1/")]);
+        let mut seed = Seed::new("http://127.0.0.1/");
+        seed.allow_private_addresses = true;
+
+        let run = capture_seed(&engine, &archive, &seed).expect("the run completes");
+
+        assert_eq!(run.captures_written, 1);
+        assert!(run.pages_inside_a_network.is_empty());
     }
 
     #[test]

@@ -10,7 +10,6 @@
 //! adapter would have to provide.
 
 use std::future::Future;
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::ControlFlow;
 use std::sync::Once;
 use std::time::Duration;
@@ -23,10 +22,11 @@ use spider::tokio::runtime::Runtime;
 use spider::tokio::sync::broadcast::Receiver;
 use spider::tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use spider::website::Website;
-use url::{Host, Url};
+use url::Url;
 
 use super::boundary::{
     CrawlEngine, CrawlError, CrawlOutcome, CrawlStop, FetchFailure, PageEvent, PageResponse, Seed,
+    is_internal_host,
 };
 use crate::storage::Header;
 
@@ -384,61 +384,6 @@ fn usable_seed_url(seed: &Seed) -> Result<String, CrawlError> {
     }
 
     Ok(parsed.to_string())
-}
-
-/// Whether a host exists only inside a network. It is the seed half of the guard the engine
-/// applies to every redirect hop, and it is deliberately the same shape as that one.
-///
-/// Neither half resolves the name. A domain answering with a private address passes both,
-/// and closing that gap means resolving before the connect and pinning the answer at connect
-/// time, since a name is free to answer differently the second time it is asked. That is a
-/// resolving connector rather than a string check, and it does not exist here yet.
-fn is_internal_host(host: &Host<&str>) -> bool {
-    match host {
-        Host::Domain(name) => is_internal_name(name),
-        Host::Ipv4(address) => is_internal_ipv4(*address),
-        Host::Ipv6(address) => is_internal_ipv6(*address),
-    }
-}
-
-fn is_internal_name(name: &str) -> bool {
-    // A trailing dot is the same name spelled as a fully qualified one, and a guard that
-    // matched on the string alone would be walked past by typing it.
-    let name = name.trim_end_matches('.');
-    name == "localhost"
-        || name.ends_with(".localhost")
-        // The cloud metadata services answer on these as well as on 169.254.169.254, and
-        // that address is the credential store of whatever machine the archive runs on.
-        || name == "metadata.google.internal"
-        || name == "metadata.goog"
-}
-
-fn is_internal_ipv4(address: Ipv4Addr) -> bool {
-    // Link-local covers 169.254.169.254, so the metadata address needs no line of its own.
-    address.is_loopback()
-        || address.is_private()
-        || address.is_link_local()
-        || address.is_unspecified()
-        || address.is_broadcast()
-        // 0.0.0.0/8 is "this network" in RFC 1122, and the whole block is a way of naming
-        // the local host: is_unspecified() only recognises 0.0.0.0 itself, so without this
-        // the other sixteen million addresses in the range walk past the guard.
-        || address.octets()[0] == 0
-}
-
-fn is_internal_ipv6(address: Ipv6Addr) -> bool {
-    if address.is_loopback() || address.is_unspecified() {
-        return true;
-    }
-    // The two ranges below are exactly what this guard is for, and the standard library
-    // still has both predicates behind an unstable flag: fc00::/7 is the private range and
-    // fe80::/10 is where a link-local address lives.
-    let first = address.segments()[0];
-    if first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80 {
-        return true;
-    }
-    // An address written as ::ffff:127.0.0.1 reaches the same machine as 127.0.0.1 does.
-    address.to_ipv4_mapped().is_some_and(is_internal_ipv4)
 }
 
 #[cfg(test)]

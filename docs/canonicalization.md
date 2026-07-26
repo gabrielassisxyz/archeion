@@ -10,17 +10,18 @@ Canonicalization is the reduction of every spelling to the one address the archi
 
 `CanonicalUrl` is the type that carries the result, and its constructor is the only way to obtain one. A type whose name claims an invariant, with a second way in that skips the rules, is a comment rather than an invariant.
 
-The rules are idempotent: canonicalizing an already canonical URL returns it unchanged. A URL read back out of a stored record therefore goes through them again on the way in without drift, which is also what makes a stored record safe to trust as an address.
+The rules are idempotent: canonicalizing an already canonical URL returns it unchanged. A URL read back out of a stored record therefore goes through them again on the way in without drift, which is also what makes a stored record safe to trust as an address. This is a property to check when adding a rule, not a nicety. A rule that reduces one label per pass rather than reducing to a fixed point writes records whose stored URL no longer names the directory they were filed in, and two of those records can end up claiming the same address.
 
 ## The rules
 
-The scheme, the case of the host, the default port, the resolution of `.` and `..` segments and the empty path are settled by the URL parser itself, in the form the WHATWG URL standard defines. They are listed here anyway, because a reader of an archive needs the whole rule set in one place and not the part this project happened to write by hand.
+The scheme, the case of the host, the default port, the resolution of `.` and `..` segments, the empty path and the mapping of an internationalized host onto its ASCII form are settled by the URL parser itself, in the form the WHATWG URL standard defines. It also percent-encodes bytes that are not legal where they appear, so `/a b` becomes `/a%20b`, and reads a backslash as a slash. All of it is listed here anyway, because a reader of an archive needs the whole rule set in one place and not the part this project happened to write by hand.
 
 | rule | in | out |
 |---|---|---|
 | The scheme and the host are compared in lowercase. | `HTTPS://Example.COM/a` | `https://example.com/a` |
 | The DNS root dot is not a second host. | `https://example.com./a` | `https://example.com/a` |
-| `www` is the apex under another name. | `https://www.rust-lang.org/learn` | `https://rust-lang.org/learn` |
+| `www` is the apex under another name, however many times it is repeated. | `https://www.www.rust-lang.org/learn` | `https://rust-lang.org/learn` |
+| An internationalized host has one ASCII spelling. | `https://bücher.example/a` | `https://xn--bcher-kva.example/a` |
 | The default port is not part of the address. | `https://example.com:443/a` | `https://example.com/a` |
 | A port that is not the default is. | `https://example.com:8443/a` | unchanged |
 | An empty path is the root path. | `https://example.com` | `https://example.com/` |
@@ -54,7 +55,13 @@ They are also kept as the raw text they arrived as, rather than decoded into pai
 - **Removing a trailing slash below the root.** `/a` and `/a/` are routinely different resources, and which one a server considers canonical is the server's business. The root is the exception the parser already handles, since an empty path and `/` are the same request on the wire.
 - **Stripping other host prefixes such as `m` or `amp`.** Unlike `www`, these commonly serve genuinely different documents. Collapsing them would lose an archive of what was actually served.
 - **Removing `index.html` or a default document name.** Which name a server maps to a directory is configuration, not a property of URLs.
-- **Rewriting percent-encoding or the case of the path.** Path case is significant to most servers, and re-encoding risks changing what is requested for no dedupe worth having.
+- **Rewriting percent-encoding or the case of the path.** Path case is significant to most servers, and re-encoding risks changing what is requested for no dedupe worth having. The parser's own encoding of bytes that are illegal where they appear is a different thing: it is what makes the string a URL at all, and it happens before any rule here runs.
+
+## Known limits
+
+- **`www` is stripped without consulting a public suffix list.** `www.co.uk` reduces to `co.uk`, which is a registry name and not a site. Avoiding it means shipping and updating a list of every public suffix, for a host nobody archives, so it is written down here instead of guarded against.
+- **An address literal and a domain can share a grouping directory.** `http://[::1]/` and a domain named `--1` both group under `items/--1/`, since the colons of an IPv6 literal become dashes. Nothing merges, because the item id is derived from the full canonical URL and those differ, but the directory a human browses is ambiguous.
+- **Nothing here is a guard against fetching a private address.** `http://127.0.0.1/`, `http://[::1]/` and `http://169.254.169.254/` are all valid addresses to canonicalize, and refusing them is a decision about what may be fetched, not about what a URL means. That guard belongs on the fetch path, which does not exist yet.
 
 ## What is left for the fetch path
 

@@ -4,7 +4,7 @@
 
 use archeion::CanonicalUrl;
 use archeion::metadata::{self, PageMetadata, PageSource};
-use archeion::readability::{self, Article, ArticleRecord, ExtractionRules};
+use archeion::readability::{self, AdmissionCost, Article, ArticleRecord, ExtractionRules};
 use archeion::storage::{
     Archive, AssetMiss, ContentHash, Header, ItemId, MissedAsset, NewAsset, NewCapture,
     StorageError,
@@ -179,6 +179,10 @@ fn an_article_is_stored_as_a_document_and_read_back_whole() {
             excerpt: Some("Bread is mostly patience.".to_owned()),
             byline: None,
             truncated: Vec::new(),
+            cost: AdmissionCost {
+                document_bytes: 4096,
+                peak_open_elements: 12,
+            },
         },
     };
 
@@ -240,6 +244,10 @@ fn an_article_whose_document_never_landed_reads_as_absent() {
                     excerpt: None,
                     byline: None,
                     truncated: Vec::new(),
+                    cost: AdmissionCost {
+                        document_bytes: 4096,
+                        peak_open_elements: 12,
+                    },
                 },
             },
         )

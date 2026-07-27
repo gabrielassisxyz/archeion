@@ -10,11 +10,14 @@
 
 mod document;
 mod markdown;
+mod markup_scan;
 mod model;
 
 use dom_smoothie::{Config, Readability, ReadabilityError};
 
-pub use model::{Article, ArticleBound, ArticleRecord, EXTRACTOR_VERSION, ExtractionRules};
+pub use model::{
+    AdmissionCost, Article, ArticleBound, ArticleRecord, EXTRACTOR_VERSION, ExtractionRules,
+};
 
 use crate::metadata::PageSource;
 
@@ -56,7 +59,7 @@ pub fn extract(
         reason,
     };
 
-    let document = document::build(&html).map_err(|cost| refused(cost.reason()))?;
+    let (document, measured) = document::build(&html).map_err(|cost| refused(cost.reason()))?;
     let mut readability = Readability::with_document(
         document,
         Some(source.final_url),
@@ -90,6 +93,10 @@ pub fn extract(
             excerpt: non_empty(article.excerpt.as_deref()),
             byline: non_empty(article.byline.as_deref()),
             truncated,
+            cost: AdmissionCost {
+                document_bytes: measured.byte_len,
+                peak_open_elements: measured.peak_open_elements,
+            },
         },
         markdown,
     }))
@@ -214,8 +221,8 @@ mod tests {
         assert_eq!(anonymous.record.byline, None);
     }
 
-    /// The guard on the scoring pass, reached through the public entry point rather than only
-    /// in `document.rs`, because what matters is that a run keeps going and says which page it
+    /// The guard on the parse, reached through the public entry point rather than only in
+    /// `document.rs`, because what matters is that a run keeps going and says which page it
     /// was rather than spending minutes of CPU on one document.
     #[test]
     fn a_page_built_to_be_expensive_is_refused_and_named() {
@@ -235,7 +242,10 @@ mod tests {
         .expect_err("refused");
 
         assert_eq!(refused.url, "https://example.com/deep");
-        assert!(refused.reason.contains("nests deeper"), "{refused}");
+        assert!(
+            refused.reason.contains("elements open at once"),
+            "{refused}"
+        );
     }
 
     #[test]

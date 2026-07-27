@@ -45,6 +45,26 @@ pub struct ArticleRecord {
     pub byline: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub truncated: Vec<ArticleBound>,
+    /// What this page cost to admit, against the ceilings that admitted it.
+    pub cost: AdmissionCost,
+}
+
+/// What one page measured against the ceilings it had to pass.
+///
+/// It is recorded for every article and not only for the pages that were refused, because the
+/// two questions are different. A count of refusals says whether a ceiling is firing. Only the
+/// values that real articles actually reach can say whether a lower ceiling would start
+/// refusing them, and lowering the ceilings is the plan: they are set where a hostile page is
+/// certainly refused, not where a real page is certainly kept, and the distance between those
+/// two is what this measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionCost {
+    /// The decoded document, which is what the byte ceiling is applied to. It is not the
+    /// stored body's length: a page in a legacy encoding decodes to a different size.
+    pub document_bytes: usize,
+    /// The most elements open at one time, counted on the markup before any tree was built.
+    /// For well-formed markup this is its nesting depth; above that it is unclosed tags.
+    pub peak_open_elements: usize,
 }
 
 /// One page's prose, and what is known about it.

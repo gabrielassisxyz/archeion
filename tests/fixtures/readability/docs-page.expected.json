@@ -13,8 +13,17 @@
     "Migrating from v1",
     "Was this page helpful?",
     "Edit this page on GitHub",
-    "Search docs"
+    "On this page"
   ],
-  "heading_levels": [1, 2, 2, 2, 3],
-  "word_count": { "min": 150, "max": 350 }
+  "heading_levels": [
+    1,
+    2,
+    2,
+    2,
+    3
+  ],
+  "word_count": {
+    "min": 150,
+    "max": 350
+  }
 }

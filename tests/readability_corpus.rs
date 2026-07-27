@@ -16,7 +16,11 @@ use archeion::metadata::PageSource;
 use archeion::readability::{self, Article};
 use serde::Deserialize;
 
+/// Unknown fields are refused rather than ignored. A mistyped assertion that parses is worse
+/// than one that fails: `must_not_contains` with an `s` reads as coverage, asserts nothing,
+/// and leaves its fixture testing only that something came out.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Expectation {
     /// Why this case is in the corpus. Read by a person, not by the test.
     #[allow(dead_code)]
@@ -35,9 +39,37 @@ struct Expectation {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WordCount {
     min: usize,
     max: usize,
+}
+
+/// Every expectation file has a page. The corpus is keyed on the markup, so an expectation
+/// whose page was renamed or deleted would otherwise sit there asserting nothing, and the
+/// suite would keep passing with one case fewer than the directory appears to hold.
+#[test]
+fn no_expectation_in_the_corpus_has_lost_its_page() {
+    let orphans: Vec<String> = fs::read_dir(corpus_dir())
+        .expect("the corpus directory is readable")
+        .map(|entry| entry.expect("a readable directory entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".expected.json"))
+        })
+        .filter(|path| {
+            let stem = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            let page = stem.trim_end_matches(".expected.json");
+            !path.with_file_name(format!("{page}.html")).is_file()
+        })
+        .map(|path| path.display().to_string())
+        .collect();
+
+    assert!(orphans.is_empty(), "expectations with no page: {orphans:?}");
 }
 
 #[test]
@@ -142,8 +174,12 @@ fn expectation_for(page: &Path, name: &str) -> Expectation {
         .unwrap_or_else(|error| panic!("{name} has an unreadable expectation file: {error}"))
 }
 
+fn corpus_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/readability")
+}
+
 fn corpus() -> Vec<PathBuf> {
-    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/readability");
+    let directory = corpus_dir();
     let mut pages: Vec<PathBuf> = fs::read_dir(&directory)
         .unwrap_or_else(|error| panic!("reading {directory:?}: {error}"))
         .map(|entry| entry.expect("a readable directory entry").path())

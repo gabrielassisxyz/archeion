@@ -17,6 +17,7 @@ use serde::de::DeserializeOwned;
 use super::model::{
     Asset, Capture, CaptureId, ContentHash, Item, ItemId, NewAsset, NewCapture, StoredBody,
 };
+use super::walk::ArchiveWalk;
 use crate::canonical_url::CanonicalUrl;
 use crate::metadata::PageMetadata;
 use crate::readability::{Article, ArticleRecord};
@@ -274,6 +275,12 @@ impl Archive {
         }))
     }
 
+    /// Every item in the archive, read from the tree rather than from addresses a caller
+    /// already holds, together with whatever the tree held that is not one.
+    pub fn walk(&self) -> Result<ArchiveWalk, StorageError> {
+        super::walk::walk(&self.root)
+    }
+
     pub fn read_item(&self, url: &CanonicalUrl) -> Result<Item, StorageError> {
         read_optional_json(&self.item_path(url))?.ok_or_else(|| StorageError::NoSuchItem {
             url: url.to_string(),
@@ -510,7 +517,9 @@ fn fingerprint_of(new: &NewCapture, body: &ContentHash) -> ContentHash {
     ContentHash::of(&buffer)
 }
 
-fn read_optional_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, StorageError> {
+pub(super) fn read_optional_json<T: DeserializeOwned>(
+    path: &Path,
+) -> Result<Option<T>, StorageError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),

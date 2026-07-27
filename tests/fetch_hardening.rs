@@ -56,7 +56,7 @@ fn a_redirect_into_the_metadata_service_is_refused_and_nothing_of_it_is_archived
     );
 }
 
-/// The other half of the same guard, and the half the engine leaves open: it screens the
+/// The other half of the same guard, and the half the engine cannot cover: it screens the
 /// hops and dials the seed straight, so a seed pointed at the metadata service is stopped
 /// here or not at all. Nothing is served in this test because nothing should be dialled.
 #[test]

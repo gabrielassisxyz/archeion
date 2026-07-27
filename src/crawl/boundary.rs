@@ -93,9 +93,9 @@ impl Seed {
 /// It answers for both ends of a fetch, which is why it lives on the boundary rather than
 /// in an adapter: a seed is refused before anything is dialled, and a page that ended on
 /// one of these addresses is refused before it is stored. The second half is not the first
-/// one repeated. A redirect is screened inside the engine, by a guard this project neither
-/// owns nor can extend, so a hop that guard misses arrives up here as an ordinary page
-/// carrying whatever answered at the address it reached.
+/// one repeated. A redirect is screened inside the engine, but the archive still keeps
+/// this predicate at the storage boundary because the engine is replaceable and a stored
+/// response is the durable part of the harm.
 ///
 /// A URL that does not parse, or that names no host, is not an address this can judge.
 /// Both answer false and are refused further along for what they actually are.
@@ -107,7 +107,8 @@ pub(crate) fn points_inside_a_network(url: &str) -> bool {
 }
 
 /// Whether a host exists only inside a network. It is the archive's half of the guard the
-/// engine applies to every redirect hop, and it is deliberately the same shape as that one.
+/// engine applies to every redirect hop, kept here so the boundary owns the archive policy
+/// rather than inheriting it from one adapter.
 ///
 /// Neither half resolves the name. A domain answering with a private address passes both,
 /// and closing that gap means resolving before the connect and pinning the answer at connect

@@ -409,7 +409,7 @@ mod tests {
         }
     }
 
-    /// The half of the guard the engine leaves open: it screens every redirect hop for
+    /// The half of the guard the engine cannot cover: it screens every redirect hop for
     /// these ranges and dials the seed straight, so a seed pointed at the cloud metadata
     /// service, at the machine's own ports or at the network around it is refused here or
     /// nowhere.

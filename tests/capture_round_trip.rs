@@ -477,6 +477,47 @@ fn a_subresource_the_capture_never_got_is_recorded_with_the_reason_it_is_missing
     assert_eq!(read_back.assets.len(), 1, "the stylesheet was stored");
 }
 
+/// Two captures that hold different subresources are different captures, even when the bytes
+/// of those subresources are identical. A site's tracking pixels are the ordinary case of two
+/// addresses serving the same bytes, so a name derived from the bytes alone would file the
+/// capture that got the second one on top of the capture that got the first.
+#[test]
+fn two_captures_holding_different_subresources_with_identical_bytes_stay_two_captures() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+    let moment = at("2026-07-25T14:03:22Z");
+    let pixel = |address: &str| {
+        archive
+            .store_asset(&NewAsset {
+                requested_url: address.to_owned(),
+                final_url: address.to_owned(),
+                status: 200,
+                media_type: Some("image/gif".to_owned()),
+                body: b"GIF89a".to_vec(),
+            })
+            .expect("the pixel is stored")
+    };
+
+    let mut first = page_capture(&archive, &url, moment, PAGE);
+    first.assets = vec![pixel("https://example.com/px1.gif")];
+    let first = archive.write_capture(first).expect("first capture");
+    let mut second = page_capture(&archive, &url, moment, PAGE);
+    second.assets = vec![pixel("https://example.com/px2.gif")];
+    let second = archive.write_capture(second).expect("second capture");
+
+    assert_ne!(first.id, second.id);
+    assert_eq!(archive.list_captures(&url).expect("listing").len(), 2);
+    assert_eq!(
+        archive
+            .read_capture(&url, &first.id)
+            .expect("the first capture survived the second")
+            .assets[0]
+            .final_url,
+        "https://example.com/px1.gif"
+    );
+}
+
 /// The ordinary capture got everything, and its record says nothing about misses rather than
 /// carrying an empty list for something that did not happen. It is the same shape a record
 /// written before the archive tracked this has, which is why nothing has to be migrated.

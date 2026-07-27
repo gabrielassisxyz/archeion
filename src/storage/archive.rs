@@ -371,10 +371,11 @@ fn directory_has_visible_entries(path: &Path) -> Result<bool, StorageError> {
 /// renamed field or a changed formatter would silently rename every capture written after
 /// it, filing a re-write of an existing capture beside the original instead of over it.
 ///
-/// What a capture missed is not in here, and does not need to be. Two fetches of one page
-/// that stored the same subresource bytes referenced the same subresources, so the hashes
-/// below already separate a capture that got a stylesheet from one that did not: adding the
-/// misses would hash a reason string that varies between two attempts at the same failure.
+/// What a capture missed is not in here, and does not need to be, but only because each asset
+/// below contributes its address as well as its bytes. Two captures of one page that agree on
+/// every asset they hold, address by address, referenced the same subresources and therefore
+/// missed the same ones. Adding the misses would hash a reason string that varies between two
+/// attempts at the same failure.
 fn fingerprint_of(new: &NewCapture, body: &ContentHash) -> ContentHash {
     fn push_field(buffer: &mut Vec<u8>, value: &str) {
         buffer.extend_from_slice(&(value.len() as u64).to_le_bytes());
@@ -398,7 +399,18 @@ fn fingerprint_of(new: &NewCapture, body: &ContentHash) -> ContentHash {
     // of them, and the whole promise of this name is that a difference gets a file rather
     // than overwriting the capture it differs from.
     buffer.push(u8::from(new.body_truncated));
+    // Each asset contributes what it is and not only what it holds. Hashing the body alone
+    // would name two captures alike whenever the bytes match and the records do not, and a
+    // page referencing two addresses that serve identical bytes, which every tracking pixel
+    // on a site is, is enough for that: a capture that got the first and a capture that got
+    // the second would share a name, and the second write would land on top of the first.
     for asset in &new.assets {
+        let media_type = asset.media_type.as_deref();
+        push_field(&mut buffer, &asset.requested_url);
+        push_field(&mut buffer, &asset.final_url);
+        push_field(&mut buffer, &asset.status.to_string());
+        buffer.push(u8::from(media_type.is_some()));
+        push_field(&mut buffer, media_type.unwrap_or(""));
         push_field(&mut buffer, asset.body.sha256.as_str());
     }
     ContentHash::of(&buffer)

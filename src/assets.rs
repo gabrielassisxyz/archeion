@@ -41,12 +41,19 @@ const MAX_ASSETS_PER_CAPTURE: usize = 128;
 /// something was dropped.
 const MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 
-/// The most one capture's subresources may spend together.
+/// The most one capture may transfer for its subresources.
+///
+/// It counts what came over the wire and not what was kept, which is the same distinction the
+/// count ceiling above is drawn on. A body refused for its size was paid for in full before its
+/// size was known, so a ceiling that counted only stored bytes would never be reached by a page
+/// whose subresources are all just over the per-file limit, and the run would transfer a
+/// hundred and twenty-eight of them per page. What is served out of what the run already
+/// learned costs nothing and counts as nothing.
 ///
 /// It is where the pass stops asking rather than a total it guarantees: the size of the next
-/// subresource is unknown until it arrives, so the last one may cross the line and the
-/// overshoot is bounded by what one subresource may spend. Thirty-two megabytes is many times
-/// the weight of a heavy page.
+/// subresource is unknown until it arrives, so the last one may cross the line, and the
+/// overshoot is bounded by the response ceiling rather than by this number. Thirty-two
+/// megabytes is many times the weight of a heavy page.
 const MAX_ASSET_BYTES_PER_CAPTURE: u64 = 32 * 1024 * 1024;
 
 /// What one capture ended up with, and what it did not.
@@ -54,6 +61,24 @@ const MAX_ASSET_BYTES_PER_CAPTURE: u64 = 32 * 1024 * 1024;
 pub(crate) struct CapturedAssets {
     pub stored: Vec<Asset>,
     pub missed: Vec<MissedAsset>,
+}
+
+/// What one ask taught the run, and what it cost to find out.
+struct Asked {
+    learned: Learned,
+    /// Bytes that came over the wire, kept or not. A body refused for its size was paid for
+    /// before its size was known, and the ceiling that bounds a capture has to see that.
+    transferred: u64,
+}
+
+impl Asked {
+    /// An answer that cost no transfer: a URL refused before it was dialled.
+    fn for_nothing(reason: AssetMiss) -> Self {
+        Self {
+            learned: Learned::Missed(reason),
+            transferred: 0,
+        }
+    }
 }
 
 /// What asking for one subresource taught the run.
@@ -126,21 +151,21 @@ impl<'a> AssetCapture<'a> {
                 continue;
             }
             let learned = match self.known.get(&reference.url) {
-                // A hit costs nothing, so it is served even when the run is out of time: the
-                // bytes are already in the archive and the record is already written down.
+                // A hit costs nothing, so it is served even when the run is out of time and it
+                // counts against no ceiling: the bytes are already in the archive and the
+                // record that references them is already written down.
                 Some(known) => known.clone(),
                 None if self.out_of_time() => Learned::Missed(AssetMiss::DeadlineReached),
                 None => {
-                    let learned = self.ask_for(&reference.url)?;
-                    self.known.insert(reference.url.clone(), learned.clone());
-                    learned
+                    let asked = self.ask_for(&reference.url)?;
+                    bytes_spent = bytes_spent.saturating_add(asked.transferred);
+                    self.known
+                        .insert(reference.url.clone(), asked.learned.clone());
+                    asked.learned
                 }
             };
             match learned {
-                Learned::Stored(asset) => {
-                    bytes_spent = bytes_spent.saturating_add(asset.body.byte_len);
-                    captured.stored.push(asset);
-                }
+                Learned::Stored(asset) => captured.stored.push(asset),
                 Learned::Missed(reason) => captured.missed.push(missed(&reference.url, reason)),
             }
         }
@@ -148,7 +173,14 @@ impl<'a> AssetCapture<'a> {
     }
 
     /// Fetches one subresource and stores it, or learns why it will not be stored.
-    fn ask_for(&mut self, url: &str) -> Result<Learned, StorageError> {
+    fn ask_for(&mut self, url: &str) -> Result<Asked, StorageError> {
+        // Screened before the engine is asked, and not only because the engine refuses these
+        // addresses as well. Handing one over means a request that never leaves the machine and
+        // a refusal this pass then has to read out of an error string, when the address is
+        // something it can judge itself.
+        if !self.seed.allow_private_addresses && points_inside_a_network(url) {
+            return Ok(Asked::for_nothing(AssetMiss::InsideANetwork));
+        }
         self.fetches += 1;
         let response = match self.engine.fetch(url, self.seed) {
             PageEvent::Response(response) => response,
@@ -156,34 +188,41 @@ impl<'a> AssetCapture<'a> {
             // shape for it: to the capture, a subresource it cannot have is a subresource it
             // cannot have, and the reason it was refused travels with it.
             PageEvent::NoResponse(failure) => {
-                return Ok(Learned::Missed(AssetMiss::NoResponse {
+                return Ok(Asked::for_nothing(AssetMiss::NoResponse {
                     detail: failure.reason,
                 }));
             }
         };
 
-        // The archive's own half of the address guard, applied where a page is: the engine
-        // screened every hop of this request, and the engine is the replaceable part, while
-        // the bytes about to be written are the durable one.
-        if !self.seed.allow_private_addresses && points_inside_a_network(&response.final_url) {
-            return Ok(Learned::Missed(AssetMiss::InsideANetwork));
-        }
+        // The same guard where the request ended up, which is the half the check above cannot
+        // cover: the engine screens every redirect hop, and the archive checks anyway, because
+        // the engine is the replaceable part while the bytes about to be written are durable.
         let byte_len = response.body.len() as u64;
+        let refused = |reason: AssetMiss| {
+            Ok(Asked {
+                learned: Learned::Missed(reason),
+                transferred: byte_len,
+            })
+        };
+        if !self.seed.allow_private_addresses && points_inside_a_network(&response.final_url) {
+            return refused(AssetMiss::InsideANetwork);
+        }
         if response.body_truncated {
             // The one place a subresource is treated differently from a page. A page that
             // arrived short is still the page and is kept, marked as short. A subresource
             // exists so the page it belongs to still works, and a stylesheet missing its end
             // does not: storing it would put bytes in the archive that read as the whole
             // file, since a subresource record has nowhere to say otherwise.
-            return Ok(Learned::Missed(AssetMiss::ArrivedShort { byte_len }));
+            return refused(AssetMiss::ArrivedShort { byte_len });
         }
         if byte_len > MAX_ASSET_BYTES {
-            return Ok(Learned::Missed(AssetMiss::TooLarge { byte_len }));
+            return refused(AssetMiss::TooLarge { byte_len });
         }
 
-        Ok(Learned::Stored(
-            self.archive.store_asset(&new_asset(response))?,
-        ))
+        Ok(Asked {
+            learned: Learned::Stored(self.archive.store_asset(&new_asset(response))?),
+            transferred: byte_len,
+        })
     }
 
     /// Whether the run's wall-clock budget is gone.

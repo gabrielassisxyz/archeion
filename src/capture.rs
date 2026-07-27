@@ -212,8 +212,7 @@ fn capture_page(
             return ControlFlow::Break(());
         }
     };
-    run.assets_stored += captured.stored.len();
-    run.assets_missed += captured.missed.len();
+    let (stored, missed) = (captured.stored.len(), captured.missed.len());
     let capture = match archive.write_capture(new_capture(canonical.clone(), page, captured)) {
         Ok(capture) => capture,
         Err(error) => {
@@ -222,6 +221,11 @@ fn capture_page(
         }
     };
     run.captures_written += 1;
+    // Counted with the capture rather than with the pass. A subresource whose capture never
+    // reached the disk is a blob nothing references, and reporting it beside a capture that
+    // does not exist would describe an archive nobody has.
+    run.assets_stored += stored;
+    run.assets_missed += missed;
 
     if let Some(metadata) = extracted
         && let Err(error) = archive.write_metadata(&canonical, &capture.id, &metadata)
@@ -1191,6 +1195,87 @@ mod tests {
                 .iter()
                 .all(|missed| missed.reason == AssetMiss::CountCeilingReached)
         );
+    }
+
+    /// The ceiling on bytes counts what came over the wire, not what was kept, and this is the
+    /// page that tells the two apart: every file on it is just over the size one subresource
+    /// may spend, so nothing is ever stored. A ceiling that counted stored bytes would sit at
+    /// zero forever while the run transferred a gigabyte per page.
+    #[test]
+    fn a_page_of_oversized_files_stops_costing_transfers_at_the_ceiling() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let oversized = vec![b'x'; 8 * 1024 * 1024 + 1];
+        let mut markup = String::from("<html><body>");
+        let mut served = Vec::new();
+        for index in 0..5 {
+            markup.push_str(&format!(r#"<img src="/{index}.png">"#));
+            served.push(subresource(
+                &format!("https://example.com/{index}.png"),
+                "image/png",
+                &oversized,
+            ));
+        }
+        markup.push_str("</body></html>");
+        let engine = ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, &markup)])
+            .serving(served);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.assets_stored, 0);
+        // Four transfers of eight megabytes crosses the thirty-two the capture may spend, and
+        // the overshoot is one file rather than every remaining reference.
+        assert_eq!(
+            run.asset_fetches, 4,
+            "a refused transfer was not charged to the capture"
+        );
+        let capture = only_capture_of(&archive, "https://example.com/a");
+        let reasons: Vec<&AssetMiss> = capture
+            .assets_missed
+            .iter()
+            .map(|missed| &missed.reason)
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                &AssetMiss::TooLarge {
+                    byte_len: 8 * 1024 * 1024 + 1
+                },
+                &AssetMiss::TooLarge {
+                    byte_len: 8 * 1024 * 1024 + 1
+                },
+                &AssetMiss::TooLarge {
+                    byte_len: 8 * 1024 * 1024 + 1
+                },
+                &AssetMiss::TooLarge {
+                    byte_len: 8 * 1024 * 1024 + 1
+                },
+                &AssetMiss::ByteCeilingReached,
+            ]
+        );
+    }
+
+    /// An address the archive can judge on its own is refused without a request. Asking the
+    /// engine would spend a call that never leaves the machine and come back as a reason to be
+    /// read out of an error string.
+    #[test]
+    fn a_reference_pointing_inside_a_network_is_refused_without_being_asked_for() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/a",
+            200,
+            r#"<html><link rel="stylesheet" href="http://169.254.169.254/latest/"></html>"#,
+        )]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.asset_fetches, 0);
+        assert!(engine.urls_fetched().is_empty());
+        let capture = only_capture_of(&archive, "https://example.com/a");
+        assert_eq!(capture.assets_missed[0].reason, AssetMiss::InsideANetwork);
     }
 
     /// The shape an archiver is aimed at something with: a page whose references all answer

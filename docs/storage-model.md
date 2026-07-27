@@ -14,6 +14,8 @@ The rule that decides where a field belongs: **anything that can differ between 
 
 An asset is stored inside its capture record rather than as a record of its own. It has no meaning apart from the page that referenced it, and its bytes are already shared through the content-addressed store, so a separate file would add a level of indirection and no information. That decision is cheap to revisit if assets ever need to be queried on their own.
 
+An asset arrives at the capture already stored, as a record, rather than as bytes the write of the capture puts away. It is the one place the store asks the caller to write in two steps, and the reason is that assets are shared: one stylesheet belongs to every page of a site that links it, so the run stores those bytes once and hands the same record to each of those captures. Holding the bytes until the capture is written would mean carrying a site's subresources in memory for as long as a run lasts, to write files that are already on disk. [`asset-capture.md`](asset-capture.md) is the pass that does that.
+
 ## The layout
 
 ```
@@ -109,6 +111,17 @@ Both ends of that window widen as captures arrive, rather than only the last one
 
 `requested_url` and `final_url` differ exactly when the fetch redirected. Response headers are a list and not a map, because a map drops the repeated ones, and `set-cookie` and `link` repeat.
 
+A capture that did not get everything the page referenced carries one more field, and a capture that got everything does not, which is also the shape of every record written before the field existed:
+
+```json
+  "assets_missed": [
+    { "url": "https://blog.example.com/hero.png", "reason": "too_large", "byte_len": 41943040 },
+    { "url": "https://cdn.example.net/app.js", "reason": "no_response", "detail": "error sending request: dns error" }
+  ]
+```
+
+The reason is the point of the field. Comparing what the derived record says the page referenced against what the capture holds already shows that something is gone; only this says whether the archive refused it, and therefore whether a different number would have kept the page whole. It stays out of the capture fingerprint: two fetches that stored the same asset bytes referenced the same assets, so the hashes above already tell those captures apart, and hashing a failure would mean hashing a reason string that varies between two attempts at it.
+
 Records are JSON, pretty printed. The format costs some bytes against the raw bodies it sits beside, and buys a file that `diff` and `grep` can work with and that any language will still parse in twenty years.
 
 ### The derived record
@@ -124,7 +137,7 @@ Its presence changes nothing else in this layout. Reading an archive that has no
 Two properties matter more than throughput, since a capture is cheap and re-fetching it may be impossible.
 
 - **Every file lands atomically.** A record is written to a temporary file in its destination directory, flushed with `fsync`, then renamed into place, and the directory itself is flushed after the rename. A reader sees the old record or the whole new one, never a half-written one. Syncing the file alone would make the content durable but not the name it was given, and a record whose name did not survive is a record the archive lost.
-- **The write order is chosen, not incidental.** Bodies go first, since a run cut short then leaves an unreferenced blob, which costs disk space and nothing else, rather than a record pointing at bytes that were never stored. The item record goes next, because it carries the canonical URL that the hashed directory name does not: a capture written into a directory with no `item.json` beside it cannot be read back to the address it came from. The capture record goes last.
+- **The write order is chosen, not incidental.** Bodies go first, since a run cut short then leaves an unreferenced blob, which costs disk space and nothing else, rather than a record pointing at bytes that were never stored. The asset bodies go before the page's own, one step earlier and by the same rule, because the capture record has to name them. The item record goes next, because it carries the canonical URL that the hashed directory name does not: a capture written into a directory with no `item.json` beside it cannot be read back to the address it came from. The capture record goes last.
 
 ## The index
 

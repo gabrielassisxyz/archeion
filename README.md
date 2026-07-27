@@ -2,11 +2,11 @@
 
 Local-first archival tool for web content and its metadata.
 
-Archeion captures a page, keeps the raw response exactly as it arrived, and records the metadata around it: canonical URL, content hash, HTTP status, MIME type, title, author, publication date, OpenGraph and schema.org data, assets, outbound links and collection tags. The archive is a directory on your disk in a layout built to be revisited, re-indexed and reprocessed years later.
+Archeion captures a page, keeps the raw response exactly as it arrived, and records the metadata around it: canonical URL, content hash, HTTP status, MIME type, title, author, publication date, OpenGraph and schema.org data, outbound links and collection tags. The images, stylesheets and media the page needs to still make sense are fetched and stored beside it, once however many pages share them. The archive is a directory on your disk in a layout built to be revisited, re-indexed and reprocessed years later.
 
 ## Status
 
-Early, and honest about it: there is no usable command yet. Crawling a seed into an archive works as a library, with the engine behind an interface this project owns, but running `archeion` today prints that there is no command surface and exits. [`docs/storage-model.md`](docs/storage-model.md) describes what an archive on disk looks like, [`docs/crawl-boundary.md`](docs/crawl-boundary.md) what the archive asks a crawl engine for. [`ROADMAP.md`](ROADMAP.md) tracks what exists, what is missing, and what is deliberately out of scope.
+Early, and honest about it: there is no usable command yet. Crawling a seed into an archive works as a library, with the engine behind an interface this project owns, but running `archeion` today prints that there is no command surface and exits. [`docs/storage-model.md`](docs/storage-model.md) describes what an archive on disk looks like, [`docs/crawl-boundary.md`](docs/crawl-boundary.md) what the archive asks a crawl engine for, and [`docs/asset-capture.md`](docs/asset-capture.md) how the files a page needs are acquired and what bounds that. [`ROADMAP.md`](ROADMAP.md) tracks what exists, what is missing, and what is deliberately out of scope.
 
 ## Install
 

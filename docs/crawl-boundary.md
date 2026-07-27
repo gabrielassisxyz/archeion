@@ -14,9 +14,13 @@ Three types, all of them written in the archive's terms rather than an engine's.
 
 Everything else an engine knows about, its configuration surface, its concurrency model, its idea of what a page is, stops at the adapter.
 
+Two things are asked of an engine rather than one: a crawl, and a single URL fetched on its own. The second exists because a page's subresources cannot be acquired through the first. Handing those addresses back to the crawl would file each of them as an item with a depth and a queue position, when a subresource belongs to the capture that referenced it and to nothing else. The fetch carries the same `Seed`, for the policy on it rather than for the address in it: the request timeout, the redirect screening and the rule about internal addresses govern every request a run makes, not only the ones the engine chose to make. It answers with a `PageEvent` and never an error, because everything that can go wrong is a fetch that produced no response, including a URL the engine refused to dial at all.
+
 ## The decisions in it
 
 **The call blocks and the core stays synchronous.** The engine is asynchronous underneath, and its runtime is built inside the adapter and never escapes. An archive is a directory being written; making canonicalization, storage and every test above them async so that one dependency feels at home is the dependency dictating the shape of the program.
+
+**A single fetch happens on a thread of its own, and that is not an optimization.** It is called from the page callback of a crawl, which runs on a thread that is already driving the engine's runtime, and a runtime cannot be entered from there. Doing the work on that thread would panic on the first subresource of the first page. The same thread also contains a panic inside the engine to the one subresource it happened on, rather than to the site the run was still archiving.
 
 **Pages arrive one at a time, through a callback, while the crawl runs.** A crawl that returns a list has already held a run's worth of response bodies in memory, and has produced nothing if it is interrupted at page 199.
 
@@ -64,7 +68,7 @@ Everything else an engine knows about, its configuration surface, its concurrenc
 
 - **A seed whose name resolves to a private address.** The guard reads addresses and known names, not answers from a resolver, so a domain pointed at 10.0.0.1 is fetched.
 - **A hard rule that no page is ever archived under a host the run was not pointed at.** The allowance above is the engine's, not a decision made here, and closing it means refusing the capture above the boundary rather than the fetch below it, where the seed's own move to its canonical host would have to stay allowed.
-- **Assets.** A page event carries the page. The subresources it needs are their own pass.
+- **A subresource inside a page event.** A page event carries the page. The subresources it needs are their own pass, over the single fetch above, and [`asset-capture.md`](asset-capture.md) is where its rules live.
 
 ## Testing it
 
@@ -72,4 +76,8 @@ The pipeline above the line is tested against a scripted engine that replays wri
 
 In the adapter, everything that does not need a socket is tested the same way: the queue that can lose pages is driven directly with a channel and more pages than it holds, and the translation from the engine's page to a page event is checked on a page built by hand. The deadline is the same trick applied to time. The crawl reaches the place that enforces it as a future rather than as a website, so the stalled host that the whole policy exists for is a future that never finishes, and the run that has to end at its budget can be proven to in fifty milliseconds. The margin the guard above the boundary waits out is a plain function of the budget and the elapsed time, which is why the one behavior that would otherwise need a stopwatch and a sleeping test is three assertions instead. The numbers that only the engine can act on, the request timeout, the retry budget and the redirect policy, are checked where they land in its configuration, since a change to how the engine is configured otherwise compiles and passes every gate while being broken.
 
-One test opens a socket, and it is the redirect guard. Whether a hop into a private address is followed is decided inside the engine's HTTP client, by a policy with no public entry point and no constructible input, so asserting which policy was configured proves the configuration and not the refusal. That test starts a server on a loopback port, answers the seed with a redirect into 169.254.169.254, and checks that the hop produced no record. The rule it reads against is about the web rather than about sockets: nothing in it leaves the machine, needs setup, or answers differently tomorrow, because the server it crawls is in the same file. What is still uncovered is the engine's own network path, and `cargo run --example capture_seed` against a server running on localhost is how that gets exercised.
+Two tests open a socket, and both cover something that lives inside the dependency with no reachable entry point. The rule they read against is about the web rather than about sockets: nothing in them leaves the machine, needs setup, or answers differently tomorrow, because the server they crawl is in the same file.
+
+The first is the redirect guard. Whether a hop into a private address is followed is decided inside the engine's HTTP client, by a policy with no public entry point and no constructible input, so asserting which policy was configured proves the configuration and not the refusal. That test starts a server on a loopback port, answers the seed with a redirect into 169.254.169.254, and checks that the hop produced no record.
+
+The second is the single fetch, and what it really covers is the thread the decision above is about. Nothing can assert that a runtime is not being nested without running one, and getting it wrong is a panic on the first subresource of the first page. So a server serves a page, a stylesheet and an image whose bytes are not text, and the test asserts that the archive holds all three and that the only paths asked of that server were the four it should have been. That is also the first test to drive the engine's plain network path, which until now was covered by `cargo run --example capture_seed` against a server on localhost and nothing else. What that example still reaches and no test does is a crawl of more than one page, and the queue between the engine and the archive under real timing.

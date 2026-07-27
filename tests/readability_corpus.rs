@@ -59,6 +59,41 @@ struct WordCount {
     max: usize,
 }
 
+/// A case that produces no article checks none of the fields that describe one, so declaring
+/// them there is writing an assertion that will never run. It reads as coverage in a file
+/// somebody will trust, which is the same reason unknown fields are refused above rather than
+/// ignored. `title` is exempt: it is handed to the extractor rather than asserted, and a page
+/// is refused or passed over with the title its metadata resolved like any other.
+#[test]
+fn no_expectation_declares_an_assertion_its_outcome_will_never_check() {
+    let unchecked: Vec<String> = corpus()
+        .into_iter()
+        .filter_map(|page| {
+            let name = file_stem(&page);
+            let expected = expectation_for(&page, &name);
+            if expected.outcome == Outcome::Article {
+                return None;
+            }
+            let declared = [
+                (!expected.must_contain.is_empty(), "must_contain"),
+                (!expected.must_not_contain.is_empty(), "must_not_contain"),
+                (expected.heading_levels.is_some(), "heading_levels"),
+                (expected.word_count.is_some(), "word_count"),
+            ];
+            let names: Vec<&str> = declared
+                .into_iter()
+                .filter_map(|(present, name)| present.then_some(name))
+                .collect();
+            (!names.is_empty()).then(|| format!("{name}: {}", names.join(", ")))
+        })
+        .collect();
+
+    assert!(
+        unchecked.is_empty(),
+        "expectations declaring assertions nothing will check: {unchecked:?}"
+    );
+}
+
 /// Every expectation file has a page. The corpus is keyed on the markup, so an expectation
 /// whose page was renamed or deleted would otherwise sit there asserting nothing, and the
 /// suite would keep passing with one case fewer than the directory appears to hold.
@@ -92,11 +127,7 @@ fn every_page_in_the_corpus_extracts_within_its_declared_bounds() {
     assert!(!cases.is_empty(), "the corpus directory has no pages in it");
 
     for page in cases {
-        let name = page
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .expect("a fixture has a readable name")
-            .to_owned();
+        let name = file_stem(&page);
         let expected = expectation_for(&page, &name);
         let extracted = extract(&page, &name, expected.title.as_deref());
 
@@ -181,6 +212,13 @@ fn extract(page: &Path, name: &str, title: Option<&str>) -> Extraction {
         title,
     )
     .unwrap_or_else(|error| panic!("{name} was refused: {error}"))
+}
+
+fn file_stem(page: &Path) -> String {
+    page.file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("a fixture has a readable name")
+        .to_owned()
 }
 
 fn expectation_for(page: &Path, name: &str) -> Expectation {

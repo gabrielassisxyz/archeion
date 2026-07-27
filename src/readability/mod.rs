@@ -51,7 +51,7 @@ const MAX_ELEMENTS_TO_SCORE: usize = 50_000;
 /// |---|---|---|---|
 /// | a site's front page | 137 | 0.12 | nothing, which is the point |
 /// | a short post on a plain page | 281 | 0.78 | the share |
-/// | the same post under a sidebar of thirty | 401 | 0.21 | the floor |
+/// | a short post under a sidebar of thirty-three | 388 | 0.20 | the floor |
 /// | a news article under its related links and comments | 1231 | 0.23 | the floor |
 /// | the rest of the corpus articles | 501 to 1231 | 0.71 to 0.93 | both |
 ///
@@ -63,13 +63,17 @@ const MAX_ELEMENTS_TO_SCORE: usize = 50_000;
 /// be raised: an article's share falls as far as its furniture goes, and furniture has no
 /// bound.
 ///
-/// The floor is where two observations meet rather than where an argument put it. The library's
-/// own numbers bracket it without settling it: below 140 characters it stops counting a block
-/// as content at all, and at 500 it stops looking for more content in a page. What decides it
-/// is that the front pages seen measured 137 and about 250, and the shortest genuine post seen
-/// measured 281, so the two constraints leave a narrow band and 300 sits in it. Those two
-/// figures are close enough that a real post of 260 characters on a busy page would be refused,
-/// which is the cost of this rule and is stated rather than hidden.
+/// The floor is where an observation put it, not an argument. The library's own numbers bracket
+/// it without settling it: below 140 characters it stops counting a block as content at all,
+/// and at 500 it stops looking for more content in a page. What decides it is that the front
+/// pages seen measured 137 and about 250, and 300 sits above both without reaching the length
+/// of the articles being kept.
+///
+/// What it costs is exact: an extraction of 299 characters or fewer survives only by being more
+/// than a quarter of its page, so on a busy enough page it does not survive at all. That
+/// includes the 281-character note in the corpus, which is kept because its page is plain. The
+/// refusal is recorded rather than silent, which is what makes a number this blunt tolerable
+/// while it is still a first guess.
 ///
 /// That is a number from few origins, which is not enough to settle it, so every article
 /// records what it measured and every refusal is written beside its capture. Both are meant to

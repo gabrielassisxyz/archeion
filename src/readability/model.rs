@@ -72,7 +72,9 @@ pub struct ArticleRecord {
 pub struct ProseShare {
     /// The extracted article's own text, without the Markdown that will be written around it.
     pub article_chars: usize,
-    /// Everything the page holds that a reader would have seen, the article included.
+    /// The page's text with the bodies of scripts, styles and templates left out, and the rest
+    /// left in: navigation, banners, and every block the scorer discarded. It is not what a
+    /// reader would have seen, since a page can hide text with CSS and this never resolves it.
     pub page_chars: usize,
 }
 

@@ -1,13 +1,14 @@
 {
-  "why": "The same short note as short-post.html, on the page an ordinary site would serve it on: a nav, a cookie notice, a sidebar of thirty other posts and a footer. Its share of the page is 0.21, under the threshold, so the only thing keeping it is the floor on its own size. Without this case the share could be tightened until it swallowed every short post published on a site with a sidebar, and the corpus would not notice.",
+  "why": "A short post on the page an ordinary site would serve it on: a nav, a sidebar of thirty-three other posts and a footer. Its share of the page is 0.20, under the threshold, so the only thing keeping it is the floor on its own size, and its 388 characters are the post itself rather than furniture that leaked into the extraction. Without this case the share could be tightened until it swallowed every short post published on a site with a sidebar, and the corpus would not notice.",
   "outcome": "article",
   "title": "The oven is fixed",
   "must_contain": [
-    "The element went in this morning"
+    "The element went in this morning",
+    "most of it still sounds right"
   ],
   "must_not_contain": [
     "Keeping a sourdough starter alive",
     "Written by hand"
   ],
-  "word_count": { "min": 50, "max": 130 }
+  "word_count": { "min": 70, "max": 140 }
 }

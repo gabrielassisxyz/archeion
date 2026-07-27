@@ -1,5 +1,5 @@
 {
-  "why": "An article in a language that does not put spaces between words. Counting words by splitting on whitespace scores its three paragraphs at three, while the nav and footer around it keep one token per element exactly as they would in English, so a rule weighing words would refuse this page however long it is. The rule weighs characters for this reason, and this case is what holds it to that.",
+  "why": "An article in a language that does not put spaces between words. Splitting on whitespace scores its three paragraphs at three tokens, while the nav, the sidebar and the footer around it keep one token per element exactly as they would in English: nineteen for this page. A rule weighing words would refuse it, since three is under a quarter of nineteen, and it would refuse it however long the article got, because adding a paragraph adds one token. The rule weighs characters for that reason, and this case is what holds it to that.",
   "outcome": "article",
   "title": "面包与耐心",
   "must_contain": [

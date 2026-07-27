@@ -309,6 +309,13 @@ mod tests {
             }
             Ok(self.outcome.clone())
         }
+
+        fn fetch(&self, url: &str, _seed: &Seed) -> PageEvent {
+            PageEvent::NoResponse(FetchFailure {
+                url: url.to_owned(),
+                reason: "this fake was given nothing to answer with".to_owned(),
+            })
+        }
     }
 
     fn page(url: &str, status: u16, body: &str) -> PageEvent {

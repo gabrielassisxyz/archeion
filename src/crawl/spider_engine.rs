@@ -18,7 +18,7 @@ use jiff::Timestamp;
 use spider::configuration::RedirectPolicy;
 use spider::page::Page;
 use spider::reqwest::header::{CONTENT_LENGTH, HeaderMap};
-use spider::tokio::runtime::Runtime;
+use spider::tokio::runtime::{Builder, Runtime};
 use spider::tokio::sync::broadcast::Receiver;
 use spider::tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use spider::website::Website;
@@ -71,6 +71,68 @@ impl CrawlEngine for SpiderEngine {
         let runtime = Runtime::new().map_err(|source| CrawlError::EngineUnavailable { source })?;
         Ok(runtime.block_on(crawl_seed(&start, seed, on_page)))
     }
+
+    fn fetch(&self, url: &str, seed: &Seed) -> PageEvent {
+        apply_response_byte_ceiling();
+        match usable_url(url, seed.allow_private_addresses) {
+            Ok(target) => fetch_off_the_crawl_runtime(&target, seed),
+            Err(reason) => PageEvent::NoResponse(FetchFailure {
+                url: url.to_owned(),
+                reason,
+            }),
+        }
+    }
+}
+
+/// Fetches one URL on a thread of this call's own.
+///
+/// The thread is not an optimization, it is the only place the fetch can happen. A runtime
+/// cannot be entered from a thread that is already driving one, and a fetch reaches here
+/// through the page callback of a crawl, which runs inside the runtime `crawl` built: doing
+/// the work on this thread would panic on the first subresource of the first page.
+///
+/// It also contains a panic inside the engine to the one subresource it happened on. A run
+/// that has archived four hundred pages should not lose the rest of a site because a
+/// stylesheet took a dependency down a path it does not handle.
+fn fetch_off_the_crawl_runtime(url: &str, seed: &Seed) -> PageEvent {
+    std::thread::scope(
+        |threads| match threads.spawn(|| fetch_one_url(url, seed)).join() {
+            Ok(event) => event,
+            Err(_) => PageEvent::NoResponse(FetchFailure {
+                url: url.to_owned(),
+                reason: "the crawl engine panicked while fetching".to_owned(),
+            }),
+        },
+    )
+}
+
+/// One request, under the same configuration a crawl of this URL would have run under.
+///
+/// The website exists for its client and is never crawled. That is what carries the policy
+/// across: the redirect screening and the chain limit, the request timeout, the user agent,
+/// and the byte ceiling the environment already holds. It is built around the URL being
+/// fetched rather than around the page that referenced it, so a subresource on a content
+/// network is judged against its own host, which is where a redirect of it would have to
+/// stay.
+///
+/// Two settings on the seed do not reach a fetch. The retry budget belongs to the crawl loop,
+/// so a subresource that failed is not asked twice and is reported as missed. The politeness
+/// delay is the crawl's too, and what stands in for it here is that the pass making these
+/// calls makes them one at a time.
+fn fetch_one_url(url: &str, seed: &Seed) -> PageEvent {
+    let runtime = match Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(source) => {
+            return PageEvent::NoResponse(FetchFailure {
+                url: url.to_owned(),
+                reason: format!("the crawl engine could not be started: {source}"),
+            });
+        }
+    };
+    runtime.block_on(async {
+        let client = configured_website(url, seed).configure_http_client();
+        page_event(Page::new_page(url, &client).await)
+    })
 }
 
 /// Puts the byte ceiling where the engine will look for it, once per process.
@@ -88,7 +150,7 @@ fn apply_response_byte_ceiling() {
     APPLIED.call_once(|| {
         let settled = std::env::var_os(RESPONSE_BYTE_CEILING);
         if let Some(ceiling) = response_byte_ceiling(settled.is_some()) {
-            // SAFETY: the first crawl of the process, before its runtime exists.
+            // SAFETY: the first crawl or fetch of the process, before its runtime exists.
             unsafe { std::env::set_var(RESPONSE_BYTE_CEILING, ceiling) };
         }
     });
@@ -357,30 +419,39 @@ fn headers_of(headers: Option<&HeaderMap>) -> Vec<Header> {
         .collect()
 }
 
-/// Refuses a seed before the engine dials anything. The scheme decides what gets opened,
-/// and `file:` or `data:` reaching a crawler is the archive reading the local machine. The
-/// address decides what gets reached, and it is checked here because the engine screens
-/// every redirect hop for the same ranges but never the seed, which it dials directly.
+/// Refuses a seed before the engine dials anything.
 fn usable_seed_url(seed: &Seed) -> Result<String, CrawlError> {
-    let unusable = |reason: String| CrawlError::UnusableSeed {
+    usable_url(&seed.url, seed.allow_private_addresses).map_err(|reason| CrawlError::UnusableSeed {
         url: seed.url.clone(),
         reason,
-    };
-    let parsed = Url::parse(&seed.url).map_err(|error| unusable(error.to_string()))?;
+    })
+}
+
+/// Whether this engine will dial a URL at all, and the address it would dial.
+///
+/// The scheme decides what gets opened, and `file:` or `data:` reaching a crawler is the
+/// archive reading the local machine. The address decides what gets reached, and it is
+/// checked here because the engine screens every redirect hop for the same ranges but never
+/// the URL it was handed, which it dials directly.
+///
+/// Both halves apply to a subresource as much as to a seed, and for the same reason: a page
+/// arriving from the open web is the one deciding which addresses the next requests of the
+/// run are aimed at, so a reference is screened before it is followed rather than trusted
+/// because the archive resolved it a moment ago.
+fn usable_url(url: &str, allow_private_addresses: bool) -> Result<String, String> {
+    let parsed = Url::parse(url).map_err(|error| error.to_string())?;
 
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(unusable(format!(
+        return Err(format!(
             "{} is not a scheme this archive fetches",
             parsed.scheme()
-        )));
+        ));
     }
     let Some(host) = parsed.host() else {
-        return Err(unusable("no host to crawl".to_owned()));
+        return Err("no host to fetch from".to_owned());
     };
-    if !seed.allow_private_addresses && is_internal_host(&host) {
-        return Err(unusable(format!(
-            "{host} is inside a network rather than on the web"
-        )));
+    if !allow_private_addresses && is_internal_host(&host) {
+        return Err(format!("{host} is inside a network rather than on the web"));
     }
 
     Ok(parsed.to_string())
@@ -475,6 +546,32 @@ mod tests {
                 usable_seed_url(&Seed::new(public)).is_ok(),
                 "{public} was refused"
             );
+        }
+    }
+
+    /// A subresource is screened by the rule the seed is screened by, and refused before a
+    /// socket is opened. The page that named it arrived from the open web, so a capture of a
+    /// public page whose stylesheet points at the metadata service is the same request as a
+    /// seed pointed there, made one hop later.
+    #[test]
+    fn a_subresource_this_engine_will_not_dial_is_refused_without_being_fetched() {
+        for refused in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://localhost:8000/style.css",
+            "http://127.0.0.1/style.css",
+            "http://[::1]/style.css",
+            "http://10.0.0.1/style.css",
+            "file:///etc/passwd",
+            "data:text/css,body{}",
+            "/style.css",
+        ] {
+            match SpiderEngine.fetch(refused, &Seed::new("https://example.com/")) {
+                PageEvent::NoResponse(failure) => assert_eq!(failure.url, refused),
+                PageEvent::Response(response) => {
+                    panic!("{refused} was fetched and answered {}", response.status)
+                }
+            }
         }
     }
 

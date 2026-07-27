@@ -240,9 +240,9 @@ pub enum CrawlError {
     },
 }
 
-/// The one thing the archival core asks of a crawl engine.
+/// What the archival core asks of a crawl engine: a crawl, and a single fetch.
 ///
-/// The call blocks until the crawl ends, and every page reaches the caller through
+/// The crawl call blocks until the crawl ends, and every page reaches the caller through
 /// `on_page` while it runs, so nothing accumulates in memory waiting for the end. An
 /// engine that is asynchronous underneath keeps its runtime inside its own adapter: the
 /// archive writes to a filesystem, and making the core async to accommodate an engine
@@ -264,4 +264,22 @@ pub trait CrawlEngine {
         seed: &Seed,
         on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
     ) -> Result<CrawlOutcome, CrawlError>;
+
+    /// Fetches one URL on its own, outside the crawl.
+    ///
+    /// This is what an asset pass is made of. A subresource a page referenced is not a page
+    /// of the crawl: it has no depth, it contributes no links, and it belongs to the capture
+    /// that referenced it rather than to a queue. Handing those URLs back to `crawl` would
+    /// file each of them as an item of its own, which is the one thing an asset is not.
+    ///
+    /// What a fetch does share with the crawl around it is the policy, which is why the seed
+    /// comes along. The request timeout, the redirect screening and the rule about addresses
+    /// that exist only inside a network govern every request a run makes, not only the ones
+    /// the engine chose to make. The address in the seed is not where this fetch goes.
+    ///
+    /// There is one answer and no error, because everything that can go wrong is a fetch
+    /// that produced no response, which `PageEvent` already carries a shape for. A URL this
+    /// engine refuses to dial at all is reported the same way, since to the caller a
+    /// subresource it cannot have is a subresource it cannot have.
+    fn fetch(&self, url: &str, seed: &Seed) -> PageEvent;
 }

@@ -52,8 +52,11 @@ const MAX_ELEMENTS_TO_SCORE: usize = 50_000;
 /// | a site's front page | 137 | 0.12 | nothing, which is the point |
 /// | a short post on a plain page | 281 | 0.78 | the share |
 /// | the same post under a sidebar of thirty | 401 | 0.21 | the floor |
-/// | an article under 40 related links and 20 comments | 1231 | 0.19 | the floor |
-/// | the corpus articles | 988 to 1231 | 0.71 to 0.93 | both |
+/// | a news article under its related links and comments | 1231 | 0.23 | the floor |
+/// | the rest of the corpus articles | 501 to 1231 | 0.71 to 0.93 | both |
+///
+/// Every row is a page in `tests/fixtures/readability`, so each of these numbers can be
+/// measured again rather than taken on trust.
 ///
 /// A floor alone would discard the short post; a share alone would discard it as soon as its
 /// page grew a sidebar, which is most pages. The last two rows are why the floor cannot simply

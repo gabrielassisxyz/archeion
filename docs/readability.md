@@ -87,8 +87,8 @@ So a second gate runs after the extraction rather than before it: an extraction 
 | a site's front page | 137 | 0.12 | nothing, which is the point |
 | a short post on a plain page | 281 | 0.78 | the share |
 | the same post under a sidebar of thirty | 401 | 0.21 | the floor |
-| an article under 40 related links and 20 comments | 1231 | 0.19 | the floor |
-| the corpus articles | 988 to 1231 | 0.71 to 0.93 | both |
+| a news article under its related links and comments | 1231 | 0.23 | the floor |
+| the rest of the corpus articles | 501 to 1231 | 0.71 to 0.93 | both |
 
 A floor alone would discard the announcement and the single-paragraph note, which an archive has as much reason to keep as anything else. A share alone would discard the same note as soon as its page grew a sidebar, which is most pages, and it would discard a long article whose page carries more comments than prose. The last two rows are also why the floor cannot simply be raised until it does the work by itself: an article's share falls as far as its furniture goes, and furniture has no bound.
 

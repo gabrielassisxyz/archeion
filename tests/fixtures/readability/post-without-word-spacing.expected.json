@@ -1,0 +1,14 @@
+{
+  "why": "An article in a language that does not put spaces between words. Counting words by splitting on whitespace scores its three paragraphs at three, while the nav and footer around it keep one token per element exactly as they would in English, so a rule weighing words would refuse this page however long it is. The rule weighs characters for this reason, and this case is what holds it to that.",
+  "outcome": "article",
+  "title": "面包与耐心",
+  "must_contain": [
+    "面团会告诉你它什么时候准备好了",
+    "真正起作用的是水"
+  ],
+  "must_not_contain": [
+    "没有订阅，没有跟踪",
+    "黑麦和小麦完全不同"
+  ],
+  "heading_levels": [1]
+}

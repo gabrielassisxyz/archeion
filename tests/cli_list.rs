@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use archeion::CanonicalUrl;
-use archeion::readability::{AdmissionCost, Article, ArticleRecord, ExtractionRules};
+use archeion::readability::{AdmissionCost, Article, ArticleRecord, ExtractionRules, ProseShare};
 use archeion::storage::{Archive, CaptureId, Header, ItemId, NewCapture};
 use jiff::Timestamp;
 use tempfile::TempDir;
@@ -36,7 +36,10 @@ fn article() -> Article {
             extractor_version: archeion::readability::EXTRACTOR_VERSION,
             rules: ExtractionRules::Heuristic,
             word_count: 5,
-            page_word_count: 5,
+            share: Some(ProseShare {
+                article_chars: 240,
+                page_chars: 300,
+            }),
             excerpt: Some("This capture produced prose.".to_owned()),
             byline: None,
             truncated: Vec::new(),

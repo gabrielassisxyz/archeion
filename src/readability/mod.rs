@@ -17,7 +17,7 @@ use dom_smoothie::{Config, Readability, ReadabilityError};
 
 pub use model::{
     AdmissionCost, Article, ArticleBound, ArticleRecord, EXTRACTOR_VERSION, Extraction,
-    ExtractionRules, RefusedExtraction,
+    ExtractionRules, ProseShare, RefusedExtraction,
 };
 
 use crate::metadata::PageSource;
@@ -28,15 +28,15 @@ use crate::metadata::PageSource;
 /// for the other: a page can have fifty thousand siblings and no nesting at all.
 const MAX_ELEMENTS_TO_SCORE: usize = 50_000;
 
-/// How short an extraction may be before the page around it has to account for it, and how
-/// small a share of that page's prose it may be. Both, never either: this refuses a sliver of
-/// a page that mostly said something else, and a sliver is the two things at once.
+/// How much text an extraction may hold before the page around it stops having to account for
+/// it, and how small a share of that page's text it may be. Both, never either: this refuses a
+/// sliver of a page that mostly said something else, and a sliver is the two things at once.
 ///
 /// A site's front page is the shape this exists for. It carries a tagline, a description and a
 /// footer blurb around a list of links, which is more prose than an imagined listing has, so
 /// the readability probe admits it and the scorer then returns whichever of those blocks scored
-/// best: a home page reduced to a corpus fixture yields 27 words of boilerplate, against a
-/// median of about 2000 for the real articles of the same site.
+/// best: a home page reduced to a corpus fixture yields 137 characters of boilerplate, against
+/// a median of about 2000 words for the real articles of the same site.
 ///
 /// The obvious instrument is not the one used here. Link density is what a listing is made of,
 /// and it cannot see this: the list is dropped as furniture before the article is formed, so
@@ -47,19 +47,36 @@ const MAX_ELEMENTS_TO_SCORE: usize = 50_000;
 ///
 /// Each number alone would refuse pages that are articles, and each covers the other's mistake:
 ///
-/// | page | words | share | kept by |
+/// | page | characters | share | kept by |
 /// |---|---|---|---|
-/// | a site's front page | 27 | 0.11 | nothing, which is the point |
-/// | a genuinely short post | 72 | 0.82 | the share |
-/// | an article under 40 related links and 20 comments | 253 | 0.21 | the length |
-/// | the corpus articles | 211 to 253 | 0.76 to 1.03 | both |
+/// | a site's front page | 137 | 0.12 | nothing, which is the point |
+/// | a short post on a plain page | 281 | 0.78 | the share |
+/// | the same post under a sidebar of thirty | 401 | 0.21 | the floor |
+/// | an article under 40 related links and 20 comments | 1231 | 0.19 | the floor |
+/// | the corpus articles | 988 to 1231 | 0.71 to 0.93 | both |
 ///
-/// Both were chosen against pages from few origins, which is not enough, so every article
-/// records `word_count` and `page_word_count` and every refusal is written beside its capture.
-/// The numbers are meant to move against that material rather than stay where a first guess
-/// put them, on the same terms as the ceilings above.
-const MIN_ARTICLE_WORDS: usize = 100;
-const MIN_SHARE_OF_PAGE: f32 = 0.25;
+/// A floor alone would discard the short post; a share alone would discard it as soon as its
+/// page grew a sidebar, which is most pages. The last two rows are why the floor cannot simply
+/// be raised: an article's share falls as far as its furniture goes, and furniture has no
+/// bound.
+///
+/// The floor is where two observations meet rather than where an argument put it. The library's
+/// own numbers bracket it without settling it: below 140 characters it stops counting a block
+/// as content at all, and at 500 it stops looking for more content in a page. What decides it
+/// is that the front pages seen measured 137 and about 250, and the shortest genuine post seen
+/// measured 281, so the two constraints leave a narrow band and 300 sits in it. Those two
+/// figures are close enough that a real post of 260 characters on a busy page would be refused,
+/// which is the cost of this rule and is stated rather than hidden.
+///
+/// That is a number from few origins, which is not enough to settle it, so every article
+/// records what it measured and every refusal is written beside its capture. Both are meant to
+/// move against that material rather than stay where a first guess put them, on the same terms
+/// as the ceilings above.
+const MIN_ARTICLE_CHARS: usize = 300;
+
+/// The share is a quarter, compared by multiplying out. Integer arithmetic has no rounding to
+/// reason about, and it answers "keep" for a page holding no text rather than dividing by it.
+const SHARE_DENOMINATOR: usize = 4;
 
 /// A page whose prose could not be read. It names the URL because the point of reporting it
 /// is to go and look at the stored body, and a count would leave nothing to look at.
@@ -95,7 +112,7 @@ pub fn extract(
     };
 
     let (document, measured) = document::build(&html).map_err(|cost| refused(cost.reason()))?;
-    let page_word_count = document::page_word_count(&document);
+    let page_chars = document::page_text_chars(&document);
     let mut readability = Readability::with_document(
         document,
         Some(source.final_url),
@@ -119,28 +136,33 @@ pub fn extract(
         Err(error) => return Err(refused(error.to_string())),
     };
 
-    let mut truncated = Vec::new();
-    let prose = markdown::render(&article.content, title, &mut truncated).map_err(&refused)?;
-    // Counted on the prose alone. The heading is a title handed in from the metadata record,
-    // so counting it here would report the same words twice across two files.
-    let word_count = markdown::word_count(&prose.body);
     let excerpt = non_empty(article.excerpt.as_deref());
+    // Measured on the extracted text rather than on the Markdown below, so that both sides of
+    // the rule count the same thing. Markdown carries link destinations and list markers that
+    // the page never showed a reader, which is enough to put a short article's share above one.
+    let share = ProseShare {
+        article_chars: document::visible_chars(&article.text_content),
+        page_chars,
+    };
 
-    if is_a_sliver(word_count, page_word_count) {
+    if share.is_a_sliver() {
         return Ok(Extraction::Refused(RefusedExtraction {
             extractor_version: EXTRACTOR_VERSION,
             rules: ExtractionRules::Heuristic,
-            word_count,
-            page_word_count,
+            share,
             excerpt,
         }));
     }
+    let mut truncated = Vec::new();
+    let prose = markdown::render(&article.content, title, &mut truncated).map_err(&refused)?;
     Ok(Extraction::Article(Article {
         record: ArticleRecord {
             extractor_version: EXTRACTOR_VERSION,
             rules: ExtractionRules::Heuristic,
-            word_count,
-            page_word_count,
+            // Counted on the prose alone. The heading is a title handed in from the metadata
+            // record, so counting it here would report the same words twice across two files.
+            word_count: markdown::word_count(&prose.body),
+            share: Some(share),
             excerpt,
             byline: non_empty(article.byline.as_deref()),
             truncated,
@@ -153,14 +175,12 @@ pub fn extract(
     }))
 }
 
-/// Whether what was extracted is a sliver of a page that mostly said something else.
-///
-/// A page with no prose at all cannot be a page an article is a small part of, so the share is
-/// compared by multiplying rather than by dividing: a zero denominator answers "keep" instead
-/// of producing a comparison against nothing.
-fn is_a_sliver(word_count: usize, page_word_count: usize) -> bool {
-    word_count < MIN_ARTICLE_WORDS
-        && (word_count as f32) < MIN_SHARE_OF_PAGE * page_word_count as f32
+impl ProseShare {
+    /// Whether what was extracted is a sliver of a page that mostly said something else.
+    fn is_a_sliver(&self) -> bool {
+        self.article_chars < MIN_ARTICLE_CHARS
+            && self.article_chars * SHARE_DENOMINATOR < self.page_chars
+    }
 }
 
 /// A field the algorithm reports as present but blank is absent, since a record saying a page
@@ -290,11 +310,18 @@ mod tests {
         };
         assert_eq!(refused.extractor_version, EXTRACTOR_VERSION);
         assert_eq!(refused.rules, ExtractionRules::Heuristic);
-        assert!(refused.word_count < MIN_ARTICLE_WORDS, "{refused:?}");
+        // What the record describes, rather than the comparison the rule already made to get
+        // here: the excerpt names the boilerplate that would otherwise have become the article,
+        // and the page count is the whole page and not the block that was taken out of it.
         assert!(
-            (refused.word_count as f32) < MIN_SHARE_OF_PAGE * refused.page_word_count as f32,
+            refused
+                .excerpt
+                .as_deref()
+                .is_some_and(|excerpt| excerpt.contains("Written by hand")),
             "{refused:?}"
         );
+        assert_eq!(refused.share.article_chars, 137, "{refused:?}");
+        assert!(refused.share.page_chars > 1_000, "{refused:?}");
     }
 
     /// The other half of the rule, and the reason it is not a floor on length alone. A note
@@ -312,7 +339,11 @@ mod tests {
             Some("The oven is fixed"),
         );
 
-        assert!(article.record.word_count < MIN_ARTICLE_WORDS, "{article:?}");
+        let share = article
+            .record
+            .share
+            .expect("a version 2 record measures its share");
+        assert!(share.article_chars < MIN_ARTICLE_CHARS, "{article:?}");
         assert!(
             article
                 .markdown
@@ -326,19 +357,19 @@ mod tests {
     /// carries more comments than prose.
     #[test]
     fn the_sliver_rule_is_where_the_constants_say_it_is() {
-        assert!(is_a_sliver(
-            MIN_ARTICLE_WORDS - 1,
-            MIN_ARTICLE_WORDS * 4 + 1
-        ));
-        // One word longer, everything else equal.
-        assert!(!is_a_sliver(MIN_ARTICLE_WORDS, MIN_ARTICLE_WORDS * 4 + 1));
+        let share = |article_chars, page_chars| ProseShare {
+            article_chars,
+            page_chars,
+        };
+
+        assert!(share(MIN_ARTICLE_CHARS - 1, MIN_ARTICLE_CHARS * 4).is_a_sliver());
+        // One character longer, everything else equal.
+        assert!(!share(MIN_ARTICLE_CHARS, MIN_ARTICLE_CHARS * 4).is_a_sliver());
         // Exactly the share, which is not under it.
-        assert!(!is_a_sliver(
-            MIN_ARTICLE_WORDS - 1,
-            (MIN_ARTICLE_WORDS - 1) * 4
-        ));
-        // A page holding nothing else is not a page an article is a small part of.
-        assert!(!is_a_sliver(1, 0));
+        assert!(!share(MIN_ARTICLE_CHARS - 1, (MIN_ARTICLE_CHARS - 1) * 4).is_a_sliver());
+        // A page holding nothing else is not a page an article is a small part of, and the
+        // comparison must answer that rather than divide by it.
+        assert!(!share(1, 0).is_a_sliver());
     }
 
     /// Most of the web. Writing an empty record for each of these would fill the archive with

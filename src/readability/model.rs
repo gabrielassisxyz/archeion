@@ -39,15 +39,18 @@ pub struct ArticleRecord {
     pub extractor_version: u32,
     pub rules: ExtractionRules,
     /// Split on whitespace, so it is a rough figure for sorting and filtering rather than a
-    /// measurement. It is wrong for languages that do not put spaces between words.
+    /// measurement. It is wrong for languages that do not put spaces between words, which is
+    /// why it is not what the sliver rule weighs.
     pub word_count: usize,
-    /// The prose of the whole page the article was taken out of, counted the same rough way.
-    ///
-    /// It is here so that what the sliver rule measures is recorded for the pages it kept and
-    /// not only for the ones it refused, on the same terms as `cost` below. A file per refusal
-    /// says the rule is firing; only the ratios that real articles reach can say whether the
+    /// What the sliver rule measured on this page, recorded for the articles it kept and not
+    /// only for the pages it refused, on the same terms as `cost` below. A file per refusal
+    /// says the rule is firing; only the shares that real articles reach can say whether the
     /// rule is about to start firing on them.
-    pub page_word_count: usize,
+    ///
+    /// Absent on records written before the rule existed, which is not the same as a page that
+    /// measured nothing. A record must not answer a question the extractor that wrote it was
+    /// never asked.
+    pub share: Option<ProseShare>,
     pub excerpt: Option<String>,
     /// The attribution the page's own markup carried, which is deliberately not the resolved
     /// author in the metadata record. The two disagree often, and collapsing them would hide
@@ -57,6 +60,20 @@ pub struct ArticleRecord {
     pub truncated: Vec<ArticleBound>,
     /// What this page cost to admit, against the ceilings that admitted it.
     pub cost: AdmissionCost,
+}
+
+/// How much of a page's text the article taken out of it holds.
+///
+/// The two counts and not the ratio between them. A ratio is a division somebody already did,
+/// at a precision they chose, and the calibration these exist for is a question about the
+/// distribution of both sides. Characters and not words, because the rule that reads them has
+/// to mean the same thing in a language that does not separate words with spaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProseShare {
+    /// The extracted article's own text, without the Markdown that will be written around it.
+    pub article_chars: usize,
+    /// Everything the page holds that a reader would have seen, the article included.
+    pub page_chars: usize,
 }
 
 /// What one page measured against the ceilings it had to pass.
@@ -116,8 +133,7 @@ pub struct RefusedExtraction {
     /// One rule refuses here, its inputs are these, and a reader can see the comparison it
     /// made. A second rule is what makes naming them worth a field, and it will arrive with
     /// its own version bump.
-    pub word_count: usize,
-    pub page_word_count: usize,
+    pub share: ProseShare,
     /// What the prose said, so that reviewing the decision does not require re-deriving it.
     pub excerpt: Option<String>,
 }

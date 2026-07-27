@@ -591,8 +591,16 @@ mod tests {
             .expect("the refusal is stored")
             .expect("a refused page has a record");
 
-        assert!(refused.word_count > 0, "{refused:?}");
-        assert!(refused.page_word_count > refused.word_count, "{refused:?}");
+        // The record describes the prose that was refused, which is what makes the file worth
+        // keeping. Repeating the comparison the rule already made to reach this arm would
+        // assert nothing.
+        assert!(
+            refused
+                .excerpt
+                .as_deref()
+                .is_some_and(|excerpt| excerpt.contains("Written by hand")),
+            "{refused:?}"
+        );
         assert_eq!(
             archive
                 .read_article(&url, &captures[0])

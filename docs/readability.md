@@ -74,24 +74,29 @@ Media types other than HTML never reach any of this, for the same reason they pr
 
 A site's own front page defeats the probe. It carries a tagline, a description and a footer blurb around its list of links, which is more prose than an imagined listing has, so the probe admits it and the scorer then returns whichever of those blocks scored best. Capturing sixty pages of one site produced forty-eight articles from forty-six posts, and one of the extras was a front page stored as forty-four words of boilerplate, against a median of about two thousand for the real articles beside it.
 
-So a second gate runs after the extraction rather than before it: an extraction is refused when it is **both** under 100 words and under a quarter of the prose its page holds.
+So a second gate runs after the extraction rather than before it: an extraction is refused when it is **both** under 300 characters and under a quarter of the text its page holds.
 
 **Link density, the obvious instrument, cannot see this.** A listing is made of links, and that is what the underlying algorithm already scores on, so the reasonable expectation is that a threshold somewhere in its configuration would refuse the page. It would not. The list is dropped as furniture before the article is formed, and what would be stored is genuine prose carrying no links at all. Nor is either number reachable through that configuration: `readable_min_score` and `readable_min_content_length` weigh text length alone, and `char_threshold` refuses nothing, because the grab loop falls back to its best attempt when no attempt reaches it.
 
+**Characters and not words.** Words are whitespace-separated only in some languages. Counting them scores a Chinese or Japanese article at its paragraph count, three or eight, while the navigation and footer around it keep one token per element exactly as they would in English, so a rule weighing words refuses those pages however long they are. Both sides are therefore counted in characters, whitespace excluded so that indented markup does not read as more text than the same page minified.
+
 **Neither number would do on its own**, and each covers the other's mistake:
 
-| page | words | share of its page | kept by |
+| page | characters | share of its page | kept by |
 |---|---|---|---|
-| a site's front page | 27 | 0.11 | nothing, which is the point |
-| a genuinely short post | 72 | 0.82 | the share |
-| an article under 40 related links and 20 comments | 253 | 0.21 | the length |
-| the corpus articles | 211 to 253 | 0.76 to 1.03 | both |
+| a site's front page | 137 | 0.12 | nothing, which is the point |
+| a short post on a plain page | 281 | 0.78 | the share |
+| the same post under a sidebar of thirty | 401 | 0.21 | the floor |
+| an article under 40 related links and 20 comments | 1231 | 0.19 | the floor |
+| the corpus articles | 988 to 1231 | 0.71 to 0.93 | both |
 
-A floor on length alone would discard the announcement and the single-paragraph note, which an archive has as much reason to keep as anything else. A floor on share alone would discard a real article whose page carries more comments than prose, and a comment section large enough to do that is ordinary.
+A floor alone would discard the announcement and the single-paragraph note, which an archive has as much reason to keep as anything else. A share alone would discard the same note as soon as its page grew a sidebar, which is most pages, and it would discard a long article whose page carries more comments than prose. The last two rows are also why the floor cannot simply be raised until it does the work by itself: an article's share falls as far as its furniture goes, and furniture has no bound.
 
-The page's prose is counted with the bodies of scripts and styles subtracted. They are text nodes like any other, so a page carrying a few kilobytes of inline JSON-LD would count them as prose it holds, and the article inside it would then look like a sliver of a much larger document.
+**Where the floor comes from.** The library's own numbers bracket it without settling it: below 140 characters it stops counting a block as content at all, and at 500 it stops looking for more content in a page. What decides it is observation. The front pages seen measured 137 and about 250 characters, the shortest genuine post seen measured 281, and 300 is where those two constraints meet. They are close enough that a real post of 260 characters on a busy page is refused, which is the cost of this rule and is stated here rather than left to be discovered.
 
-**Both numbers were chosen against pages from few origins, which is not enough**, and they are expected to move for the same reason the ceilings below are. So every article records `word_count` and `page_word_count`, and every refusal is written to the archive beside the capture it refused, as `<capture-id>.article-refused.json`. A count of refusals says the rule is firing; only the pages it refused and the ratios the kept articles reached can say whether it fired on something it should have kept. That file is the queue a later pass reads.
+**What the denominator counts, and what that lets a page do.** It is the page's text with the bodies of scripts, styles, `noscript` and templates left out, and everything else left in, including text the scorer itself discards and text the page hides with CSS. So a page can inflate its own denominator and push its own article under the share. What that buys is refusal of an extraction from the page doing it, on a response the archive stored whole either way, and the refusal is recorded rather than silent. It is a limit worth knowing, not a hole worth a partial defence: the same page could simply have served no article at all.
+
+**These numbers were chosen against pages from few origins, which is not enough**, and they are expected to move for the same reason the ceilings below are. So every article records what it measured, and every refusal is written to the archive beside the capture it refused, as `<capture-id>.article-refused.json`. A count of refusals says the rule is firing; only the pages it refused and the shares the kept articles reached can say whether it fired on something it should have kept. That file is the queue a later pass reads.
 
 Only pages the rule turned down are written there, never the many that the probe passed over. Those are most of the web, and a file for each of them would bury the few worth reviewing under the many that say nothing.
 
@@ -164,10 +169,13 @@ They are set where a hostile page is certainly refused, not where a real page is
 ```json
 {
   "markdown_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "extractor_version": 1,
+  "extractor_version": 2,
   "rules": "heuristic",
   "word_count": 1240,
-  "page_word_count": 1418,
+  "share": {
+    "article_chars": 6120,
+    "page_chars": 7043
+  },
   "excerpt": "Bread is mostly patience.",
   "byline": "J. Writer",
   "cost": {
@@ -177,27 +185,33 @@ They are set where a hostile page is certainly refused, not where a real page is
 }
 ```
 
-`page_word_count` is the prose of the whole page the article came out of, which is the denominator of the sliver rule above. It is recorded for the pages that were kept and not only for the ones that were refused, on the same terms as `cost`: a file per refusal says the rule is firing, and only the ratios real articles reach can say whether it is about to start firing on them.
+`share` is what the sliver rule measured: the article's own text, and the text of the whole page it came out of. It is recorded for the pages that were kept and not only for the ones that were refused, on the same terms as `cost`: a file per refusal says the rule is firing, and only the shares real articles reach can say whether it is about to start firing on them. The two counts and not the ratio between them, because a ratio is a division somebody already did at a precision they chose, and the question these exist to answer is about the distribution of both sides.
 
-A refused page gets a record of its own instead of this pair, holding the same two counts, the excerpt and nothing else:
+It is absent on records written before the rule existed, which is not the same as a page whose text measured nothing. A reader that treated a missing `share` as a pair of zeroes would fill the calibration it exists for with pages nobody measured.
+
+A refused page gets a record of its own instead of this pair, holding the same measurement, the excerpt and nothing else:
 
 ```json
 {
   "extractor_version": 2,
   "rules": "heuristic",
-  "word_count": 27,
-  "page_word_count": 253,
+  "share": {
+    "article_chars": 137,
+    "page_chars": 1188
+  },
   "excerpt": "Written by hand, published from a laptop on a kitchen table."
 }
 ```
 
 There is no field naming the rule that refused it. One rule refuses here and its inputs are the two counts, so the comparison is readable from the record itself; a second rule is what would make naming them worth a field, and it will arrive with its own version bump.
 
-`rules` names what produced the extraction. `byline` is what the algorithm found in the page's own markup and is not the resolved author in the metadata record: the two disagree often, and collapsing them would hide which one to look at when an attribution comes out wrong. `word_count` counts the prose and not the heading, which is a title the metadata record already holds. `truncated` is absent when nothing was cut, which is the ordinary case.
+The excerpt is the one field here a page controls the length of, and the reader of these records refuses a file over 64 KiB. A page serving an enormous description can therefore write a refusal that will not read back, which is reported by path rather than silently skipped. The article record has carried the same hazard since before this rule, and bounding both is its own change.
+
+`rules` names what produced the extraction. `byline` is what the algorithm found in the page's own markup and is not the resolved author in the metadata record: the two disagree often, and collapsing them would hide which one to look at when an attribution comes out wrong. `word_count` counts the prose and not the heading, which is a title the metadata record already holds; it stays a rough figure for sorting and filtering, which is why it is not what the sliver rule weighs. `truncated` is absent when nothing was cut, which is the ordinary case.
 
 `markdown_sha256` is the address of the document beside it, and it is what makes the pair safe to rewrite. Ordering alone is enough only the first time: writing over an existing pair and stopping between the two files leaves new prose beside an old record, both present, both parsing, and every field describing something that is no longer there. A reader that finds the two disagreeing reports no article, because the response the article was derived from is still in the archive and the pass that re-extracts will simply redo it.
 
-`extractor_version` is bumped when the meaning of a field or a rule that fills one changes, not when a field is added, on the same terms as the metadata record. It is 2 for the sliver rule: `page_word_count` arriving beside the counts would not have been enough on its own, but a page can now produce prose and still not be stored as an article, so the absence of a record beside a capture stopped meaning what it meant at 1.
+`extractor_version` is bumped when the meaning of a field or a rule that fills one changes, not when a field is added, on the same terms as the metadata record. It is 2 for the sliver rule: `share` arriving beside the counts would not have been enough on its own, but a page can now produce prose and still not be stored as an article, so the absence of a record beside a capture stopped meaning what it meant at 1.
 
 ## What was deliberately left out
 
@@ -205,7 +219,7 @@ There is no field naming the rule that refused it. One rule refuses here and its
 - **Plain text beside the Markdown.** Covered above.
 - **Images pulled into the prose.** An article's images are already captured as subresources and addressed by content hash. Rewriting the Markdown to point at them is a question about how a reader resolves references, which belongs to the reader.
 - **Pagination.** An article split across numbered pages is captured as the several pages it is served as. Stitching them is a per-site rule in every implementation that does it, so it waits for the rules layer.
-- **Language-aware word counting.** The count splits on whitespace, which is wrong for languages that do not use it. It is a rough figure for sorting and filtering, not a measurement.
+- **Language-aware word counting.** `word_count` splits on whitespace, which is wrong for languages that do not use it. It stays a rough figure for sorting and filtering rather than a measurement, and nothing decides anything on it: the sliver rule counts characters precisely so that a page in such a language is judged the same way as any other.
 - **Removing an article.** There is a way to write a pair and no way to un-write one, so an extractor that later decides a capture is not an article leaves the previous pair in place. The sliver rule made that reachable rather than hypothetical: re-reading a capture an older extractor kept now leaves the refusal beside the article it disagrees with, both on disk. Nothing needs solving until a pass over an existing archive exists, and that pass is the caller that will define what removal should mean.
 - **A ceiling on wall clock.** Every guard here bounds a shape that was measured. None of them bounds a shape that was not, and a per-document time limit is the only thing that would. It is not built because a thread cannot be stopped from outside in this language, so such a limit would bound how long a capture waits without bounding what it spends, and a host serving many such pages would saturate the machine either way.
 - **A guard on the metadata path.** The quadratic parse described above is a property of reading hostile markup, not of this module: metadata extraction takes 0.6 s on the same input where this took 18 s. It is bounded there, but by a memory ceiling that happens to cut the blowup short rather than by anything aimed at it. Giving it the same scan is its own change.

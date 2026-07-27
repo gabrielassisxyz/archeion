@@ -111,21 +111,52 @@ pub(super) fn build(html: &str) -> Result<(Document, Measured), TooExpensive> {
     ))
 }
 
-/// How many words the whole page holds, as the denominator of the sliver rule in `mod.rs`.
+/// The subtrees whose text is not the page's prose. A page carrying a few kilobytes of inline
+/// JSON-LD or a framework's serialized state would otherwise count them as text it holds, and
+/// the article inside it would look like a sliver of a much larger document.
+const NOT_PROSE: [&str; 4] = ["script", "style", "noscript", "template"];
+
+/// How much text the whole page holds, as the denominator of the sliver rule in `mod.rs`.
 ///
 /// Counted here because this is the last moment the tree exists in one piece, before the
 /// scorer takes it and decides which part of it is the article.
 ///
-/// The bodies of scripts and styles are subtracted rather than left in. They are text nodes
-/// like any other, so a page carrying a few kilobytes of inline JSON-LD or a framework's
-/// serialized state would count them as prose it holds, and the article inside it would then
-/// look like a sliver of a much larger document. Refusing real articles for having a big
-/// script tag is the exact failure this rule is supposed to avoid, in reverse.
-pub(super) fn page_word_count(document: &Document) -> usize {
-    let body = document.select("body");
-    let words = |text: &str| text.split_whitespace().count();
-    // Disjoint subtrees, so the counts subtract cleanly.
-    words(&body.text()).saturating_sub(words(&body.select("script, style, noscript").text()))
+/// It is a walk and not the difference between two selections. Differencing looks equivalent
+/// and is not: an element in `NOT_PROSE` may contain another, since a document parsed with
+/// scripting disabled keeps the contents of `<noscript>` as real elements, and a selection
+/// sums each match's whole subtree. The inner text would then be subtracted twice and the
+/// denominator could reach zero, which answers "keep" and hands the page being judged a way
+/// to switch the rule off.
+///
+/// Characters and not words, because words are whitespace-separated only in some languages:
+/// counting them would score a Chinese or Japanese article at its paragraph count while
+/// scoring the furniture around it, whose tokens are separated by the markup's own
+/// whitespace, exactly as it scores an English page. Whitespace itself is not counted, so
+/// that indented markup does not read as more text than the same page minified.
+pub(super) fn page_text_chars(document: &Document) -> usize {
+    let Some(body) = document.select("body").nodes().first().cloned() else {
+        return 0;
+    };
+    let mut total = 0;
+    let mut pending = vec![body];
+    while let Some(node) = pending.pop() {
+        if node.is_text() {
+            total += visible_chars(&node.text());
+            continue;
+        }
+        let skipped = node
+            .node_name()
+            .is_some_and(|name| NOT_PROSE.contains(&name.as_ref()));
+        if !skipped {
+            pending.extend(node.children());
+        }
+    }
+    total
+}
+
+/// Text as it would be read, which is what both sides of the sliver rule are counted in.
+pub(super) fn visible_chars(text: &str) -> usize {
+    text.chars().filter(|c| !c.is_whitespace()).count()
 }
 
 /// Whether any element in the tree sits deeper than `ceiling`.

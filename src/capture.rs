@@ -14,6 +14,7 @@ use crate::crawl::{
     points_inside_a_network,
 };
 use crate::metadata::{self, PageMetadata, PageSource, ReferencedAsset, UnreadablePage};
+use crate::readability::{self, Article, UnreadableArticle};
 use crate::storage::{Archive, Header, NewCapture, StorageError};
 
 #[derive(Debug, thiserror::Error)]
@@ -61,6 +62,14 @@ pub struct CaptureRun {
     /// derived reading is missing, so the run goes on: the response is in the archive, and
     /// a later pass can read it again without fetching anything.
     pub unreadable_pages: Vec<UnreadablePage>,
+    /// Pages whose prose was extracted. It is far fewer than the captures, and that is
+    /// correct: most of the web is navigation, and a page that is not an article is not a
+    /// failure of anything.
+    pub articles_extracted: usize,
+    /// Pages whose prose was refused because reading it would have cost too much. Reported
+    /// rather than counted, for the same reason as the pages above: the response is stored
+    /// whole and the URL is what someone needs in order to go and look at it.
+    pub unreadable_articles: Vec<UnreadableArticle>,
     /// Pages the engine fetched that never reached the archive, straight from the engine.
     pub pages_dropped: usize,
     /// Subresources stored beside the captures of this run.
@@ -200,6 +209,7 @@ fn capture_page(
     // after, because the response is what cannot be recovered: a run cut short then leaves
     // a capture with no reading of it, which a later pass can produce on its own.
     let extracted = read_page(&page, run);
+    let prose = read_prose(&page, extracted.as_ref(), run);
     // The subresources are acquired before the capture is written because the record has to
     // name them, and their bytes are stored before the page's own for the reason every body
     // is stored before every record: a blob nobody references costs disk space, and a record
@@ -227,13 +237,56 @@ fn capture_page(
     run.assets_stored += stored;
     run.assets_missed += missed;
 
-    if let Some(metadata) = extracted
-        && let Err(error) = archive.write_metadata(&canonical, &capture.id, &metadata)
+    if let Some(metadata) = &extracted
+        && let Err(error) = archive.write_metadata(&canonical, &capture.id, metadata)
+    {
+        *write_failure = Some(error);
+        return ControlFlow::Break(());
+    }
+
+    if let Some(article) = prose
+        && let Err(error) = archive.write_article(&canonical, &capture.id, &article)
     {
         *write_failure = Some(error);
         return ControlFlow::Break(());
     }
     ControlFlow::Continue(())
+}
+
+/// Separates the page's prose from the furniture around it, or reports that it could not.
+///
+/// Like the metadata above, a page this fails on is not a failed capture: the response is
+/// stored whole, and the only thing missing is a reading of it that a later pass can redo
+/// without fetching anything.
+///
+/// The title comes from the metadata rather than from this page's markup, so that the
+/// precedence rules that live there decide it once instead of this forming a second opinion.
+fn read_prose(
+    page: &PageResponse,
+    metadata: Option<&PageMetadata>,
+    run: &mut CaptureRun,
+) -> Option<Article> {
+    let title = metadata
+        .and_then(|metadata| metadata.title.as_ref())
+        .map(|title| title.value.as_str());
+    match readability::extract(
+        PageSource {
+            body: &page.body,
+            content_type: content_type_of(&page.headers),
+            final_url: &page.final_url,
+        },
+        title,
+    ) {
+        Ok(Some(article)) => {
+            run.articles_extracted += 1;
+            Some(article)
+        }
+        Ok(None) => None,
+        Err(refused) => {
+            run.unreadable_articles.push(refused);
+            None
+        }
+    }
 }
 
 /// Reads what the page says about itself, or reports that it could not be read.
@@ -443,6 +496,76 @@ mod tests {
 
         assert_eq!(metadata.title.expect("a title").value, "A page");
         assert_eq!(metadata.links[0].url, "https://example.com/b");
+    }
+
+    #[test]
+    fn an_article_is_archived_as_a_markdown_document_beside_the_capture() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/a",
+            200,
+            &format!(
+                r#"<html><head><title>A page for the tab</title>
+                   <meta property="og:title" content="How to bake bread"></head>
+                   <body><nav><a href="/b">b</a></nav><article>{}</article>
+                   <footer>Subscribe to our newsletter</footer></body></html>"#,
+                "<p>Bread is mostly patience, and the dough will tell you when it is ready.</p>"
+                    .repeat(8)
+            ),
+        )]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.articles_extracted, 1);
+        assert!(run.unreadable_articles.is_empty());
+        let url = CanonicalUrl::parse("https://example.com/a").expect("valid url");
+        let captures = archive.list_captures(&url).expect("captures are listed");
+        let article = archive
+            .read_article(&url, &captures[0])
+            .expect("the prose is stored")
+            .expect("an article has prose");
+
+        // The heading is the title the metadata rules resolved, not the raw `<title>`.
+        assert!(
+            article.markdown.starts_with("# How to bake bread\n"),
+            "{}",
+            article.markdown
+        );
+        assert!(article.markdown.contains("Bread is mostly patience"));
+        assert!(!article.markdown.contains("Subscribe to our newsletter"));
+        assert!(article.record.word_count > 0);
+    }
+
+    /// Most of what a crawl answers is navigation. A capture with no prose in it is the
+    /// ordinary case, and writing an empty article for each would bury the ones worth having.
+    #[test]
+    fn a_capture_with_no_prose_in_it_gets_no_article_and_no_complaint() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/index",
+            200,
+            r#"<html><head><title>Index</title></head><body><ul>
+               <li><a href="/a">one</a></li><li><a href="/b">two</a></li>
+               <li><a href="/c">three</a></li></ul></body></html>"#,
+        )]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.captures_written, 1);
+        assert_eq!(run.articles_extracted, 0);
+        assert!(run.unreadable_articles.is_empty());
+        let url = CanonicalUrl::parse("https://example.com/index").expect("valid url");
+        let captures = archive.list_captures(&url).expect("captures are listed");
+        assert_eq!(
+            archive
+                .read_article(&url, &captures[0])
+                .expect("no prose is not an error"),
+            None
+        );
     }
 
     /// The archive keeps whatever answered, and most of what answers a crawl is not a page.

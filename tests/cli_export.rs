@@ -5,7 +5,7 @@ use std::process::Command;
 use archeion::CanonicalUrl;
 use archeion::metadata::{Attributed, MetadataSource, PageMetadata, PublicationDate};
 use archeion::readability::{AdmissionCost, Article, ArticleRecord, ExtractionRules};
-use archeion::storage::{Archive, Header, ItemId, NewCapture};
+use archeion::storage::{Archive, Asset, ContentHash, Header, ItemId, NewAsset, NewCapture};
 use jiff::Timestamp;
 use tempfile::TempDir;
 
@@ -195,6 +195,33 @@ fn add_unreadable_item_directory(archive: &Path) {
     std::fs::create_dir_all(broken).expect("broken item directory exists");
 }
 
+fn store_asset(
+    archive: &Archive,
+    requested_url: &str,
+    final_url: &str,
+    media_type: &str,
+    body: &[u8],
+) -> Asset {
+    archive
+        .store_asset(&NewAsset {
+            requested_url: requested_url.to_owned(),
+            final_url: final_url.to_owned(),
+            status: 200,
+            media_type: Some(media_type.to_owned()),
+            body: body.to_vec(),
+        })
+        .expect("asset is stored")
+}
+
+fn stored_body_path(archive: &Path, hash: &ContentHash) -> std::path::PathBuf {
+    archive
+        .join("blobs")
+        .join("sha256")
+        .join(&hash.as_str()[0..2])
+        .join(&hash.as_str()[2..4])
+        .join(hash.as_str())
+}
+
 fn exported_tree(root: &Path) -> BTreeMap<String, String> {
     let mut files = BTreeMap::new();
     collect_files(root, root, &mut files);
@@ -336,6 +363,251 @@ fn export_writes_a_markdown_vault_for_the_latest_article_capture_per_item() {
             ),
         ])
     );
+}
+
+#[test]
+fn export_carries_referenced_article_images_as_content_hashed_assets() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = Archive::open(dir.path()).expect("archive opens");
+    let url = CanonicalUrl::parse("https://example.com/images").expect("valid url");
+    let png = b"png bytes";
+    let jpeg = b"jpeg bytes";
+    let webp = b"webp bytes";
+    let accented = b"accented image";
+    let css = b"body { color: red; }";
+    let unused = b"unused image";
+    let pdf = b"pdf bytes";
+
+    let mut capture = capture_of(&url, at("2026-07-27T10:00:00Z"), "Images");
+    capture.assets = vec![
+        store_asset(
+            &archive,
+            "https://example.com/a",
+            "https://cdn.example.com/a.png",
+            "image/png",
+            png,
+        ),
+        store_asset(
+            &archive,
+            "https://en.wikipedia.org/wiki/Foo_(bar)",
+            "https://en.wikipedia.org/wiki/Foo_(bar)",
+            "image/jpeg",
+            jpeg,
+        ),
+        store_asset(
+            &archive,
+            "https://example.com/a b",
+            "https://example.com/a b",
+            "image/webp",
+            webp,
+        ),
+        store_asset(
+            &archive,
+            "https://example.com/img/caf%C3%A9.png",
+            "https://example.com/img/caf%C3%A9.png",
+            "image/png",
+            accented,
+        ),
+        store_asset(
+            &archive,
+            "https://example.com/style.css",
+            "https://example.com/style.css",
+            "text/css",
+            css,
+        ),
+        store_asset(
+            &archive,
+            "https://example.com/unused.png",
+            "https://example.com/unused.png",
+            "image/png",
+            unused,
+        ),
+        store_asset(
+            &archive,
+            "https://example.com/file.pdf",
+            "https://example.com/file.pdf",
+            "application/pdf",
+            pdf,
+        ),
+    ];
+    let capture = archive.write_capture(capture).expect("capture is written");
+    archive
+        .write_metadata(&url, &capture.id, &metadata(Some("Images")))
+        .expect("metadata is written");
+    archive
+        .write_article(
+            &url,
+            &capture.id,
+            &article(
+                "`literal [text](https://example.com/x) here`\n\n\
+                 ```\n\
+                 see [text](https://example.com/x) in code\n\
+                 ```\n\n\
+                 ![this](https://example.com/a \"the title\")\n\n\
+                 ![wiki](https://en.wikipedia.org/wiki/Foo_\\(bar\\))\n\n\
+                 ![spaced](<https://example.com/a b>)\n\n\
+                 ![a \\[b\\] c](https://example.com/a)\n\n\
+                 ![accented](https://example.com/img/café.png)\n\n\
+                 ![pdf](https://example.com/file.pdf)\n\n\
+                 ![missing](https://example.com/missing.png)",
+                20,
+                Some("Images."),
+            ),
+        )
+        .expect("article is written");
+
+    let destination = TempDir::new().expect("temp dir");
+    let destination_path = destination.path().join("vault");
+    let output = archeion()
+        .arg("export")
+        .arg(dir.path())
+        .arg(&destination_path)
+        .output()
+        .expect("the binary runs");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "exported 1 note\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+
+    let png_name = format!("{}.png", ContentHash::of(png).as_str());
+    let jpeg_name = format!("{}.jpg", ContentHash::of(jpeg).as_str());
+    let webp_name = format!("{}.webp", ContentHash::of(webp).as_str());
+    let accented_name = format!("{}.png", ContentHash::of(accented).as_str());
+    let mut asset_names: Vec<_> = std::fs::read_dir(destination_path.join("assets"))
+        .expect("asset dir reads")
+        .map(|entry| {
+            entry
+                .expect("asset entry reads")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    asset_names.sort();
+    assert_eq!(asset_names, {
+        let mut names = vec![
+            accented_name.clone(),
+            jpeg_name.clone(),
+            png_name.clone(),
+            webp_name.clone(),
+        ];
+        names.sort();
+        names
+    });
+    assert_eq!(
+        std::fs::read(destination_path.join("assets").join(&png_name)).expect("png reads"),
+        png
+    );
+    assert_eq!(
+        std::fs::read(destination_path.join("assets").join(&jpeg_name)).expect("jpeg reads"),
+        jpeg
+    );
+    assert_eq!(
+        std::fs::read(destination_path.join("assets").join(&webp_name)).expect("webp reads"),
+        webp
+    );
+    assert_eq!(
+        std::fs::read(destination_path.join("assets").join(&accented_name))
+            .expect("accented image reads"),
+        accented
+    );
+
+    let note = std::fs::read_to_string(destination_path.join("example.com/2026-07-27-images.md"))
+        .expect("note reads");
+    assert_eq!(
+        note,
+        format!(
+            "---\n\
+             title: \"Images\"\n\
+             canonical_url: \"https://example.com/images\"\n\
+             captured_at: \"2026-07-27T10:00:00Z\"\n\
+             published_at: \"2026-07-24T00:00:00Z\"\n\
+             author: \"J. Writer\"\n\
+             site_name: \"Example Site\"\n\
+             language: \"en\"\n\
+             word_count: 20\n\
+             excerpt: \"Images.\"\n\
+             ---\n\n\
+             `literal [text](https://example.com/x) here`\n\n\
+             ```\n\
+             see [text](https://example.com/x) in code\n\
+             ```\n\n\
+             ![this](../assets/{png_name} \"the title\")\n\n\
+             ![wiki](../assets/{jpeg_name})\n\n\
+             ![spaced](<../assets/{webp_name}>)\n\n\
+             ![a \\[b\\] c](../assets/{png_name})\n\n\
+             ![accented](../assets/{accented_name})\n\n\
+             ![pdf](https://example.com/file.pdf)\n\n\
+             ![missing](https://example.com/missing.png)"
+        )
+    );
+}
+
+#[test]
+fn export_keeps_the_note_when_a_referenced_image_body_is_missing() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = Archive::open(dir.path()).expect("archive opens");
+    let url = CanonicalUrl::parse("https://example.com/missing-asset").expect("valid url");
+    let body = b"image bytes";
+    let asset = store_asset(
+        &archive,
+        "https://example.com/image.png",
+        "https://example.com/image.png",
+        "image/png",
+        body,
+    );
+
+    let mut capture = capture_of(&url, at("2026-07-27T11:00:00Z"), "Missing asset");
+    capture.assets = vec![asset.clone()];
+    let capture = archive.write_capture(capture).expect("capture is written");
+    archive
+        .write_metadata(&url, &capture.id, &metadata(Some("Missing asset")))
+        .expect("metadata is written");
+    archive
+        .write_article(
+            &url,
+            &capture.id,
+            &article(
+                "The prose survives.\n\n![image](https://example.com/image.png)",
+                5,
+                Some("The prose survives."),
+            ),
+        )
+        .expect("article is written");
+    std::fs::remove_file(stored_body_path(dir.path(), &asset.body.sha256))
+        .expect("asset body is removed");
+
+    let destination = TempDir::new().expect("temp dir");
+    let destination_path = destination.path().join("vault");
+    let output = archeion()
+        .arg("export")
+        .arg(dir.path())
+        .arg(&destination_path)
+        .output()
+        .expect("the binary runs");
+
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "exported 1 note\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("warning: capture "), "{stderr}");
+    assert!(stderr.contains(asset.body.sha256.as_str()), "{stderr}");
+    assert!(
+        stderr.contains("archive has 1 unreadable item(s)"),
+        "{stderr}"
+    );
+    assert!(
+        !destination_path.join("assets").exists(),
+        "no asset was copied"
+    );
+    let note =
+        std::fs::read_to_string(destination_path.join("example.com/2026-07-27-missing-asset.md"))
+            .expect("note reads");
+    assert!(note.contains("The prose survives."));
+    assert!(note.contains("![image](https://example.com/image.png)"));
 }
 
 #[test]

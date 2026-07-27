@@ -1,19 +1,22 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
+use pulldown_cmark::{Event, LinkType, Parser, Tag, TagEnd};
 use thiserror::Error;
 use url::Url;
 
 use crate::CanonicalUrl;
 use crate::metadata::PageMetadata;
 use crate::readability::Article;
-use crate::storage::{Archive, CaptureId, Item, ItemId, StorageError};
+use crate::storage::{Archive, Asset, Capture, CaptureId, Item, ItemId, StorageError};
 
 const SLUG_MAX_BYTES: usize = 80;
 const ID_PREFIX_BYTES: usize = 12;
+const ASSET_DIRECTORY: &str = "assets";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExportOptions {
@@ -50,6 +53,8 @@ struct ExportNote {
     capture_id: String,
     front_matter: FrontMatter,
     body: String,
+    assets: Vec<ExportedAsset>,
+    unreadable: Vec<String>,
 }
 
 struct FrontMatter {
@@ -66,6 +71,36 @@ struct FrontMatter {
 
 struct DestinationState {
     created_root: bool,
+}
+
+struct ExportedAsset {
+    filename: String,
+    bytes: Vec<u8>,
+}
+
+struct RewrittenAssets {
+    assets: Vec<ExportedAsset>,
+    unreadable: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkdownDestinationKind {
+    Link,
+    Image,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MarkdownDestination {
+    kind: MarkdownDestinationKind,
+    destination: String,
+    span: Range<usize>,
+}
+
+struct ActiveMarkdownDestination {
+    kind: MarkdownDestinationKind,
+    destination: String,
+    span: Range<usize>,
+    label_content_end: usize,
 }
 
 pub fn export_archive(
@@ -107,6 +142,7 @@ fn write_export(
         for capture_id in selected {
             match export_note(archive, &item, &capture_id) {
                 Ok(Some(note)) => {
+                    report.unreadable.extend(note.unreadable.iter().cloned());
                     write_note(destination, note, &mut used)?;
                     report.notes_written += 1;
                 }
@@ -131,13 +167,17 @@ fn export_note(
     };
     let capture = archive.read_capture(&item.canonical_url, capture_id)?;
     let metadata = archive.read_metadata(&item.canonical_url, capture_id)?;
-    Ok(Some(note_from(
+    let mut note = note_from(
         item,
         capture_id,
         &capture.fetched_at,
         metadata.as_ref(),
         article,
-    )))
+    );
+    let rewritten = rewrite_note_assets(archive, &capture, &mut note.body);
+    note.assets = rewritten.assets;
+    note.unreadable = rewritten.unreadable;
+    Ok(Some(note))
 }
 
 fn note_from(
@@ -183,6 +223,92 @@ fn note_from(
             excerpt: article.record.excerpt.clone(),
         },
         body: article.markdown,
+        assets: Vec::new(),
+        unreadable: Vec::new(),
+    }
+}
+
+fn rewrite_note_assets(
+    archive: &Archive,
+    capture: &Capture,
+    markdown: &mut String,
+) -> RewrittenAssets {
+    let assets_by_url = assets_by_url(capture);
+    let mut replacements = Vec::new();
+    let mut copied = HashSet::new();
+    let mut exported = Vec::new();
+    let mut unreadable = Vec::new();
+
+    for destination in markdown_destinations(markdown) {
+        if destination.kind != MarkdownDestinationKind::Image {
+            continue;
+        }
+        let Some(asset) = assets_by_url.get(&asset_url_key(&destination.destination)) else {
+            continue;
+        };
+        if !(200..300).contains(&asset.status) {
+            continue;
+        }
+        let Some(extension) = image_extension(asset.media_type.as_deref()) else {
+            continue;
+        };
+        let filename = format!("{}.{}", asset.body.sha256.as_str(), extension);
+        if copied.insert(filename.clone()) {
+            let bytes = match archive.read_body(&asset.body.sha256) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    unreadable.push(format!(
+                        "capture {} asset {}: {error}",
+                        capture.id, asset.body.sha256
+                    ));
+                    copied.remove(&filename);
+                    continue;
+                }
+            };
+            exported.push(ExportedAsset {
+                filename: filename.clone(),
+                bytes,
+            });
+        }
+        replacements.push((destination.span, format!("../{ASSET_DIRECTORY}/{filename}")));
+    }
+
+    apply_markdown_replacements(markdown, replacements);
+    RewrittenAssets {
+        assets: exported,
+        unreadable,
+    }
+}
+
+fn assets_by_url(capture: &Capture) -> HashMap<String, &Asset> {
+    let mut assets = HashMap::new();
+    for asset in &capture.assets {
+        assets.insert(asset_url_key(&asset.requested_url), asset);
+        assets.insert(asset_url_key(&asset.final_url), asset);
+    }
+    assets
+}
+
+fn asset_url_key(address: &str) -> String {
+    match Url::parse(address) {
+        Ok(mut url) => {
+            url.set_fragment(None);
+            url.to_string()
+        }
+        Err(_) => address.to_owned(),
+    }
+}
+
+fn image_extension(media_type: Option<&str>) -> Option<&'static str> {
+    let media_type = media_type?.split(';').next()?.trim().to_ascii_lowercase();
+    match media_type.as_str() {
+        "image/avif" => Some("avif"),
+        "image/gif" => Some("gif"),
+        "image/jpeg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/svg+xml" => Some("svg"),
+        "image/webp" => Some("webp"),
+        _ => None,
     }
 }
 
@@ -231,6 +357,8 @@ fn write_note(
     note: ExportNote,
     used: &mut HashSet<PathBuf>,
 ) -> Result<(), ExportError> {
+    write_assets(destination, &note.assets)?;
+
     let host = destination.join(&note.host);
     fs::create_dir_all(&host).map_err(|source| ExportError::Io {
         path: host.clone(),
@@ -243,6 +371,25 @@ fn write_note(
         path: path.clone(),
         source,
     })
+}
+
+fn write_assets(destination: &Path, assets: &[ExportedAsset]) -> Result<(), ExportError> {
+    if assets.is_empty() {
+        return Ok(());
+    }
+    let root = destination.join(ASSET_DIRECTORY);
+    fs::create_dir_all(&root).map_err(|source| ExportError::Io {
+        path: root.clone(),
+        source,
+    })?;
+    for asset in assets {
+        let path = root.join(&asset.filename);
+        fs::write(&path, &asset.bytes).map_err(|source| ExportError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    }
+    Ok(())
 }
 
 fn unique_note_path(host: &Path, note: &ExportNote, used: &mut HashSet<PathBuf>) -> PathBuf {
@@ -380,6 +527,165 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+fn markdown_destinations(markdown: &str) -> Vec<MarkdownDestination> {
+    let mut destinations = Vec::new();
+    let mut active = Vec::new();
+    for (event, range) in Parser::new(markdown).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Link {
+                link_type: LinkType::Inline,
+                dest_url,
+                ..
+            }) => {
+                active.push(ActiveMarkdownDestination {
+                    kind: MarkdownDestinationKind::Link,
+                    destination: dest_url.to_string(),
+                    label_content_end: range.start,
+                    span: range,
+                });
+            }
+            Event::Start(Tag::Image {
+                link_type: LinkType::Inline,
+                dest_url,
+                ..
+            }) => {
+                active.push(ActiveMarkdownDestination {
+                    kind: MarkdownDestinationKind::Image,
+                    destination: dest_url.to_string(),
+                    label_content_end: range.start,
+                    span: range,
+                });
+            }
+            Event::End(TagEnd::Link) => {
+                if active
+                    .last()
+                    .is_some_and(|destination| destination.kind == MarkdownDestinationKind::Link)
+                    && let Some(destination) = active.pop()
+                    && let Some(span) = inline_destination_span(
+                        markdown,
+                        destination.span.clone(),
+                        destination.label_content_end,
+                    )
+                {
+                    if let Some(parent) = active.last_mut() {
+                        parent.label_content_end =
+                            parent.label_content_end.max(destination.span.end);
+                    }
+                    destinations.push(MarkdownDestination {
+                        kind: MarkdownDestinationKind::Link,
+                        destination: destination.destination,
+                        span,
+                    });
+                }
+            }
+            Event::End(TagEnd::Image) => {
+                if active
+                    .last()
+                    .is_some_and(|destination| destination.kind == MarkdownDestinationKind::Image)
+                    && let Some(destination) = active.pop()
+                    && let Some(span) = inline_destination_span(
+                        markdown,
+                        destination.span.clone(),
+                        destination.label_content_end,
+                    )
+                {
+                    if let Some(parent) = active.last_mut() {
+                        parent.label_content_end =
+                            parent.label_content_end.max(destination.span.end);
+                    }
+                    destinations.push(MarkdownDestination {
+                        kind: MarkdownDestinationKind::Image,
+                        destination: destination.destination,
+                        span,
+                    });
+                }
+            }
+            _ => {
+                if let Some(destination) = active.last_mut()
+                    && destination.span.start < range.start
+                    && range.end < destination.span.end
+                {
+                    destination.label_content_end = destination.label_content_end.max(range.end);
+                }
+            }
+        }
+    }
+    destinations
+}
+
+fn apply_markdown_replacements(
+    markdown: &mut String,
+    mut replacements: Vec<(Range<usize>, String)>,
+) {
+    replacements.sort_by_key(|(span, _)| span.start);
+    let mut previous_end = 0;
+    replacements.retain(|(span, _)| {
+        if span.start < previous_end {
+            return false;
+        }
+        previous_end = span.end;
+        true
+    });
+    for (span, replacement) in replacements.into_iter().rev() {
+        markdown.replace_range(span, &replacement);
+    }
+}
+
+fn inline_destination_span(
+    markdown: &str,
+    span: Range<usize>,
+    label_content_end: usize,
+) -> Option<Range<usize>> {
+    let inline = markdown.get(span.clone())?;
+    let bytes = inline.as_bytes();
+    let mut at = label_content_end.checked_sub(span.start)?;
+    while bytes.get(at).is_some_and(|byte| *byte != b']') {
+        at += 1;
+    }
+    at += 1;
+    if bytes.get(at) != Some(&b'(') {
+        return None;
+    }
+    at += 1;
+    at = skip_ascii_whitespace(bytes, at);
+    if bytes.get(at) == Some(&b'<') {
+        let start = at + 1;
+        let end = bytes[start..].iter().position(|byte| *byte == b'>')? + start;
+        return Some(span.start + start..span.start + end);
+    }
+
+    let start = at;
+    let mut depth = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'(' => {
+                depth += 1;
+                at += 1;
+            }
+            b')' if depth == 0 => {
+                return (start < at).then_some(span.start + start..span.start + at);
+            }
+            b')' => {
+                depth -= 1;
+                at += 1;
+            }
+            byte if byte.is_ascii_whitespace() => {
+                return (start < at).then_some(span.start + start..span.start + at);
+            }
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], mut at: usize) -> usize {
+    while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+        at += 1;
+    }
+    at
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +731,53 @@ mod tests {
 
         assert_eq!(slug_from_path(&spaced).as_deref(), Some("hello-world"));
         assert_eq!(slug_from_path(&non_latin), None);
+    }
+
+    #[test]
+    fn markdown_destinations_are_rewritten_only_inside_real_inline_images() {
+        let mut markdown = "`literal [text](https://example.com/x) here`\n\n\
+                            ```\n\
+                            see [text](https://example.com/x) in code\n\
+                            ```\n\n\
+                            ![this](https://example.com/a \"the title\")\n\n\
+                            ![wiki](https://en.wikipedia.org/wiki/Foo_\\(bar\\))\n\n\
+                            ![spaced](<https://example.com/a b>)\n\n\
+                            ![a \\[b\\] c](https://example.com/a)\n\n\
+                            ![a `](x)` b](https://example.com/code.png)\n\n\
+                            [not an image](https://example.com/a)\n"
+            .to_owned();
+
+        let replacements = markdown_destinations(&markdown)
+            .into_iter()
+            .filter_map(|destination| {
+                if destination.kind != MarkdownDestinationKind::Image {
+                    return None;
+                }
+                let replacement = match destination.destination.as_str() {
+                    "https://example.com/a" => "../assets/a.png",
+                    "https://en.wikipedia.org/wiki/Foo_(bar)" => "../assets/wiki.jpg",
+                    "https://example.com/a b" => "../assets/spaced.webp",
+                    "https://example.com/code.png" => "../assets/code.png",
+                    other => panic!("unexpected destination {other}"),
+                };
+                Some((destination.span, replacement.to_owned()))
+            })
+            .collect();
+
+        apply_markdown_replacements(&mut markdown, replacements);
+
+        assert_eq!(
+            markdown,
+            "`literal [text](https://example.com/x) here`\n\n\
+             ```\n\
+             see [text](https://example.com/x) in code\n\
+             ```\n\n\
+             ![this](../assets/a.png \"the title\")\n\n\
+             ![wiki](../assets/wiki.jpg)\n\n\
+             ![spaced](<../assets/spaced.webp>)\n\n\
+             ![a \\[b\\] c](../assets/a.png)\n\n\
+             ![a `](x)` b](../assets/code.png)\n\n\
+             [not an image](https://example.com/a)\n"
+        );
     }
 }

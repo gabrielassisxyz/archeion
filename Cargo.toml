@@ -26,6 +26,9 @@ jiff = { version = "0.2.35", default-features = false, features = ["std", "serde
 # hostile input whose parse must stay bounded: this one never holds more of the document
 # than the token it is on, while a tree would cost the whole page in memory.
 lol_html = "2.9"
+# A CommonMark reader used to locate already rendered link destinations by byte offset.
+# Export still writes the original Markdown, replacing only destination spans.
+pulldown-cmark = { version = "0.13.4", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"

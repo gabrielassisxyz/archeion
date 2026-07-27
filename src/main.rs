@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::io::{self, Write as _};
 use std::path::PathBuf;
 
+use archeion::export::{ExportOptions, export_archive};
 use archeion::storage::Archive;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -23,6 +24,16 @@ enum Command {
         json: bool,
         /// Archive directory to read.
         archive: PathBuf,
+    },
+    /// Export article captures as a Markdown vault.
+    Export {
+        /// Export every article capture instead of only the latest capture per item.
+        #[arg(long)]
+        all_captures: bool,
+        /// Archive directory to read.
+        archive: PathBuf,
+        /// Empty or absent directory to write the vault into.
+        destination: PathBuf,
     },
 }
 
@@ -50,6 +61,29 @@ fn main() {
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Command::List { json, archive } => list_archive(archive, json),
+        Command::Export {
+            all_captures,
+            archive,
+            destination,
+        } => export_markdown_vault(archive, destination, all_captures),
+    }
+}
+
+fn export_markdown_vault(
+    archive_path: PathBuf,
+    destination: PathBuf,
+    all_captures: bool,
+) -> Result<(), Box<dyn Error>> {
+    let archive = Archive::open_existing(archive_path)?;
+    let report = export_archive(&archive, destination, ExportOptions { all_captures })?;
+    write_stdout(&export_report_line(report.notes_written))?;
+    for unreadable in &report.unreadable {
+        eprintln!("warning: {unreadable}");
+    }
+    if report.unreadable.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("archive has {} unreadable item(s)", report.unreadable.len()).into())
     }
 }
 
@@ -122,6 +156,11 @@ fn json_lines(rows: &[ListRow]) -> Result<String, serde_json::Error> {
         output.push('\n');
     }
     Ok(output)
+}
+
+fn export_report_line(notes: usize) -> String {
+    let noun = if notes == 1 { "note" } else { "notes" };
+    format!("exported {notes} {noun}\n")
 }
 
 fn table(rows: &[ListRow]) -> String {

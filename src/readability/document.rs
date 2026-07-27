@@ -183,6 +183,65 @@ fn nests_deeper_than(document: &Document, ceiling: usize) -> bool {
 mod tests {
     use super::*;
 
+    fn page_chars(html: &str) -> usize {
+        let (document, _) = build(html).expect("well within every ceiling");
+        page_text_chars(&document)
+    }
+
+    /// The denominator is what a reader would have seen, so what a page carries for machines
+    /// does not count as the page saying something. A framework's serialized state is easily
+    /// larger than the article beside it, and counting it would make every article on such a
+    /// page look like a sliver of a much larger document.
+    #[test]
+    fn what_a_page_carries_for_machines_is_not_the_page_saying_something() {
+        let prose = "<p>Bread is patience.</p>";
+        assert_eq!(page_chars(prose), 16);
+        assert_eq!(
+            page_chars(&format!(
+                "{prose}<script>var state = {{ a: 1, b: 2, c: 3 }};</script>\
+                 <style>.article {{ color: rebeccapurple }}</style>"
+            )),
+            16
+        );
+    }
+
+    /// The regression that made this a walk rather than the difference between two selections.
+    /// A document parsed with scripting disabled keeps what is inside `<noscript>` as real
+    /// elements, so a `<style>` in one is matched twice by a selection that sums whole
+    /// subtrees: once on its own and once inside the `<noscript>`. Differencing then subtracts
+    /// it twice, and a page carrying enough of it drives the count to zero.
+    ///
+    /// Zero is the answer that keeps an extraction whatever its size, so the page being judged
+    /// would have been handed a way to switch the rule off and be archived as an article again.
+    #[test]
+    fn a_style_inside_a_noscript_is_not_subtracted_twice() {
+        let padding = ".rule { color: rebeccapurple; background: white }".repeat(20);
+        let counted = page_chars(&format!(
+            "<p>Bread is patience.</p><noscript><style>{padding}</style></noscript>"
+        ));
+
+        assert_eq!(counted, 16);
+    }
+
+    /// A document with no body is not a document whose text was measured. It answers zero, and
+    /// zero has to mean "keep" wherever the rule reads it.
+    #[test]
+    fn a_document_with_no_body_measures_nothing() {
+        let (document, _) =
+            build("<frameset><frame src=\"a.html\"></frameset>").expect("within every ceiling");
+        assert_eq!(page_text_chars(&document), 0);
+    }
+
+    /// Whitespace is not text. Markup indented by its author would otherwise hold more of it
+    /// than the same page minified, and the share would depend on how the page was formatted.
+    #[test]
+    fn how_a_page_is_indented_does_not_change_how_much_it_says() {
+        assert_eq!(
+            page_chars("<div><p>Bread is patience.</p></div>"),
+            page_chars("<div>\n    <p>\n        Bread is patience.\n    </p>\n</div>")
+        );
+    }
+
     fn nested(depth: usize) -> String {
         format!(
             "{}<p>buried</p>{}",

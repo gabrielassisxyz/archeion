@@ -19,6 +19,7 @@ use super::model::{
 };
 use crate::canonical_url::CanonicalUrl;
 use crate::metadata::PageMetadata;
+use crate::readability::Article;
 
 const MARKER_FILE: &str = "archeion.json";
 const FORMAT_NAME: &str = "archeion-archive";
@@ -194,6 +195,52 @@ impl Archive {
         read_optional_json(&self.metadata_path(url, capture))
     }
 
+    /// Writes the prose read out of a capture: the Markdown document, and the record beside
+    /// it. Both are derived, on the same terms as the metadata above.
+    ///
+    /// The Markdown is a file of its own rather than a string inside the record. It is the
+    /// artifact a person opens and a reader renders, and a JSON string would escape every
+    /// newline and quote in it, turning a document meant to outlive this tool into something
+    /// only a program can read.
+    ///
+    /// The record goes last, so a run cut short leaves prose with nothing describing it
+    /// rather than a description of prose that is not there.
+    pub fn write_article(
+        &self,
+        url: &CanonicalUrl,
+        capture: &CaptureId,
+        article: &Article,
+    ) -> Result<(), StorageError> {
+        write_atomically(
+            &self.article_markdown_path(url, capture),
+            article.markdown.as_bytes(),
+        )?;
+        write_json(&self.article_record_path(url, capture), &article.record)
+    }
+
+    /// The prose read out of a capture, or `None`.
+    ///
+    /// Absent is an ordinary answer: most of the web is not an article, a capture of an image
+    /// has no prose, and a derived file that was deliberately deleted is meant to be
+    /// regenerated. A record with no Markdown beside it is a torn write and reads as absent,
+    /// which is the outcome the write order above was chosen to produce.
+    pub fn read_article(
+        &self,
+        url: &CanonicalUrl,
+        capture: &CaptureId,
+    ) -> Result<Option<Article>, StorageError> {
+        let Some(record) = read_optional_json(&self.article_record_path(url, capture))? else {
+            return Ok(None);
+        };
+        let path = self.article_markdown_path(url, capture);
+        let markdown = match fs::read_to_string(&path) {
+            Ok(markdown) => markdown,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(StorageError::Io { path, source }),
+        };
+        Ok(Some(Article { markdown, record }))
+    }
+
     pub fn read_item(&self, url: &CanonicalUrl) -> Result<Item, StorageError> {
         read_optional_json(&self.item_path(url))?.ok_or_else(|| StorageError::NoSuchItem {
             url: url.to_string(),
@@ -321,6 +368,20 @@ impl Archive {
         self.item_dir(url)
             .join("captures")
             .join(format!("{capture}.metadata.json"))
+    }
+
+    /// The prose, as a document rather than as a field. The `.article` suffix keeps the stem
+    /// from being the shape of a capture id, for the same reason `.metadata` does.
+    fn article_markdown_path(&self, url: &CanonicalUrl, capture: &CaptureId) -> PathBuf {
+        self.item_dir(url)
+            .join("captures")
+            .join(format!("{capture}.article.md"))
+    }
+
+    fn article_record_path(&self, url: &CanonicalUrl, capture: &CaptureId) -> PathBuf {
+        self.item_dir(url)
+            .join("captures")
+            .join(format!("{capture}.article.json"))
     }
 
     fn body_path(&self, hash: &ContentHash) -> PathBuf {

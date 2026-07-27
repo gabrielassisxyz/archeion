@@ -14,12 +14,13 @@ Direction, not a schedule. It answers three questions for someone arriving at th
 - Asset capture. The images, stylesheets, scripts and media a page needs to still make sense once the source is gone are fetched beside it, stored once however many pages reference them, and bounded: a count of references one capture deals with, a size for one file and for all of them together, and the run's own deadline. What the archive did not get is in the record with the reason, so an absence says whether a number would have kept the page whole. [`docs/asset-capture.md`](docs/asset-capture.md) has the numbers, the guards on an address a page chose, and what was left out.
 - Readability extraction. A page that is an article is also stored as Markdown, with the navigation, the cookie banner, the share buttons and the sidebar taken out, so that a thousand sites end up in one uniform vocabulary instead of a thousand layouts. Most captures produce none, which is correct: most of the web is navigation. Reading hostile markup turned out to have two costs that grow faster than the input, so a page is weighed before it is parsed and again before it is scored, and every article records what it measured so the ceilings can be lowered against real pages instead of a guess. [`docs/readability.md`](docs/readability.md) has the measurements and what a generic extractor cannot do.
 - Canonicalization and dedupe. Every spelling of a page reduces to one address, so `www.example.com` and `example.com` are one item and a campaign parameter does not make a second one, while identical bytes stay one stored file however many captures reference them. [`docs/canonicalization.md`](docs/canonicalization.md) has the rules, the ones deliberately rejected, and the reason a lossy rule is safe to apply.
+- Collection listing. `archeion list <archive>` walks the archive tree and reports each canonical URL, its capture count, the most recent capture time and whether that latest capture has an article. `--json` emits one object per line for scripts.
 
 ## What is missing
 
 Roughly in dependency order, since each item unlocks the next.
 
-1. **Query and export.** An index over the collection, and an export format that outlives this tool.
+1. **Export.** A Markdown vault projection that joins stored article documents with their metadata without making the export authoritative.
 2. **Per-host extraction rules.** A generic scorer reads markup that follows convention and fails on sites with a layout of their own. The escape hatch is a per-host override saying which subtree is the article and which selectors are furniture, and it waits for real sites to define the shape of the rule rather than being designed against imagined ones.
 3. **A pass over an existing archive.** Re-reading stored responses with a better extractor, and fetching the subresources a capture already on disk never got. Both work from records the archive already holds, so neither needs a crawl.
 

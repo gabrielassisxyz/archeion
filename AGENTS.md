@@ -8,7 +8,7 @@
 
 - **Stack:** Rust, 2024 edition, toolchain 1.96 or newer. Single binary crate.
 - **Build:** `cargo build`
-- **Run:** `cargo run`
+- **Run:** `cargo run -- list <archive>`, or `cargo run -- list --json <archive>` for JSONL.
 - **Test:** `cargo test`
 - **Every gate at once:** `bin/ci`, which is exactly what CI runs. Green locally means green in CI.
 - **Planned work:** `br ready` for what can be started now, `br` for the rest. The queue is maintainer state and is not committed; `ROADMAP.md` is its public counterpart.

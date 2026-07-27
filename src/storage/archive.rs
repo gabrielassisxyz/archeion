@@ -25,6 +25,8 @@ use crate::readability::{Article, ArticleRecord};
 const MARKER_FILE: &str = "archeion.json";
 const FORMAT_NAME: &str = "archeion-archive";
 const FORMAT_VERSION: u32 = 1;
+const MAX_ARTICLE_RECORD_BYTES: u64 = 64 * 1024;
+const MAX_ARTICLE_MARKDOWN_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Serialize, serde::Deserialize)]
 struct FormatMarker {
@@ -62,6 +64,10 @@ pub enum StorageError {
     },
     #[error("{path} holds something else, not an Archeion archive")]
     NotAnArchive { path: PathBuf },
+    #[error("{path} does not exist")]
+    MissingArchive { path: PathBuf },
+    #[error("{path} does not hold an Archeion archive")]
+    NoArchiveMarker { path: PathBuf },
     #[error("{path} is an archive in format version {found}, this build reads version {readable}")]
     UnreadableFormat {
         path: PathBuf,
@@ -82,6 +88,8 @@ pub enum StorageError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("{path} was refused rather than read: {reason}")]
+    RefusedRecord { path: PathBuf, reason: &'static str },
 }
 
 pub struct Archive {
@@ -120,6 +128,35 @@ impl Archive {
                     },
                 )?;
             }
+        }
+
+        Ok(Self { root })
+    }
+
+    /// Opens an existing archive without creating a marker when the path is absent or empty.
+    ///
+    /// Read-only callers use this so a mistyped path does not become a valid empty archive
+    /// merely by being listed.
+    pub fn open_existing(root: impl Into<PathBuf>) -> Result<Self, StorageError> {
+        let root = root.into();
+        if !root.exists() {
+            return Err(StorageError::MissingArchive { path: root });
+        }
+        let marker_path = root.join(MARKER_FILE);
+
+        match read_optional_json::<FormatMarker>(&marker_path)? {
+            Some(marker) if marker.format != FORMAT_NAME => {
+                return Err(StorageError::NotAnArchive { path: root });
+            }
+            Some(marker) if marker.version > FORMAT_VERSION => {
+                return Err(StorageError::UnreadableFormat {
+                    path: root,
+                    found: marker.version,
+                    readable: FORMAT_VERSION,
+                });
+            }
+            Some(_) => {}
+            None => return Err(StorageError::NoArchiveMarker { path: root }),
         }
 
         Ok(Self { root })
@@ -255,17 +292,28 @@ impl Archive {
         url: &CanonicalUrl,
         capture: &CaptureId,
     ) -> Result<Option<Article>, StorageError> {
-        let Some(stored) =
-            read_optional_json::<StoredArticle>(&self.article_record_path(url, capture))?
+        let record_path = self.article_record_path(url, capture);
+        let Some(stored) = read_optional_bounded_json::<StoredArticle>(
+            &record_path,
+            MAX_ARTICLE_RECORD_BYTES,
+            "larger than an article record can be",
+        )?
         else {
             return Ok(None);
         };
         let path = self.article_markdown_path(url, capture);
-        let markdown = match fs::read_to_string(&path) {
-            Ok(markdown) => markdown,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(StorageError::Io { path, source }),
+        let Some(bytes) = read_optional_regular_file(
+            &path,
+            MAX_ARTICLE_MARKDOWN_BYTES,
+            "larger than an article document can be",
+        )?
+        else {
+            return Ok(None);
         };
+        let markdown = String::from_utf8(bytes).map_err(|source| StorageError::Io {
+            path: path.clone(),
+            source: io::Error::new(io::ErrorKind::InvalidData, source),
+        })?;
         if ContentHash::of(markdown.as_bytes()) != stored.markdown_sha256 {
             return Ok(None);
         }
@@ -534,6 +582,56 @@ fn read_optional_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, Sto
             path: path.to_owned(),
             source,
         })
+}
+
+fn read_optional_bounded_json<T: DeserializeOwned>(
+    path: &Path,
+    max_len: u64,
+    too_large: &'static str,
+) -> Result<Option<T>, StorageError> {
+    let Some(bytes) = read_optional_regular_file(path, max_len, too_large)? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|source| StorageError::MalformedRecord {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+fn read_optional_regular_file(
+    path: &Path,
+    max_len: u64,
+    too_large: &'static str,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    let shape = match fs::symlink_metadata(path) {
+        Ok(shape) => shape,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(StorageError::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    if !shape.is_file() {
+        return Err(StorageError::RefusedRecord {
+            path: path.to_owned(),
+            reason: "this archive record is a regular file, and this is not one",
+        });
+    }
+    if shape.len() > max_len {
+        return Err(StorageError::RefusedRecord {
+            path: path.to_owned(),
+            reason: too_large,
+        });
+    }
+
+    fs::read(path).map(Some).map_err(|source| StorageError::Io {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 fn write_json<T: Serialize>(path: &Path, record: &T) -> Result<(), StorageError> {

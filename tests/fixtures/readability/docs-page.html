@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Configuring retries - Widget SDK</title></head>
+<body>
+<header class="docs-header"><a class="logo" href="/">Widget SDK</a><input type="search" placeholder="Search docs"><a href="/api">API</a><a href="/guides">Guides</a><a href="https://github.com/example/widget">GitHub</a></header>
+<div class="docs-layout">
+<nav class="sidebar" aria-label="Documentation">
+  <ul>
+    <li><a href="/docs/install">Installation</a></li>
+    <li><a href="/docs/quickstart">Quickstart</a></li>
+    <li><a href="/docs/config">Configuration</a>
+      <ul><li><a href="/docs/config/timeouts">Timeouts</a></li><li><a href="/docs/config/retries">Retries</a></li><li><a href="/docs/config/proxies">Proxies</a></li></ul></li>
+    <li><a href="/docs/errors">Error handling</a></li>
+    <li><a href="/docs/testing">Testing</a></li>
+    <li><a href="/docs/migrating">Migrating from v1</a></li>
+  </ul>
+</nav>
+<main class="docs-content">
+  <h1>Configuring retries</h1>
+  <p>The client retries a request when the failure looks transient, and gives up immediately when it does not. A connection reset is retried; a 400 response is not, because sending the same malformed request again will produce the same answer.</p>
+  <h2>Defaults</h2>
+  <p>Three attempts, with exponential backoff starting at 200 milliseconds and a jitter of up to half the delay. The jitter matters more than the backoff: without it, every client that failed at the same moment retries at the same moment.</p>
+  <pre><code>client = Widget(
+    retries=3,
+    backoff_base_ms=200,
+)</code></pre>
+  <h2>Which failures are retried</h2>
+  <table>
+    <thead><tr><th>Condition</th><th>Retried</th></tr></thead>
+    <tbody>
+      <tr><td>Connection reset</td><td>Yes</td></tr>
+      <tr><td>Timeout</td><td>Yes</td></tr>
+      <tr><td>429 Too Many Requests</td><td>Yes, honouring Retry-After</td></tr>
+      <tr><td>5xx</td><td>Yes</td></tr>
+      <tr><td>4xx other than 429</td><td>No</td></tr>
+    </tbody>
+  </table>
+  <h2>Turning it off</h2>
+  <p>Set retries to zero. This is the right setting when the caller already has its own retry loop, since two nested retry loops multiply rather than add, and three attempts inside three attempts is nine requests against a service that is already struggling.</p>
+  <pre><code>client = Widget(retries=0)</code></pre>
+  <h3>Idempotency</h3>
+  <p>Retries are only safe for requests that can be repeated without changing the outcome twice. The client will not retry a POST unless an idempotency key is set, and it is an error to set one on a request that is not idempotent.</p>
+</main>
+<aside class="toc"><h2>On this page</h2><ul><li><a href="#defaults">Defaults</a></li><li><a href="#which">Which failures are retried</a></li><li><a href="#off">Turning it off</a></li></ul></aside>
+</div>
+<footer class="docs-footer"><p>Was this page helpful?</p><button>Yes</button><button>No</button><p>Edit this page on GitHub</p></footer>
+</body></html>

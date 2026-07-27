@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+<head><title>notes on rewriting the indexer</title></head>
+<body>
+<div id="wrap">
+<div id="top"><a href="/">index</a> &middot; <a href="/feed.xml">rss</a> &middot; <a href="/now">now</a></div>
+<div id="main">
+<div class="date">2026-01-08</div>
+<div class="body">
+<p>I rewrote the indexer last week and it is now roughly forty times faster, which sounds like a triumph and is mostly an admission about what it was doing before.</p>
+<p>The old one opened the database once per document. Not once per batch, not once per run: once per document. This was invisible for the first two years because the collection was small enough that the whole thing finished in under a second, and nobody profiles something that finishes in under a second.</p>
+<p>What made it visible was not growth in the collection. It was moving the database onto a network filesystem, where opening a handle stopped being free. The operation that had always been wasteful became the operation that dominated, and a job that took a second started taking three minutes.</p>
+<p>There is a lesson here that I keep relearning. Waste that is invisible is still waste; it is just waiting for the constant factor to change. Every one of these I have found was introduced by someone who measured, saw an acceptable number, and stopped. Including me, twice.</p>
+<p>The fix was four lines. The interesting part was that nothing about the code changed to make it slow. The code was always slow. What changed was the floor underneath it.</p>
+</div>
+</div>
+<div id="bottom"><p>written by hand, no analytics, no tracking</p><p><a href="/archive">older posts</a></p></div>
+</div>
+</body></html>

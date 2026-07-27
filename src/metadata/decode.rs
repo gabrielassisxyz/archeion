@@ -22,7 +22,7 @@ const PRESCAN_BYTES: usize = 1024;
 /// the chosen encoding become replacement characters rather than an error: a page with one
 /// bad byte still has a title, and refusing the whole document over it would archive less
 /// than the bytes support.
-pub(super) fn decode_html<'a>(bytes: &'a [u8], declared_charset: Option<&str>) -> Cow<'a, str> {
+pub(crate) fn decode_html<'a>(bytes: &'a [u8], declared_charset: Option<&str>) -> Cow<'a, str> {
     let fallback = declared_charset
         .and_then(label_to_encoding)
         .or_else(|| {

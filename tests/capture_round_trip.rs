@@ -4,6 +4,7 @@
 
 use archeion::CanonicalUrl;
 use archeion::metadata::{self, PageMetadata, PageSource};
+use archeion::readability::{self, AdmissionCost, Article, ArticleRecord, ExtractionRules};
 use archeion::storage::{
     Archive, AssetMiss, ContentHash, Header, ItemId, MissedAsset, NewAsset, NewCapture,
     StorageError,
@@ -151,6 +152,180 @@ fn the_layout_on_disk_is_the_documented_one() {
             .is_file()
     );
     assert!(blob.is_file());
+}
+
+/// The prose is a document on disk and not a string inside a record, which is the whole
+/// point of it: a Markdown file is readable by anything, and the same text inside JSON has
+/// every newline and quote escaped out of it.
+#[test]
+fn an_article_is_stored_as_a_document_and_read_back_whole() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+    let capture = archive
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
+        .expect("capture is stored");
+    let article = Article {
+        markdown: "# How to bake bread\n\nBread is mostly patience.".to_owned(),
+        record: ArticleRecord {
+            extractor_version: readability::EXTRACTOR_VERSION,
+            rules: ExtractionRules::Heuristic,
+            word_count: 5,
+            excerpt: Some("Bread is mostly patience.".to_owned()),
+            byline: None,
+            truncated: Vec::new(),
+            cost: AdmissionCost {
+                document_bytes: 4096,
+                peak_open_elements: 12,
+            },
+        },
+    };
+
+    archive
+        .write_article(&url, &capture.id, &article)
+        .expect("the article is stored");
+
+    let captures_dir = dir
+        .path()
+        .join("items")
+        .join("example.com")
+        .join(ItemId::of(&url).as_str())
+        .join("captures");
+    let markdown_path = captures_dir.join(format!("{}.article.md", capture.id));
+    assert!(
+        captures_dir
+            .join(format!("{}.article.json", capture.id))
+            .is_file()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&markdown_path).expect("the document is on disk"),
+        article.markdown,
+        "the Markdown is stored verbatim, with nothing escaped into it"
+    );
+    assert_eq!(
+        archive
+            .read_article(&url, &capture.id)
+            .expect("the article reads back"),
+        Some(article)
+    );
+}
+
+/// The failure ordering alone does not catch: writing over a pair that is already there. The
+/// new document lands, the process dies before the record, and both files exist and parse,
+/// with every field of the old record describing prose that is no longer on disk. Only the
+/// hash in the record makes that detectable, and detected means absent, because the pass that
+/// re-extracts can rebuild it from the stored response.
+#[test]
+fn an_article_described_by_a_record_from_a_previous_extraction_reads_as_absent() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+    let capture = archive
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
+        .expect("capture is stored");
+    let article = |markdown: &str| Article {
+        markdown: markdown.to_owned(),
+        record: ArticleRecord {
+            extractor_version: readability::EXTRACTOR_VERSION,
+            rules: ExtractionRules::Heuristic,
+            word_count: 3,
+            excerpt: None,
+            byline: None,
+            truncated: Vec::new(),
+            cost: AdmissionCost {
+                document_bytes: 4096,
+                peak_open_elements: 12,
+            },
+        },
+    };
+    archive
+        .write_article(&url, &capture.id, &article("# A page\n\nThe first prose."))
+        .expect("the first article is stored");
+
+    // A better extractor rewrites the document, and the write is cut before the record.
+    std::fs::write(
+        dir.path()
+            .join("items")
+            .join("example.com")
+            .join(ItemId::of(&url).as_str())
+            .join("captures")
+            .join(format!("{}.article.md", capture.id)),
+        "# A page\n\nProse the record beside this one never saw.",
+    )
+    .expect("the document is replaced");
+
+    assert_eq!(
+        archive
+            .read_article(&url, &capture.id)
+            .expect("a mismatched pair is not an error"),
+        None
+    );
+}
+
+/// The record is written after the document, so a run cut short between the two leaves prose
+/// with nothing describing it. That is the half the archive can afford to lose, and it has to
+/// read as absent rather than as an error, because the next pass will simply redo it.
+#[test]
+fn an_article_whose_document_never_landed_reads_as_absent() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+    let capture = archive
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
+        .expect("capture is stored");
+    archive
+        .write_article(
+            &url,
+            &capture.id,
+            &Article {
+                markdown: "# A page\n\nSome prose.".to_owned(),
+                record: ArticleRecord {
+                    extractor_version: readability::EXTRACTOR_VERSION,
+                    rules: ExtractionRules::Heuristic,
+                    word_count: 2,
+                    excerpt: None,
+                    byline: None,
+                    truncated: Vec::new(),
+                    cost: AdmissionCost {
+                        document_bytes: 4096,
+                        peak_open_elements: 12,
+                    },
+                },
+            },
+        )
+        .expect("the article is stored");
+
+    std::fs::remove_file(
+        dir.path()
+            .join("items")
+            .join("example.com")
+            .join(ItemId::of(&url).as_str())
+            .join("captures")
+            .join(format!("{}.article.md", capture.id)),
+    )
+    .expect("the document is removed");
+
+    assert_eq!(
+        archive
+            .read_article(&url, &capture.id)
+            .expect("a half-written article is not an error"),
+        None
+    );
 }
 
 #[test]

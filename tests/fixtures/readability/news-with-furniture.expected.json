@@ -1,0 +1,21 @@
+{
+  "why": "The hard case: no semantic article element, and the prose is interrupted by an advertisement block that sits inside the body rather than beside it.",
+  "is_article": true,
+  "title": "City council votes to keep the night buses",
+  "must_contain": [
+    "voted on Tuesday evening to keep all eleven night bus routes",
+    "counts a nurse going to a night shift the same way",
+    "fund the gap from the parking surplus",
+    "recruiting the twelve drivers"
+  ],
+  "must_not_contain": [
+    "Accept all cookies",
+    "free articles remaining",
+    "Share on Twitter",
+    "Get the morning briefing",
+    "Most read this week",
+    "All rights reserved"
+  ],
+  "heading_levels": [1, 2, 2],
+  "word_count": { "min": 200, "max": 400 }
+}

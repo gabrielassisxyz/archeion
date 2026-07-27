@@ -25,6 +25,8 @@ An asset arrives at the capture already stored, as a record, rather than as byte
   items/<host>/<item-id>/item.json                  one item
   items/<host>/<item-id>/captures/<capture-id>.json one fetch of it
   items/<host>/<item-id>/captures/<capture-id>.metadata.json  what was read out of that fetch
+  items/<host>/<item-id>/captures/<capture-id>.article.md     its prose, if it had any
+  items/<host>/<item-id>/captures/<capture-id>.article.json   what is known about that prose
 ```
 
 A real archive holding a single capture of one page, with one stylesheet as its asset:
@@ -124,13 +126,17 @@ The reason is the point of the field. Comparing what the derived record says the
 
 Records are JSON, pretty printed. The format costs some bytes against the raw bodies it sits beside, and buys a file that `diff` and `grep` can work with and that any language will still parse in twenty years.
 
-### The derived record
+### The derived records
 
 Beside each capture there may be a `<capture-id>.metadata.json`, holding what was read out of that response: its title, its author, its date, the tags behind them, its outbound links and the subresources it referenced. [`metadata-extraction.md`](metadata-extraction.md) has the fields and the rules.
 
-It is a separate file because the two have different lifetimes. The capture record is what the archive observed and is the part that cannot be recovered; this is a reading of it, and a better extractor is expected to replace every one of these without touching a single recorded file. A capture with no derived file beside it is an ordinary state: the response may not be a page at all, or nothing has read it yet.
+Beside a capture that turned out to be an article there is also a `<capture-id>.article.md`, its prose with the navigation, sidebars and banners taken out, and a `<capture-id>.article.json` describing it. Most captures have neither, because most of the web is not an article. [`readability.md`](readability.md) has the rules and the ceilings.
 
-Its presence changes nothing else in this layout. Reading an archive that has none works exactly as before, the format version does not move, and the listing that walks an item's captures still sees captures, because the extra suffix keeps the file stem from being the shape of a capture id.
+They are separate files because they have different lifetimes from the capture. The capture record is what the archive observed and is the part that cannot be recovered; these are readings of it, and a better extractor is expected to replace every one of them without touching a single recorded file. A capture with no derived file beside it is an ordinary state: the response may not be a page at all, or nothing has read it yet.
+
+**The prose is a document and not a field.** It could have been a string inside the record beside it, and it is not, because a JSON string escapes every newline and quote in it: the artifact whose whole promise is that it outlives this tool would then be readable only by a program that decodes it first. A `.md` file opens in anything.
+
+Their presence changes nothing else in this layout. Reading an archive that has none works exactly as before, the format version does not move, and the listing that walks an item's captures still sees captures, because the extra suffix keeps the file stem from being the shape of a capture id.
 
 ## Writing
 

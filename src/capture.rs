@@ -156,11 +156,11 @@ fn capture_page(
     };
 
     // A seed is screened before anything is dialled, so a page that ends on one of these
-    // addresses got there by redirect, through a guard inside the engine that this project
-    // does not own. What that guard misses arrives here looking like any other page, and
-    // storing it is what turns a blind fetch into a durable copy of whatever answered on
-    // the machine the archive runs on. The run that asked for local addresses gets them,
-    // which is the only way a locally served site is archived at all.
+    // addresses got there by redirect, through a guard inside the engine. This boundary
+    // keeps the same predicate because the engine is replaceable and storing the response
+    // is what turns a blind fetch into a durable copy of whatever answered on the machine
+    // the archive runs on. The run that asked for local addresses gets them, which is the
+    // only way a locally served site is archived at all.
     if !allow_private_addresses && points_inside_a_network(&page.final_url) {
         run.pages_inside_a_network.push(page.final_url);
         return ControlFlow::Continue(());

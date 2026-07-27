@@ -14,7 +14,9 @@ use jiff::Timestamp;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::model::{Asset, Capture, CaptureId, ContentHash, Item, ItemId, NewCapture, StoredBody};
+use super::model::{
+    Asset, Capture, CaptureId, ContentHash, Item, ItemId, NewAsset, NewCapture, StoredBody,
+};
 use crate::canonical_url::CanonicalUrl;
 use crate::metadata::PageMetadata;
 
@@ -107,28 +109,35 @@ impl Archive {
         Ok(Self { root })
     }
 
-    /// Stores one fetch of one item: its bytes, its assets' bytes, the item record and the
-    /// capture record.
+    /// Stores the bytes of one subresource and answers with the record that references them.
+    ///
+    /// It is separate from writing the capture because a subresource is shared: one
+    /// stylesheet belongs to every page of a site that links it, and the run that captured
+    /// it stores it once and then hands this record to each of those captures. The store
+    /// would have deduplicated the bytes either way, since the address is the content, but
+    /// only the caller can avoid fetching them twice, and that is the part that costs
+    /// somebody else's bandwidth.
+    pub fn store_asset(&self, new: &NewAsset) -> Result<Asset, StorageError> {
+        Ok(Asset {
+            requested_url: new.requested_url.clone(),
+            final_url: new.final_url.clone(),
+            status: new.status,
+            media_type: new.media_type.clone(),
+            body: self.write_body(&new.body)?,
+        })
+    }
+
+    /// Stores one fetch of one item: its bytes, the item record and the capture record.
     ///
     /// The write order is what a run cut short leaves behind, so it is chosen rather than
-    /// incidental. Bodies come first, because an unreferenced blob costs disk space and
+    /// incidental. The body comes first, because an unreferenced blob costs disk space and
     /// nothing else while a record pointing at absent bytes is broken. The item record
     /// comes next, because it holds the canonical URL that the hashed directory name does
     /// not: a capture stranded without it cannot be read back to the address it came from.
+    /// The subresources arrive already stored, by the same rule applied one step earlier.
     pub fn write_capture(&self, new: NewCapture) -> Result<Capture, StorageError> {
         let body = self.write_body(&new.body)?;
-        let mut assets = Vec::with_capacity(new.assets.len());
-        for asset in &new.assets {
-            assets.push(Asset {
-                requested_url: asset.requested_url.clone(),
-                final_url: asset.final_url.clone(),
-                status: asset.status,
-                media_type: asset.media_type.clone(),
-                body: self.write_body(&asset.body)?,
-            });
-        }
-
-        let fingerprint = fingerprint_of(&new, &body.sha256, &assets);
+        let fingerprint = fingerprint_of(&new, &body.sha256);
         let capture = Capture {
             id: CaptureId::new(new.fetched_at, &fingerprint),
             item_id: ItemId::of(&new.canonical_url),
@@ -140,7 +149,8 @@ impl Archive {
             body,
             body_truncated: new.body_truncated,
             fetched_at: new.fetched_at,
-            assets,
+            assets: new.assets,
+            assets_missed: new.assets_missed,
         };
 
         self.record_item(&new.canonical_url, new.fetched_at)?;
@@ -360,7 +370,13 @@ fn directory_has_visible_entries(path: &Path) -> Result<bool, StorageError> {
 /// filename that has to stay the same forever, and JSON output is a moving target: a
 /// renamed field or a changed formatter would silently rename every capture written after
 /// it, filing a re-write of an existing capture beside the original instead of over it.
-fn fingerprint_of(new: &NewCapture, body: &ContentHash, assets: &[Asset]) -> ContentHash {
+///
+/// What a capture missed is not in here, and does not need to be, but only because each asset
+/// below contributes its address as well as its bytes. Two captures of one page that agree on
+/// every asset they hold, address by address, referenced the same subresources and therefore
+/// missed the same ones. Adding the misses would hash a reason string that varies between two
+/// attempts at the same failure.
+fn fingerprint_of(new: &NewCapture, body: &ContentHash) -> ContentHash {
     fn push_field(buffer: &mut Vec<u8>, value: &str) {
         buffer.extend_from_slice(&(value.len() as u64).to_le_bytes());
         buffer.extend_from_slice(value.as_bytes());
@@ -383,7 +399,18 @@ fn fingerprint_of(new: &NewCapture, body: &ContentHash, assets: &[Asset]) -> Con
     // of them, and the whole promise of this name is that a difference gets a file rather
     // than overwriting the capture it differs from.
     buffer.push(u8::from(new.body_truncated));
-    for asset in assets {
+    // Each asset contributes what it is and not only what it holds. Hashing the body alone
+    // would name two captures alike whenever the bytes match and the records do not, and a
+    // page referencing two addresses that serve identical bytes, which every tracking pixel
+    // on a site is, is enough for that: a capture that got the first and a capture that got
+    // the second would share a name, and the second write would land on top of the first.
+    for asset in &new.assets {
+        let media_type = asset.media_type.as_deref();
+        push_field(&mut buffer, &asset.requested_url);
+        push_field(&mut buffer, &asset.final_url);
+        push_field(&mut buffer, &asset.status.to_string());
+        buffer.push(u8::from(media_type.is_some()));
+        push_field(&mut buffer, media_type.unwrap_or(""));
         push_field(&mut buffer, asset.body.sha256.as_str());
     }
     ContentHash::of(&buffer)

@@ -7,12 +7,13 @@
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
+use crate::assets::{AssetCapture, CapturedAssets};
 use crate::canonical_url::{CanonicalUrl, InvalidCanonicalUrl};
 use crate::crawl::{
     CrawlEngine, CrawlError, CrawlStop, FetchFailure, PageEvent, PageResponse, Seed,
     points_inside_a_network,
 };
-use crate::metadata::{self, PageMetadata, PageSource, UnreadablePage};
+use crate::metadata::{self, PageMetadata, PageSource, ReferencedAsset, UnreadablePage};
 use crate::storage::{Archive, Header, NewCapture, StorageError};
 
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +63,15 @@ pub struct CaptureRun {
     pub unreadable_pages: Vec<UnreadablePage>,
     /// Pages the engine fetched that never reached the archive, straight from the engine.
     pub pages_dropped: usize,
+    /// Subresources stored beside the captures of this run.
+    pub assets_stored: usize,
+    /// Subresources a page referenced and its capture does not hold. Each one is in the
+    /// capture record with the reason, which is where it belongs: this count is for the run,
+    /// and the run is over by the time anyone asks why a page looks wrong.
+    pub assets_missed: usize,
+    /// Requests the subresource pass made. The gap between this and the two counts above is
+    /// the run recognising a file shared by many pages instead of asking for it once per page.
+    pub asset_fetches: usize,
     /// Why the run ended. A run that stopped at its deadline archived a prefix of a site
     /// rather than the site, and the difference is not visible in any of the counts above.
     pub stopped: CrawlStop,
@@ -84,12 +94,16 @@ pub fn capture_seed(
     let started = Instant::now();
     let deadline = seed.deadline;
     let mut engine_overran = false;
+    // The pass outlives every page because what it learned about one page's subresources is
+    // the answer for the next page that references them.
+    let mut assets = AssetCapture::new(engine, archive, seed, started);
 
     let outcome = engine.crawl(seed, &mut |event| {
         let answer = capture_page(
             event,
             archive,
-            seed.allow_private_addresses,
+            seed,
+            &mut assets,
             &mut run,
             &mut write_failure,
         );
@@ -106,6 +120,7 @@ pub fn capture_seed(
     })?;
 
     run.pages_dropped = outcome.pages_dropped;
+    run.asset_fetches = assets.fetches();
     // The engine reports that its caller stopped it. This is that caller, and it knows why.
     run.stopped = if engine_overran {
         CrawlStop::DeadlineReached
@@ -143,7 +158,8 @@ fn engine_overran_its_deadline(deadline: Option<Duration>, elapsed: Duration) ->
 fn capture_page(
     event: PageEvent,
     archive: &Archive,
-    allow_private_addresses: bool,
+    seed: &Seed,
+    assets: &mut AssetCapture<'_>,
     run: &mut CaptureRun,
     write_failure: &mut Option<StorageError>,
 ) -> ControlFlow<()> {
@@ -161,7 +177,7 @@ fn capture_page(
     // is what turns a blind fetch into a durable copy of whatever answered on the machine
     // the archive runs on. The run that asked for local addresses gets them, which is the
     // only way a locally served site is archived at all.
-    if !allow_private_addresses && points_inside_a_network(&page.final_url) {
+    if !seed.allow_private_addresses && points_inside_a_network(&page.final_url) {
         run.pages_inside_a_network.push(page.final_url);
         return ControlFlow::Continue(());
     }
@@ -184,7 +200,20 @@ fn capture_page(
     // after, because the response is what cannot be recovered: a run cut short then leaves
     // a capture with no reading of it, which a later pass can produce on its own.
     let extracted = read_page(&page, run);
-    let capture = match archive.write_capture(new_capture(canonical.clone(), page)) {
+    // The subresources are acquired before the capture is written because the record has to
+    // name them, and their bytes are stored before the page's own for the reason every body
+    // is stored before every record: a blob nobody references costs disk space, and a record
+    // naming bytes that are absent is broken. What it trades is a page lost whole if the
+    // process dies mid-pass, rather than a capture on disk claiming subresources it never got.
+    let captured = match assets.of_page(referenced_assets(extracted.as_ref())) {
+        Ok(captured) => captured,
+        Err(error) => {
+            *write_failure = Some(error);
+            return ControlFlow::Break(());
+        }
+    };
+    let (stored, missed) = (captured.stored.len(), captured.missed.len());
+    let capture = match archive.write_capture(new_capture(canonical.clone(), page, captured)) {
         Ok(capture) => capture,
         Err(error) => {
             *write_failure = Some(error);
@@ -192,6 +221,11 @@ fn capture_page(
         }
     };
     run.captures_written += 1;
+    // Counted with the capture rather than with the pass. A subresource whose capture never
+    // reached the disk is a blob nothing references, and reporting it beside a capture that
+    // does not exist would describe an archive nobody has.
+    run.assets_stored += stored;
+    run.assets_missed += missed;
 
     if let Some(metadata) = extracted
         && let Err(error) = archive.write_metadata(&canonical, &capture.id, &metadata)
@@ -221,7 +255,18 @@ fn read_page(page: &PageResponse, run: &mut CaptureRun) -> Option<PageMetadata> 
     }
 }
 
-fn new_capture(canonical_url: CanonicalUrl, page: PageResponse) -> NewCapture {
+/// What a page referenced, or nothing at all when there was no reading of it. A capture that
+/// is not a page has no subresources to acquire, and neither has one whose markup the
+/// extractor could not read: the references are in the part it failed on.
+fn referenced_assets(extracted: Option<&PageMetadata>) -> &[ReferencedAsset] {
+    extracted.map_or(&[], |metadata| metadata.assets.as_slice())
+}
+
+fn new_capture(
+    canonical_url: CanonicalUrl,
+    page: PageResponse,
+    captured: CapturedAssets,
+) -> NewCapture {
     let media_type = media_type_of(&page.headers);
     NewCapture {
         canonical_url,
@@ -233,15 +278,15 @@ fn new_capture(canonical_url: CanonicalUrl, page: PageResponse) -> NewCapture {
         body: page.body,
         body_truncated: page.body_truncated,
         fetched_at: page.fetched_at,
-        // Assets are captured by their own pass over the page, which does not exist yet.
-        assets: Vec::new(),
+        assets: captured.stored,
+        assets_missed: captured.missed,
     }
 }
 
 /// The media type without its parameters: `text/html` out of `text/html; charset=utf-8`.
 /// Nothing is lost by narrowing it, since the header survives verbatim in the record, and
 /// the field then holds what its name promises instead of a string every reader re-parses.
-fn media_type_of(headers: &[Header]) -> Option<String> {
+pub(crate) fn media_type_of(headers: &[Header]) -> Option<String> {
     content_type_of(headers)
         .map(|content_type| {
             let (media_type, _parameters) =
@@ -261,12 +306,14 @@ fn content_type_of(headers: &[Header]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::time::Duration;
 
     use tempfile::TempDir;
 
     use super::*;
     use crate::crawl::CrawlOutcome;
+    use crate::storage::AssetMiss;
 
     /// A crawl engine that replays a written-down list of page events instead of fetching
     /// anything. It is the whole reason the boundary exists: the pipeline above it is
@@ -274,23 +321,47 @@ mod tests {
     /// address is decided by the test rather than by whatever the web answered today.
     struct ScriptedCrawlEngine {
         pages: Vec<PageEvent>,
+        /// What each URL fetched on its own answers with. A URL that is not written down
+        /// answered nothing, which is the only honest default for a fake with no network.
+        subresources: HashMap<String, PageEvent>,
         outcome: CrawlOutcome,
         /// What the pipeline answered for each page, so a test can prove the crawl stopped
         /// rather than infer it from a count.
         answers: RefCell<Vec<ControlFlow<()>>>,
+        /// Every URL fetched on its own, in order. A file shared by two pages should cost one
+        /// request, and a count is the only way a test can say so.
+        fetched: RefCell<Vec<String>>,
     }
 
     impl ScriptedCrawlEngine {
         fn new(pages: Vec<PageEvent>) -> Self {
             Self {
                 pages,
+                subresources: HashMap::new(),
                 outcome: CrawlOutcome::default(),
                 answers: RefCell::new(Vec::new()),
+                fetched: RefCell::new(Vec::new()),
             }
+        }
+
+        /// The subresources this engine will answer for, keyed by the URL they are asked for.
+        fn serving(mut self, subresources: Vec<PageEvent>) -> Self {
+            for event in subresources {
+                let url = match &event {
+                    PageEvent::Response(response) => response.requested_url.clone(),
+                    PageEvent::NoResponse(failure) => failure.url.clone(),
+                };
+                self.subresources.insert(url, event);
+            }
+            self
         }
 
         fn pages_offered(&self) -> usize {
             self.answers.borrow().len()
+        }
+
+        fn urls_fetched(&self) -> Vec<String> {
+            self.fetched.borrow().clone()
         }
     }
 
@@ -308,6 +379,16 @@ mod tests {
                 }
             }
             Ok(self.outcome.clone())
+        }
+
+        fn fetch(&self, url: &str, _seed: &Seed) -> PageEvent {
+            self.fetched.borrow_mut().push(url.to_owned());
+            self.subresources.get(url).cloned().unwrap_or_else(|| {
+                PageEvent::NoResponse(FetchFailure {
+                    url: url.to_owned(),
+                    reason: "this fake was given nothing to answer with".to_owned(),
+                })
+            })
         }
     }
 
@@ -806,5 +887,555 @@ mod tests {
             .expect("the capture reads back");
         assert_eq!(capture.requested_url, "https://example.com/short-link");
         assert_eq!(capture.final_url, "https://example.com/final");
+    }
+
+    const STYLED_PAGE: &str = r#"<html><head><link rel="stylesheet" href="/style.css"></head>
+           <body><img src="/logo.png"></body></html>"#;
+
+    fn subresource(url: &str, media_type: &str, body: &[u8]) -> PageEvent {
+        PageEvent::Response(PageResponse {
+            requested_url: url.to_owned(),
+            final_url: url.to_owned(),
+            status: 200,
+            headers: vec![Header {
+                name: "content-type".to_owned(),
+                value: media_type.to_owned(),
+            }],
+            body: body.to_vec(),
+            body_truncated: false,
+            fetched_at: "2026-07-25T14:03:22Z".parse().expect("valid timestamp"),
+        })
+    }
+
+    fn only_capture_of(archive: &Archive, url: &str) -> crate::storage::Capture {
+        let url = CanonicalUrl::parse(url).expect("valid url");
+        let captures = archive.list_captures(&url).expect("captures are listed");
+        archive
+            .read_capture(&url, &captures[0])
+            .expect("the capture reads back")
+    }
+
+    #[test]
+    fn a_page_is_archived_with_the_files_it_needs_to_still_render() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine =
+            ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, STYLED_PAGE)])
+                .serving(vec![
+                    subresource("https://example.com/style.css", "text/CSS", b"body{}"),
+                    subresource("https://example.com/logo.png", "image/png", b"\x89PNG"),
+                ]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.assets_stored, 2);
+        assert_eq!(run.assets_missed, 0);
+        assert_eq!(run.asset_fetches, 2);
+        let capture = only_capture_of(&archive, "https://example.com/a");
+        assert!(capture.assets_missed.is_empty());
+        let stored: Vec<(&str, Option<&str>)> = capture
+            .assets
+            .iter()
+            .map(|asset| (asset.final_url.as_str(), asset.media_type.as_deref()))
+            .collect();
+        assert_eq!(
+            stored,
+            [
+                ("https://example.com/style.css", Some("text/css")),
+                ("https://example.com/logo.png", Some("image/png")),
+            ]
+        );
+        assert_eq!(
+            archive
+                .read_body(&capture.assets[0].body.sha256)
+                .expect("the stylesheet reads back"),
+            b"body{}"
+        );
+    }
+
+    /// The reason the pass remembers anything. A stylesheet belongs to every page of a site
+    /// that links it, and asking the server for it once per page is two hundred requests for
+    /// one file, which is not something an archive gets to do to somebody else's host.
+    #[test]
+    fn a_file_two_pages_share_is_asked_for_once_and_stored_once() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![
+            page(
+                "https://example.com/a",
+                200,
+                r#"<html><link rel="stylesheet" href="/style.css"></html>"#,
+            ),
+            page(
+                "https://example.com/b",
+                200,
+                r#"<html><link rel="stylesheet" href="/style.css"></html>"#,
+            ),
+        ])
+        .serving(vec![subresource(
+            "https://example.com/style.css",
+            "text/css",
+            b"body{}",
+        )]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.captures_written, 2);
+        assert_eq!(run.assets_stored, 2, "both captures reference the file");
+        assert_eq!(
+            engine.urls_fetched(),
+            ["https://example.com/style.css"],
+            "the shared file was asked for more than once"
+        );
+        assert_eq!(run.asset_fetches, 1);
+        let first = only_capture_of(&archive, "https://example.com/a");
+        let second = only_capture_of(&archive, "https://example.com/b");
+        assert_eq!(first.assets[0].body.sha256, second.assets[0].body.sha256);
+    }
+
+    /// A subresource that is gone is gone for every page of the site that references it, so
+    /// the answer is remembered exactly like a successful one. A run that asked again per page
+    /// would spend a request each time to be told the same thing.
+    #[test]
+    fn a_subresource_no_server_answered_is_recorded_and_asked_for_only_once() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let referencing = r#"<html><link rel="stylesheet" href="/gone.css"></html>"#;
+        let engine = ScriptedCrawlEngine::new(vec![
+            page("https://example.com/a", 200, referencing),
+            page("https://example.com/b", 200, referencing),
+        ]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.captures_written, 2, "the pages are archived regardless");
+        assert_eq!(run.assets_stored, 0);
+        assert_eq!(run.assets_missed, 2);
+        assert_eq!(run.asset_fetches, 1);
+        let capture = only_capture_of(&archive, "https://example.com/a");
+        assert_eq!(capture.assets_missed.len(), 1);
+        assert_eq!(capture.assets_missed[0].url, "https://example.com/gone.css");
+        assert!(matches!(
+            capture.assets_missed[0].reason,
+            AssetMiss::NoResponse { .. }
+        ));
+    }
+
+    /// Half a stylesheet is not a stylesheet, and a subresource record has nowhere to say the
+    /// bytes are partial, so it is refused rather than stored as though it were whole. A page
+    /// in the same state is kept, because a page cut short is still the page.
+    #[test]
+    fn a_subresource_that_arrived_short_is_not_stored_as_if_it_were_whole() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut cut_short = subresource("https://example.com/style.css", "text/css", b"body{col");
+        response_of(&mut cut_short).body_truncated = true;
+        let engine =
+            ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, STYLED_PAGE)])
+                .serving(vec![cut_short]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.assets_stored, 0, "the logo was never served either");
+        let capture = only_capture_of(&archive, "https://example.com/a");
+        let short = capture
+            .assets_missed
+            .iter()
+            .find(|missed| missed.url == "https://example.com/style.css")
+            .expect("the stylesheet is reported");
+        assert_eq!(short.reason, AssetMiss::ArrivedShort { byte_len: 8 });
+    }
+
+    /// The same guard the pages get, one hop further in. A public page whose stylesheet
+    /// redirects into the machine the archive runs on is the same request as a seed pointed
+    /// there, and the durable half of the harm is the bytes that would be written.
+    #[test]
+    fn a_subresource_that_ended_inside_a_network_is_refused() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut redirected = subresource("https://example.com/style.css", "text/css", b"body{}");
+        response_of(&mut redirected).final_url = "http://169.254.169.254/latest/".to_owned();
+        let engine =
+            ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, STYLED_PAGE)])
+                .serving(vec![redirected]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.captures_written, 1);
+        assert_eq!(run.assets_stored, 0);
+        let capture = only_capture_of(&archive, "https://example.com/a");
+        let refused = capture
+            .assets_missed
+            .iter()
+            .find(|missed| missed.url == "https://example.com/style.css")
+            .expect("the stylesheet is reported");
+        assert_eq!(refused.reason, AssetMiss::InsideANetwork);
+    }
+
+    /// The other side of that guard: archiving a site served locally is the whole reason the
+    /// flag exists, and a local site's stylesheet is on the same local address.
+    #[test]
+    fn a_run_that_asked_for_local_addresses_still_gets_their_subresources() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut local = page("http://127.0.0.1:8000/a", 200, STYLED_PAGE);
+        response_of(&mut local).final_url = "http://127.0.0.1:8000/a".to_owned();
+        let engine = ScriptedCrawlEngine::new(vec![local]).serving(vec![subresource(
+            "http://127.0.0.1:8000/style.css",
+            "text/css",
+            b"body{}",
+        )]);
+        let mut seed = Seed::new("http://127.0.0.1:8000/");
+        seed.allow_private_addresses = true;
+
+        let run = capture_seed(&engine, &archive, &seed).expect("the run completes");
+
+        assert_eq!(run.assets_stored, 1);
+        let capture = only_capture_of(&archive, "http://127.0.0.1:8000/a");
+        assert_eq!(
+            capture.assets[0].final_url,
+            "http://127.0.0.1:8000/style.css"
+        );
+    }
+
+    /// A run out of time stops asking. The page is archived either way, and a subresource is
+    /// the cheapest thing in a run to give up on, so the budget is read plainly here rather
+    /// than with the margin the backstop over the engine allows itself.
+    #[test]
+    fn a_run_out_of_time_stops_asking_for_subresources_and_says_so() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine =
+            ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, STYLED_PAGE)])
+                .serving(vec![subresource(
+                    "https://example.com/style.css",
+                    "text/css",
+                    b"body{}",
+                )]);
+        let mut seed = Seed::new("https://example.com/");
+        seed.deadline = Some(Duration::ZERO);
+
+        let run = capture_seed(&engine, &archive, &seed).expect("the run completes");
+
+        assert_eq!(run.captures_written, 1);
+        assert_eq!(
+            run.asset_fetches, 0,
+            "the run asked for a file it had no time for"
+        );
+        let capture = only_capture_of(&archive, "https://example.com/a");
+        assert_eq!(capture.assets_missed.len(), 2);
+        assert!(
+            capture
+                .assets_missed
+                .iter()
+                .all(|missed| missed.reason == AssetMiss::DeadlineReached),
+            "{:#?}",
+            capture.assets_missed
+        );
+    }
+
+    /// A capture that is not a page references nothing, and neither does one whose markup the
+    /// extractor could not read: the references live in the part it failed on.
+    #[test]
+    fn a_capture_with_no_reading_of_it_asks_for_nothing() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut image = page("https://example.com/logo.png", 200, "not markup");
+        response_of(&mut image).headers = vec![Header {
+            name: "content-type".to_owned(),
+            value: "image/png".to_owned(),
+        }];
+        let engine = ScriptedCrawlEngine::new(vec![image]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.captures_written, 1);
+        assert_eq!(run.asset_fetches, 0);
+        assert_eq!(run.assets_missed, 0);
+    }
+
+    /// A page that references more files than a capture holds is a page the ceiling was
+    /// written for, and the tail of it is recorded rather than dropped quietly. Nothing past
+    /// the ceiling is asked for: refusing after fetching would spend the requests anyway.
+    #[test]
+    fn a_page_referencing_more_files_than_a_capture_holds_records_the_tail() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let references = 130;
+        let mut markup = String::from("<html><body>");
+        let mut served = Vec::new();
+        for index in 0..references {
+            markup.push_str(&format!(r#"<img src="/{index}.png">"#));
+            served.push(subresource(
+                &format!("https://example.com/{index}.png"),
+                "image/png",
+                format!("{index}").as_bytes(),
+            ));
+        }
+        markup.push_str("</body></html>");
+        let engine = ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, &markup)])
+            .serving(served);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        let capture = only_capture_of(&archive, "https://example.com/a");
+        assert_eq!(capture.assets.len(), 128);
+        assert_eq!(capture.assets_missed.len(), references - 128);
+        assert_eq!(run.asset_fetches, 128, "a refused file was fetched anyway");
+        assert!(
+            capture
+                .assets_missed
+                .iter()
+                .all(|missed| missed.reason == AssetMiss::CountCeilingReached)
+        );
+    }
+
+    /// A page referencing a host that accepts connections and says nothing is what holds the
+    /// whole pipeline: the pass runs inside the callback the crawl hands pages through, so every
+    /// request it waits out is time the engine spends fetching pages nothing is reading. After
+    /// enough silence the capture stops asking, and what it did not ask for says so.
+    #[test]
+    fn a_capture_stops_asking_once_nothing_is_answering() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut markup = String::from("<html><body>");
+        for index in 0..6 {
+            markup.push_str(&format!(r#"<img src="/{index}.png">"#));
+        }
+        markup.push_str("</body></html>");
+        // The last reference would have answered, and the point is that it is never asked.
+        let engine = ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, &markup)])
+            .serving(vec![subresource(
+                "https://example.com/5.png",
+                "image/png",
+                b"\x89PNG",
+            )]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.captures_written, 1);
+        assert_eq!(run.assets_stored, 0);
+        assert_eq!(
+            run.asset_fetches, 3,
+            "the capture kept waiting on a host that was not answering"
+        );
+        let capture = only_capture_of(&archive, "https://example.com/a");
+        let reasons: Vec<&AssetMiss> = capture
+            .assets_missed
+            .iter()
+            .map(|missed| &missed.reason)
+            .collect();
+        assert!(
+            matches!(
+                reasons.as_slice(),
+                [
+                    AssetMiss::NoResponse { .. },
+                    AssetMiss::NoResponse { .. },
+                    AssetMiss::NoResponse { .. },
+                    AssetMiss::NothingWasAnswering,
+                    AssetMiss::NothingWasAnswering,
+                    AssetMiss::NothingWasAnswering,
+                ]
+            ),
+            "{reasons:#?}"
+        );
+    }
+
+    /// Silence has to be consecutive to mean anything. A host that answers between two failures
+    /// is answering, and a page that references a couple of files that are gone is an ordinary
+    /// page rather than a reason to stop capturing it.
+    #[test]
+    fn a_host_that_answers_between_failures_is_not_taken_for_a_dead_one() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/a",
+            200,
+            r#"<html><body><img src="/gone-1.png"><img src="/gone-2.png"><img src="/here.png">
+               <img src="/gone-3.png"><img src="/gone-4.png"><img src="/also-here.png"></body></html>"#,
+        )])
+        .serving(vec![
+            subresource("https://example.com/here.png", "image/png", b"\x89PNG1"),
+            subresource("https://example.com/also-here.png", "image/png", b"\x89PNG2"),
+        ]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.assets_stored, 2);
+        assert_eq!(run.asset_fetches, 6, "a reference was never asked for");
+        let capture = only_capture_of(&archive, "https://example.com/a");
+        assert!(
+            capture
+                .assets_missed
+                .iter()
+                .all(|missed| matches!(missed.reason, AssetMiss::NoResponse { .. })),
+            "{:#?}",
+            capture.assets_missed
+        );
+    }
+
+    /// A refusal that never became a request cost no wait, so it is not silence. Counting it
+    /// would let a page full of addresses this archive will not dial stop it from capturing the
+    /// files that are perfectly reachable further down the same page.
+    #[test]
+    fn a_reference_refused_before_being_dialled_is_not_counted_as_silence() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/a",
+            200,
+            r#"<html><body><img src="http://127.0.0.1/1.png"><img src="http://10.0.0.1/2.png">
+               <img src="http://[::1]/3.png"><img src="http://169.254.169.254/4.png">
+               <img src="/here.png"></body></html>"#,
+        )])
+        .serving(vec![subresource(
+            "https://example.com/here.png",
+            "image/png",
+            b"\x89PNG",
+        )]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.assets_stored, 1);
+        assert_eq!(run.asset_fetches, 1);
+        assert_eq!(run.assets_missed, 4);
+    }
+
+    /// The ceiling on bytes counts what came over the wire, not what was kept, and this is the
+    /// page that tells the two apart: every file on it is just over the size one subresource
+    /// may spend, so nothing is ever stored. A ceiling that counted stored bytes would sit at
+    /// zero forever while the run transferred a gigabyte per page.
+    #[test]
+    fn a_page_of_oversized_files_stops_costing_transfers_at_the_ceiling() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let oversized = vec![b'x'; 8 * 1024 * 1024 + 1];
+        let mut markup = String::from("<html><body>");
+        let mut served = Vec::new();
+        for index in 0..5 {
+            markup.push_str(&format!(r#"<img src="/{index}.png">"#));
+            served.push(subresource(
+                &format!("https://example.com/{index}.png"),
+                "image/png",
+                &oversized,
+            ));
+        }
+        markup.push_str("</body></html>");
+        let engine = ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, &markup)])
+            .serving(served);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.assets_stored, 0);
+        // Four transfers of eight megabytes crosses the thirty-two the capture may spend, and
+        // the overshoot is one file rather than every remaining reference.
+        assert_eq!(
+            run.asset_fetches, 4,
+            "a refused transfer was not charged to the capture"
+        );
+        let capture = only_capture_of(&archive, "https://example.com/a");
+        let reasons: Vec<&AssetMiss> = capture
+            .assets_missed
+            .iter()
+            .map(|missed| &missed.reason)
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                &AssetMiss::TooLarge {
+                    byte_len: 8 * 1024 * 1024 + 1
+                },
+                &AssetMiss::TooLarge {
+                    byte_len: 8 * 1024 * 1024 + 1
+                },
+                &AssetMiss::TooLarge {
+                    byte_len: 8 * 1024 * 1024 + 1
+                },
+                &AssetMiss::TooLarge {
+                    byte_len: 8 * 1024 * 1024 + 1
+                },
+                &AssetMiss::ByteCeilingReached,
+            ]
+        );
+    }
+
+    /// An address the archive can judge on its own is refused without a request. Asking the
+    /// engine would spend a call that never leaves the machine and come back as a reason to be
+    /// read out of an error string.
+    #[test]
+    fn a_reference_pointing_inside_a_network_is_refused_without_being_asked_for() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/a",
+            200,
+            r#"<html><link rel="stylesheet" href="http://169.254.169.254/latest/"></html>"#,
+        )]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.asset_fetches, 0);
+        assert!(engine.urls_fetched().is_empty());
+        let capture = only_capture_of(&archive, "https://example.com/a");
+        assert_eq!(capture.assets_missed[0].reason, AssetMiss::InsideANetwork);
+    }
+
+    /// The shape an archiver is aimed at something with: one page, a thousand addresses on a
+    /// host somebody else picked, none of them answering. It is also where all three bounds meet,
+    /// so what each one refused is asserted rather than only the total.
+    #[test]
+    fn a_page_referencing_a_thousand_dead_addresses_costs_three_requests() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut markup = String::from("<html><body>");
+        for index in 0..1_000 {
+            markup.push_str(&format!(
+                r#"<img src="https://victim.example/{index}.png">"#
+            ));
+        }
+        markup.push_str("</body></html>");
+        let engine = ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, &markup)]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.assets_stored, 0);
+        assert_eq!(
+            run.asset_fetches, 3,
+            "the run kept asking a host that had answered nothing three times over"
+        );
+        let capture = only_capture_of(&archive, "https://example.com/a");
+        let counted = |wanted: &AssetMiss| {
+            capture
+                .assets_missed
+                .iter()
+                .filter(|missed| {
+                    std::mem::discriminant(&missed.reason) == std::mem::discriminant(wanted)
+                })
+                .count()
+        };
+        // Three requests, then the capture stops asking, and the count ceiling takes over from
+        // there: it is what keeps the record itself from growing with a page's ambitions.
+        assert_eq!(
+            counted(&AssetMiss::NoResponse {
+                detail: String::new()
+            }),
+            3
+        );
+        assert_eq!(counted(&AssetMiss::NothingWasAnswering), 125);
+        assert_eq!(counted(&AssetMiss::CountCeilingReached), 872);
+        assert_eq!(capture.assets_missed.len(), 1_000);
     }
 }

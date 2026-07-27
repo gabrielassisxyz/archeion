@@ -36,7 +36,7 @@ Adding this file to an archive is a compatible change and does not move the form
 
 The raw `<meta>` list and the JSON-LD blocks are kept on top of the resolved fields, and that is deliberate duplication. They are small, they answer "where did that come from" without re-reading the body, and they let a field nobody has thought of yet be recovered from records already written.
 
-Nothing here has been fetched. The subresource list is an inventory of what the page referenced, which is the input a later asset capture works from.
+Nothing here has been fetched. The subresource list is an inventory of what the page referenced, and it is the input the asset pass works from: [`asset-capture.md`](asset-capture.md) has what that pass does with it, and what it is allowed to spend.
 
 ## The precedence rules, and why each one is that way
 

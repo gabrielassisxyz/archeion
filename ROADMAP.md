@@ -11,15 +11,16 @@ Direction, not a schedule. It answers three questions for someone arriving at th
 - The execution policy. A seed carries a wall-clock deadline, a ceiling on one request and a retry budget, so no single host can own a whole run and a run that ends early says whether it ran out of pages, of time, or of patience with a disk. [`docs/crawl-boundary.md`](docs/crawl-boundary.md) has where each of the three is enforced and why the deadline is enforced twice.
 - The guards on the fetch path. A seed cannot point at loopback, a private range, link-local or a cloud metadata service unless the run asks for it, a redirect is screened, bounded, and recorded rather than followed once it leaves the host the run was pointed at, one response is capped at sixty-four megabytes so an endless one cannot take the run down with it, and a body that arrived short is recorded as short instead of passing for the whole page. [`docs/crawl-boundary.md`](docs/crawl-boundary.md) has each guard, what it does not cover, and why the one gap that is left needs a resolving connector rather than another check.
 - Metadata extraction. Every page the crawl archives is read once as it is filed: title, author, publication date, description, the OpenGraph and schema.org tags behind them, the address the page claims for itself, its outbound links and the subresources it references. The reading is stored beside the capture rather than inside it, so a better extractor can rewrite the whole derived layer later without touching a single recorded response. [`docs/metadata-extraction.md`](docs/metadata-extraction.md) has the precedence rules, the ceilings a hostile page runs into, and what was left out.
+- Asset capture. The images, stylesheets, scripts and media a page needs to still make sense once the source is gone are fetched beside it, stored once however many pages reference them, and bounded: a count of references one capture deals with, a size for one file and for all of them together, and the run's own deadline. What the archive did not get is in the record with the reason, so an absence says whether a number would have kept the page whole. [`docs/asset-capture.md`](docs/asset-capture.md) has the numbers, the guards on an address a page chose, and what was left out.
 - Canonicalization and dedupe. Every spelling of a page reduces to one address, so `www.example.com` and `example.com` are one item and a campaign parameter does not make a second one, while identical bytes stay one stored file however many captures reference them. [`docs/canonicalization.md`](docs/canonicalization.md) has the rules, the ones deliberately rejected, and the reason a lossy rule is safe to apply.
 
 ## What is missing
 
 Roughly in dependency order, since each item unlocks the next.
 
-1. **Asset capture.** The images, stylesheets and media a page needs to still make sense once the source is gone. What each page references is already recorded; nothing fetches it yet.
-2. **Query and export.** An index over the collection, and an export format that outlives this tool.
-3. **Readability extraction.** Article text separated from page furniture, kept alongside the raw response and never in place of it.
+1. **Query and export.** An index over the collection, and an export format that outlives this tool.
+2. **Readability extraction.** Article text separated from page furniture, kept alongside the raw response and never in place of it.
+3. **A pass over an existing archive.** Re-reading stored responses with a better extractor, and fetching the subresources a capture already on disk never got. Both work from records the archive already holds, so neither needs a crawl.
 
 ## Out of scope
 

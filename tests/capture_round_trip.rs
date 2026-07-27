@@ -4,7 +4,10 @@
 
 use archeion::CanonicalUrl;
 use archeion::metadata::{self, PageMetadata, PageSource};
-use archeion::storage::{Archive, ContentHash, Header, ItemId, NewAsset, NewCapture, StorageError};
+use archeion::storage::{
+    Archive, AssetMiss, ContentHash, Header, ItemId, MissedAsset, NewAsset, NewCapture,
+    StorageError,
+};
 use jiff::Timestamp;
 use tempfile::TempDir;
 
@@ -15,7 +18,24 @@ fn at(instant: &str) -> Timestamp {
     instant.parse().expect("test timestamp is valid")
 }
 
-fn page_capture(url: &CanonicalUrl, fetched_at: Timestamp, body: &[u8]) -> NewCapture {
+/// A capture of a page that needed one stylesheet. The subresource is stored before the
+/// capture that references it, which is the order the store asks for: a record pointing at
+/// bytes that are not there is the one shape a run cut short must not leave behind.
+fn page_capture(
+    archive: &Archive,
+    url: &CanonicalUrl,
+    fetched_at: Timestamp,
+    body: &[u8],
+) -> NewCapture {
+    let stylesheet = archive
+        .store_asset(&NewAsset {
+            requested_url: "https://example.com/style.css".to_owned(),
+            final_url: "https://example.com/style.css".to_owned(),
+            status: 200,
+            media_type: Some("text/css".to_owned()),
+            body: STYLESHEET.to_vec(),
+        })
+        .expect("the stylesheet is stored");
     NewCapture {
         canonical_url: url.clone(),
         requested_url: "http://example.com/a-page".to_owned(),
@@ -29,13 +49,8 @@ fn page_capture(url: &CanonicalUrl, fetched_at: Timestamp, body: &[u8]) -> NewCa
         body: body.to_vec(),
         body_truncated: false,
         fetched_at,
-        assets: vec![NewAsset {
-            requested_url: "https://example.com/style.css".to_owned(),
-            final_url: "https://example.com/style.css".to_owned(),
-            status: 200,
-            media_type: Some("text/css".to_owned()),
-            body: STYLESHEET.to_vec(),
-        }],
+        assets: vec![stylesheet],
+        assets_missed: Vec::new(),
     }
 }
 
@@ -50,7 +65,12 @@ fn a_capture_survives_a_write_and_a_read() {
     let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
 
     let written = archive
-        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
         .expect("capture is stored");
     let read_back = archive
         .read_capture(&url, &written.id)
@@ -78,7 +98,12 @@ fn the_item_record_names_the_url_its_directory_only_hashes() {
     let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
 
     archive
-        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
         .expect("capture is stored");
     let item = archive.read_item(&url).expect("item is found");
 
@@ -95,7 +120,12 @@ fn the_layout_on_disk_is_the_documented_one() {
     let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
 
     let capture = archive
-        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
         .expect("capture is stored");
 
     let item_dir = dir
@@ -130,10 +160,20 @@ fn recapturing_unchanged_bytes_adds_a_capture_and_not_a_copy() {
     let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
 
     archive
-        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
         .expect("first capture");
     archive
-        .write_capture(page_capture(&url, at("2026-08-01T09:00:00Z"), PAGE))
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-08-01T09:00:00Z"),
+            PAGE,
+        ))
         .expect("second capture");
 
     let captures = archive.list_captures(&url).expect("captures are listed");
@@ -167,7 +207,7 @@ fn every_spelling_of_a_page_lands_on_one_item() {
     for (spelling, fetched_at) in spellings {
         let url = CanonicalUrl::parse(spelling).expect("valid url");
         archive
-            .write_capture(page_capture(&url, at(fetched_at), PAGE))
+            .write_capture(page_capture(&archive, &url, at(fetched_at), PAGE))
             .expect("capture is stored");
     }
 
@@ -193,10 +233,16 @@ fn a_backfilled_older_capture_widens_the_item_window() {
     let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
 
     archive
-        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
         .expect("first capture");
     archive
         .write_capture(page_capture(
+            &archive,
             &url,
             at("2026-01-04T08:00:00Z"),
             b"<html>older</html>",
@@ -216,7 +262,12 @@ fn asking_for_what_was_never_archived_says_so() {
     let other = CanonicalUrl::parse("https://example.com/never-fetched").expect("valid url");
 
     let capture = archive
-        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
         .expect("capture is stored");
 
     assert!(matches!(
@@ -248,8 +299,14 @@ fn a_directory_holding_something_else_is_not_adopted_as_an_archive() {
 fn reopening_an_archive_keeps_reading_what_is_in_it() {
     let dir = TempDir::new().expect("temp dir");
     let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
-    let capture = archive_in(&dir)
-        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+    let archive = archive_in(&dir);
+    let capture = archive
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
         .expect("capture is stored");
 
     let reopened = Archive::open(dir.path()).expect("an existing archive opens again");
@@ -305,9 +362,9 @@ fn two_fetches_in_the_same_second_with_the_same_bytes_stay_two_captures() {
     // A retry inside the same second can return identical bytes under a different status,
     // and the archive has to keep both: the pair is the evidence of what happened.
     let served = archive
-        .write_capture(page_capture(&url, moment, PAGE))
+        .write_capture(page_capture(&archive, &url, moment, PAGE))
         .expect("first capture");
-    let mut failed = page_capture(&url, moment, PAGE);
+    let mut failed = page_capture(&archive, &url, moment, PAGE);
     failed.status = 503;
     let failed = archive.write_capture(failed).expect("second capture");
 
@@ -333,9 +390,9 @@ fn a_body_that_arrived_short_is_not_filed_over_the_complete_one() {
     let moment = at("2026-07-25T14:03:22Z");
 
     let complete = archive
-        .write_capture(page_capture(&url, moment, PAGE))
+        .write_capture(page_capture(&archive, &url, moment, PAGE))
         .expect("complete capture");
-    let mut short = page_capture(&url, moment, PAGE);
+    let mut short = page_capture(&archive, &url, moment, PAGE);
     short.body_truncated = true;
     let short = archive.write_capture(short).expect("short capture");
 
@@ -357,7 +414,12 @@ fn a_record_written_before_the_field_existed_still_reads() {
     let archive = archive_in(&dir);
     let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
     let capture = archive
-        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
         .expect("capture is stored");
 
     let path = capture_file(dir.path(), &url, &capture.id);
@@ -379,6 +441,116 @@ fn a_record_written_before_the_field_existed_still_reads() {
     assert!(!read_back.body_truncated);
 }
 
+/// What the capture does not hold is part of the capture. A reader who compares the
+/// subresources a page referenced against the ones stored beside it can see that one is
+/// gone, and has no way to tell an archive that refused it from a server that never sent it.
+#[test]
+fn a_subresource_the_capture_never_got_is_recorded_with_the_reason_it_is_missing() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+
+    let mut incomplete = page_capture(&archive, &url, at("2026-07-25T14:03:22Z"), PAGE);
+    incomplete.assets_missed = vec![
+        MissedAsset {
+            url: "https://example.com/hero.png".to_owned(),
+            reason: AssetMiss::TooLarge {
+                byte_len: 41_943_040,
+            },
+        },
+        MissedAsset {
+            url: "https://cdn.example.net/app.js".to_owned(),
+            reason: AssetMiss::NoResponse {
+                detail: "error sending request: dns error".to_owned(),
+            },
+        },
+    ];
+    let expected = incomplete.assets_missed.clone();
+    let written = archive
+        .write_capture(incomplete)
+        .expect("capture is stored");
+
+    let read_back = archive
+        .read_capture(&url, &written.id)
+        .expect("capture is found");
+    assert_eq!(read_back.assets_missed, expected);
+    assert_eq!(read_back.assets.len(), 1, "the stylesheet was stored");
+}
+
+/// Two captures that hold different subresources are different captures, even when the bytes
+/// of those subresources are identical. A site's tracking pixels are the ordinary case of two
+/// addresses serving the same bytes, so a name derived from the bytes alone would file the
+/// capture that got the second one on top of the capture that got the first.
+#[test]
+fn two_captures_holding_different_subresources_with_identical_bytes_stay_two_captures() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+    let moment = at("2026-07-25T14:03:22Z");
+    let pixel = |address: &str| {
+        archive
+            .store_asset(&NewAsset {
+                requested_url: address.to_owned(),
+                final_url: address.to_owned(),
+                status: 200,
+                media_type: Some("image/gif".to_owned()),
+                body: b"GIF89a".to_vec(),
+            })
+            .expect("the pixel is stored")
+    };
+
+    let mut first = page_capture(&archive, &url, moment, PAGE);
+    first.assets = vec![pixel("https://example.com/px1.gif")];
+    let first = archive.write_capture(first).expect("first capture");
+    let mut second = page_capture(&archive, &url, moment, PAGE);
+    second.assets = vec![pixel("https://example.com/px2.gif")];
+    let second = archive.write_capture(second).expect("second capture");
+
+    assert_ne!(first.id, second.id);
+    assert_eq!(archive.list_captures(&url).expect("listing").len(), 2);
+    assert_eq!(
+        archive
+            .read_capture(&url, &first.id)
+            .expect("the first capture survived the second")
+            .assets[0]
+            .final_url,
+        "https://example.com/px1.gif"
+    );
+}
+
+/// The ordinary capture got everything, and its record says nothing about misses rather than
+/// carrying an empty list for something that did not happen. It is the same shape a record
+/// written before the archive tracked this has, which is why nothing has to be migrated.
+#[test]
+fn a_capture_that_missed_nothing_carries_no_list_of_misses() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+
+    let capture = archive
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
+        .expect("capture is stored");
+
+    let record =
+        std::fs::read_to_string(capture_file(dir.path(), &url, &capture.id)).expect("read record");
+    assert!(
+        !record.contains("assets_missed"),
+        "a capture that missed nothing wrote a list of misses: {record}"
+    );
+    assert!(
+        archive
+            .read_capture(&url, &capture.id)
+            .expect("capture is found")
+            .assets_missed
+            .is_empty()
+    );
+}
+
 #[test]
 fn writing_the_very_same_capture_twice_is_idempotent() {
     let dir = TempDir::new().expect("temp dir");
@@ -387,10 +559,10 @@ fn writing_the_very_same_capture_twice_is_idempotent() {
     let moment = at("2026-07-25T14:03:22Z");
 
     let first = archive
-        .write_capture(page_capture(&url, moment, PAGE))
+        .write_capture(page_capture(&archive, &url, moment, PAGE))
         .expect("first capture");
     let again = archive
-        .write_capture(page_capture(&url, moment, PAGE))
+        .write_capture(page_capture(&archive, &url, moment, PAGE))
         .expect("same capture again");
 
     assert_eq!(first, again);
@@ -403,7 +575,12 @@ fn a_record_edited_to_point_outside_the_archive_is_refused() {
     let archive = archive_in(&dir);
     let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
     let capture = archive
-        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
         .expect("capture is stored");
 
     // An archive is hostile input forever, not only while it is being written: the file
@@ -428,7 +605,12 @@ fn a_body_that_no_longer_matches_its_name_is_reported_and_not_returned() {
     let archive = archive_in(&dir);
     let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
     let capture = archive
-        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
         .expect("capture is stored");
 
     let hash = capture.body.sha256.clone();
@@ -481,7 +663,12 @@ fn an_address_host_lands_in_a_directory_a_filesystem_accepts() {
     let url = CanonicalUrl::parse("http://[2001:db8::1]/a-page").expect("valid url");
 
     archive
-        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
         .expect("capture is stored");
 
     assert!(
@@ -502,7 +689,12 @@ fn what_was_read_out_of_a_page_is_stored_beside_it_and_not_inside_it() {
     let archive = archive_in(&dir);
     let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
     let capture = archive
-        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
         .expect("capture is stored");
 
     let extracted = extracted_from(PAGE);
@@ -528,7 +720,12 @@ fn a_derived_record_is_not_mistaken_for_a_capture() {
     let archive = archive_in(&dir);
     let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
     let capture = archive
-        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
         .expect("capture is stored");
 
     archive
@@ -547,7 +744,12 @@ fn a_capture_nothing_was_read_out_of_is_not_a_broken_archive() {
     let archive = archive_in(&dir);
     let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
     let capture = archive
-        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
         .expect("capture is stored");
 
     assert_eq!(
@@ -564,7 +766,12 @@ fn a_derived_record_edited_to_hold_something_else_is_refused() {
     let archive = archive_in(&dir);
     let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
     let capture = archive
-        .write_capture(page_capture(&url, at("2026-07-25T14:03:22Z"), PAGE))
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
         .expect("capture is stored");
     archive
         .write_metadata(&url, &capture.id, &extracted_from(PAGE))

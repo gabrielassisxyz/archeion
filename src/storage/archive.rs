@@ -517,9 +517,7 @@ fn fingerprint_of(new: &NewCapture, body: &ContentHash) -> ContentHash {
     ContentHash::of(&buffer)
 }
 
-pub(super) fn read_optional_json<T: DeserializeOwned>(
-    path: &Path,
-) -> Result<Option<T>, StorageError> {
+fn read_optional_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, StorageError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),

@@ -1,0 +1,17 @@
+{
+  "why": "A hand-written page with no semantic element and no useful class name anywhere: nothing marks the article, so only the scoring can find it. There is also no h1, so the heading in the output can only come from the title handed in.",
+  "is_article": true,
+  "title": "notes on rewriting the indexer",
+  "must_contain": [
+    "roughly forty times faster",
+    "once per document",
+    "Waste that is invisible is still waste",
+    "What changed was the floor underneath it"
+  ],
+  "must_not_contain": [
+    "no analytics, no tracking",
+    "older posts"
+  ],
+  "heading_levels": [1],
+  "word_count": { "min": 200, "max": 350 }
+}

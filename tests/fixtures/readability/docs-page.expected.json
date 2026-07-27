@@ -1,0 +1,20 @@
+{
+  "why": "Documentation, where the furniture is larger than on a blog and the content that must survive is not only prose: code blocks and a table carry the answer the page exists to give.",
+  "is_article": true,
+  "title": "Configuring retries",
+  "must_contain": [
+    "retries a request when the failure looks transient",
+    "backoff_base_ms=200",
+    "429 Too Many Requests",
+    "two nested retry loops multiply rather than add",
+    "client = Widget(retries=0)"
+  ],
+  "must_not_contain": [
+    "Migrating from v1",
+    "Was this page helpful?",
+    "Edit this page on GitHub",
+    "Search docs"
+  ],
+  "heading_levels": [1, 2, 2, 2, 3],
+  "word_count": { "min": 150, "max": 350 }
+}

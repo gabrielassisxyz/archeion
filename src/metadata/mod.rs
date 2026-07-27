@@ -13,6 +13,8 @@ mod model;
 mod resolve;
 mod scan;
 
+use std::borrow::Cow;
+
 pub use model::{
     AssetKind, Attributed, Bound, EXTRACTOR_VERSION, MetaTag, MetadataSource, OutboundLink,
     PageMetadata, PublicationDate, ReferencedAsset,
@@ -53,17 +55,27 @@ pub struct PageSource<'a> {
 /// `Ok(None)` means the capture is not a page: an image or a PDF has nothing this reads,
 /// and recording an empty result for it would fill the archive with files saying nothing.
 pub fn extract(source: PageSource<'_>) -> Result<Option<PageMetadata>, UnreadablePage> {
-    let (media_type, charset) = split_content_type(source.content_type);
-    if !media_type.is_some_and(|media_type| HTML_MEDIA_TYPES.contains(&media_type.as_str())) {
+    let Some(html) = decoded_html(source) else {
         return Ok(None);
-    }
-
-    let html = decode::decode_html(source.body, charset.as_deref());
+    };
     let scanned = scan::scan(&html).map_err(|reason| UnreadablePage {
         url: source.final_url.to_owned(),
         reason: reason.to_string(),
     })?;
     Ok(Some(resolve::resolve(scanned, source.final_url)))
+}
+
+/// The page's markup as text, or `None` when the capture is not a page at all.
+///
+/// Both extractors that read a captured page start here, so the list of media types worth
+/// reading and the encoding rules are decided once. Readability builds a tree where this
+/// module reads a token stream, but which bytes are markup and how to turn them into text is
+/// the same question for both, and answering it twice is how the two would drift apart.
+pub(crate) fn decoded_html(source: PageSource<'_>) -> Option<Cow<'_, str>> {
+    let (media_type, charset) = split_content_type(source.content_type);
+    media_type
+        .is_some_and(|media_type| HTML_MEDIA_TYPES.contains(&media_type.as_str()))
+        .then(|| decode::decode_html(source.body, charset.as_deref()))
 }
 
 /// Splits `text/html; charset=utf-8` into the media type and the charset, both lowercased.

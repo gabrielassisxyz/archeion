@@ -1,0 +1,21 @@
+{
+  "why": "The conventional shape: semantic article, entry-content, and the widgets, comments and share buttons every blog carries around it.",
+  "is_article": true,
+  "title": "How to bake bread",
+  "must_contain": [
+    "Bread is mostly patience",
+    "500 g strong white flour",
+    "This does most of the kneading for you",
+    "Patience is an ingredient"
+  ],
+  "must_not_contain": [
+    "Subscribe to our newsletter",
+    "Ten pasta shapes",
+    "Leave a Reply",
+    "Great recipe, worked first time",
+    "Proudly powered by WordPress",
+    "Share this:"
+  ],
+  "heading_levels": [1, 2, 2, 3],
+  "word_count": { "min": 200, "max": 400 }
+}

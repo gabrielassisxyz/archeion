@@ -17,6 +17,7 @@ use serde::de::DeserializeOwned;
 use super::model::{
     Asset, Capture, CaptureId, ContentHash, Item, ItemId, NewAsset, NewCapture, StoredBody,
 };
+use super::walk::ArchiveWalk;
 use crate::canonical_url::CanonicalUrl;
 use crate::metadata::PageMetadata;
 use crate::readability::{Article, ArticleRecord};
@@ -272,6 +273,12 @@ impl Archive {
             markdown,
             record: stored.record,
         }))
+    }
+
+    /// Every item in the archive, read from the tree rather than from addresses a caller
+    /// already holds, together with whatever the tree held that is not one.
+    pub fn walk(&self) -> Result<ArchiveWalk, StorageError> {
+        super::walk::walk(&self.root)
     }
 
     pub fn read_item(&self, url: &CanonicalUrl) -> Result<Item, StorageError> {

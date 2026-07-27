@@ -2,7 +2,7 @@
 
 > Read before every interaction. Living spec: short, imperative. On every gotcha or decision, append one line here.
 
-> **What it is:** a local-first archival tool that captures web content and its metadata into a durable personal collection. **Calibration:** Tier 2 · Phase: work. External stakes are contained (single operator, no hosted service, no third-party data), personal stakes are high: this is a public developer tool meant to grow. Update the phase as the project moves work, then right, then fast; an agent reads this line to decide how much rigor a change deserves. **Review gate:** standard. One independent external opinion over the whole branch diff, exactly once, pre-push. No per-commit reviews. Escalating or de-escalating for one task is allowed and always announced, never silent.
+> **What it is:** a local-first archival tool that captures web content and its metadata into a durable personal collection. **Calibration:** Tier 2 · Phase: work. External stakes are contained (single operator, no hosted service, no third-party data), personal stakes are high: this is a public developer tool meant to grow. Update the phase as the project moves work, then right, then fast; an agent reads this line to decide how much rigor a change deserves. **Review gate:** standard. One independent opinion over the whole branch diff, exactly once, pre-push, run the way the Review section below describes. No per-commit reviews.
 
 ## Stack and commands
 
@@ -72,6 +72,15 @@
 - A server the test starts on loopback is the exception, and it is for guards that live inside a dependency and have no reachable entry point. It stays an exception: it costs a socket and a thread, and it is worth that only when asserting the configuration would prove the configuration rather than the behavior.
 - Before saying "done", run `bin/ci` and report the result.
 
+## Review
+
+- Before a branch is pushed, one opinion over its whole diff, exactly once. It is a fresh Claude Code instance, started from inside the worktree and given the diff to read.
+- The invocation is `claude --safe-mode -p '<prompt>' --allowedTools 'Read' 'Grep' 'Glob' 'Bash(git *)' 'Bash(cargo *)'`. Read-only on purpose: the reviewer reports, and the agent that wrote the code applies the fixes and decides which findings are wrong.
+- **`--safe-mode` is the point of the whole gate.** It starts with every customization off: this file, the skills, the hooks, the MCP servers. An opinion formed from the same instructions that shaped the work is not a second opinion, it is the same opinion with a new context window. The project's documents stay readable and the prompt names the ones that matter, because they are evidence about what the code promised rather than instructions about what to conclude.
+- The prompt states what changed and why, names the documents that say what the code is supposed to guarantee, and asks for concrete defects ranked by severity, each with the input that triggers it and the wrong result it produces. A finding with no failing case is an opinion about taste and is worth saying so.
+- Nothing is pushed until every finding is answered, by a fix or by a written reason it does not hold.
+- Escalating or de-escalating for one task is allowed and always announced, never silent.
+
 ## Small releases
 
 - Every commit on `main` passes `bin/ci` and is releasable. No "broken commit I fix in the next one".
@@ -119,6 +128,7 @@
 | An element's namespace is not what separates HTML from what a page embeds. An SVG `<title>` is an HTML integration point, so the parser reports it in the HTML namespace exactly as it reports the page's own title, and a rule written against `namespace_uri` reads as if it works because it does fire for MathML. An ancestor selector is what distinguishes them. | tripwire | partial: `a_page_with_only_a_graphic_title_has_no_title` in `src/metadata/mod.rs` |
 | Reading hostile markup has two costs that grow faster than the input: the tree parse is quadratic in the number of elements left open, and the readability scoring pass grows with nesting depth far faster than linearly. Each guard in `readability/document.rs` therefore has to run before the step it protects, and a guard moved after it still refuses the page while paying the whole cost. The byte ceiling bounds neither on its own. | tripwire | yes: each ceiling has a pair of tests at its boundary, and `markup_that_only_opens_elements_is_refused_before_a_tree_is_built` pins the ordering |
 | The release matrix names the runner labels `ubuntu-24.04-arm` and `macos-15-intel`. They are unverified until the first tag, and a wrong label fails the job at startup rather than at build time. | tripwire | none until the first release |
+| Changing a canonicalization rule silently unfiles every item already stored under the old spelling. The walk re-canonicalizes the address inside each record and refuses one that does not hash to the directory holding it, so those items stop appearing in anything built on the walk while the format version says nothing changed. A rule change is therefore a migration that rewrites the tree, on the same terms `docs/storage-model.md` sets for a field whose meaning changes. | tripwire | none, the reason is on `Misfiled` in `storage/walk.rs` |
 
 **A hurdle promoted to a gate is deleted from this table, not duplicated.** The gate is the instruction; a line here restating it only dilutes the ones still unguarded.
 

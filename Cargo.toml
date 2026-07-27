@@ -11,6 +11,7 @@ keywords = ["archive", "crawler", "metadata", "local-first"]
 categories = ["command-line-utilities"]
 
 [dependencies]
+clap = { version = "4.6.4", features = ["derive"] }
 dom_query = "0.28"
 dom_smoothie = "0.18"
 # Decoding a page's bytes is a separate decision from parsing its markup, so the encoding

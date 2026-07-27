@@ -6,7 +6,7 @@ Archeion captures a page, keeps the raw response exactly as it arrived, and reco
 
 ## Status
 
-Early, and honest about it: there is no usable command yet. Crawling a seed into an archive works as a library, with the engine behind an interface this project owns, but running `archeion` today prints that there is no command surface and exits. [`docs/storage-model.md`](docs/storage-model.md) describes what an archive on disk looks like, [`docs/crawl-boundary.md`](docs/crawl-boundary.md) what the archive asks a crawl engine for, and [`docs/asset-capture.md`](docs/asset-capture.md) how the files a page needs are acquired and what bounds that. [`ROADMAP.md`](ROADMAP.md) tracks what exists, what is missing, and what is deliberately out of scope.
+Early, and honest about it: `archeion list <archive>` reports what a collection already holds, with `--json` for JSONL output. Crawling a seed into an archive works as a library and example while the command surface for capture stays deliberately undecided. [`docs/storage-model.md`](docs/storage-model.md) describes what an archive on disk looks like, [`docs/crawl-boundary.md`](docs/crawl-boundary.md) what the archive asks a crawl engine for, and [`docs/asset-capture.md`](docs/asset-capture.md) how the files a page needs are acquired and what bounds that. [`ROADMAP.md`](ROADMAP.md) tracks what exists, what is missing, and what is deliberately out of scope.
 
 ## Install
 

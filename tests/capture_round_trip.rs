@@ -328,6 +328,55 @@ fn an_article_whose_document_never_landed_reads_as_absent() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn an_article_document_that_is_not_a_regular_file_is_refused_before_it_is_read() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+    let capture = archive
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
+        .expect("capture is stored");
+    let article = Article {
+        markdown: "# How to bake bread\n\nBread is mostly patience.".to_owned(),
+        record: ArticleRecord {
+            extractor_version: readability::EXTRACTOR_VERSION,
+            rules: ExtractionRules::Heuristic,
+            word_count: 5,
+            excerpt: Some("Bread is mostly patience.".to_owned()),
+            byline: None,
+            truncated: Vec::new(),
+            cost: AdmissionCost {
+                document_bytes: 4096,
+                peak_open_elements: 12,
+            },
+        },
+    };
+    archive
+        .write_article(&url, &capture.id, &article)
+        .expect("the article is stored");
+
+    let markdown_path = dir
+        .path()
+        .join("items")
+        .join("example.com")
+        .join(ItemId::of(&url).as_str())
+        .join("captures")
+        .join(format!("{}.article.md", capture.id));
+    std::fs::remove_file(&markdown_path).expect("the document is removed");
+    std::os::unix::fs::symlink("/dev/zero", &markdown_path).expect("the link is created");
+
+    assert!(matches!(
+        archive.read_article(&url, &capture.id),
+        Err(StorageError::RefusedRecord { path, .. }) if path == markdown_path
+    ));
+}
+
 #[test]
 fn recapturing_unchanged_bytes_adds_a_capture_and_not_a_copy() {
     let dir = TempDir::new().expect("temp dir");

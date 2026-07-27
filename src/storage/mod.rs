@@ -7,6 +7,6 @@ mod model;
 
 pub use archive::{Archive, StorageError};
 pub use model::{
-    Asset, Capture, CaptureId, ContentHash, Header, Item, ItemId, MalformedIdentifier, NewAsset,
-    NewCapture, StoredBody,
+    Asset, AssetMiss, Capture, CaptureId, ContentHash, Header, Item, ItemId, MalformedIdentifier,
+    MissedAsset, NewAsset, NewCapture, StoredBody,
 };

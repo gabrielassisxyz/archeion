@@ -237,6 +237,17 @@ pub struct Capture {
     pub body_truncated: bool,
     pub fetched_at: Timestamp,
     pub assets: Vec<Asset>,
+    /// Subresources the page referenced and the archive does not have, each with the reason.
+    ///
+    /// Without this the absence is readable but mute: a reader can see that the page
+    /// references twenty subresources and the capture holds twelve, and has no way to tell
+    /// the eight the archive refused from the eight a server never sent. The run reports the
+    /// same thing while it is running, and a run is over by the time anyone asks.
+    ///
+    /// Empty for a capture that got everything, which is the ordinary case, and for one
+    /// written before the archive recorded this.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assets_missed: Vec<MissedAsset>,
 }
 
 /// A subresource a capture needed. It is stored inside the capture rather than as a
@@ -251,9 +262,51 @@ pub struct Asset {
     pub body: StoredBody,
 }
 
-/// A capture before it is stored. It carries bytes where the stored record carries a
-/// hash, which is the whole difference between the two and the reason they are separate
-/// types rather than one type with optional fields.
+/// A subresource that was referenced and not stored, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissedAsset {
+    pub url: String,
+    /// Flattened, so the record reads as one object with a `reason` in it rather than as a
+    /// reason wrapped in a field also called reason.
+    #[serde(flatten)]
+    pub reason: AssetMiss,
+}
+
+/// Why a referenced subresource is not in the capture.
+///
+/// The distinction that matters is between what the archive decided and what the web did.
+/// A ceiling reached is a decision, and knowing which one was reached is what tells a reader
+/// whether raising a number would have kept the page whole. A response that never came is
+/// the web, and no number here would have changed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum AssetMiss {
+    /// No server answered, or the engine refused to dial the address at all.
+    NoResponse { detail: String },
+    /// The response was larger than one subresource may spend, so what arrived was dropped
+    /// rather than stored: half a stylesheet is not a stylesheet, and the size is kept
+    /// because it is what says how far over the ceiling the page was.
+    TooLarge { byte_len: u64 },
+    /// The capture had already stored as many subresources as one capture may hold.
+    CountCeilingReached,
+    /// The capture had already spent the bytes one capture may spend on subresources.
+    ByteCeilingReached,
+    /// The run's wall-clock budget was gone before this one was asked for.
+    DeadlineReached,
+    /// The reference ended on an address that exists only inside a network, which a run that
+    /// did not ask for those addresses had no business reaching.
+    InsideANetwork,
+}
+
+/// A capture before it is stored. It carries the page's bytes where the stored record
+/// carries a hash, which is the whole difference between the two and the reason they are
+/// separate types rather than one type with optional fields.
+///
+/// Its subresources arrive already stored, as records. They are shared, so the run that
+/// captured them stores each set of bytes once and hands the same record to every capture
+/// that referenced it: keeping the bytes here instead would mean carrying a site's
+/// stylesheets in memory for as long as the run lasts, to write files that are already
+/// there.
 #[derive(Debug, Clone)]
 pub struct NewCapture {
     pub canonical_url: CanonicalUrl,
@@ -267,9 +320,11 @@ pub struct NewCapture {
     /// The clock is an input rather than something the store reads, so the same capture
     /// written twice produces the same record and a test needs no clock of its own.
     pub fetched_at: Timestamp,
-    pub assets: Vec<NewAsset>,
+    pub assets: Vec<Asset>,
+    pub assets_missed: Vec<MissedAsset>,
 }
 
+/// A subresource that was fetched and not yet stored.
 #[derive(Debug, Clone)]
 pub struct NewAsset {
     pub requested_url: String,

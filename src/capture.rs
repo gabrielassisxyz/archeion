@@ -235,6 +235,7 @@ fn new_capture(canonical_url: CanonicalUrl, page: PageResponse) -> NewCapture {
         fetched_at: page.fetched_at,
         // Assets are captured by their own pass over the page, which does not exist yet.
         assets: Vec::new(),
+        assets_missed: Vec::new(),
     }
 }
 

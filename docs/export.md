@@ -18,6 +18,24 @@ The destination must resolve to an absent or empty directory. Exporting over an 
 
 The command prints the number of notes it wrote. If part of the archive is unreadable, export still writes the intact items, warns about the damaged paths and exits non-zero.
 
+## Assets
+
+Images referenced by an exported article body are copied to:
+
+```text
+<destination>/assets/<sha256>.<ext>
+```
+
+The note is rewritten to point at that file with a relative path from the note's host directory, for example `../assets/<sha256>.png`. The name is the content hash of the stored body, so the export keeps the archive's dedupe property and never derives an asset filename from remote data.
+
+Only successful image responses are carried into the vault, and only when the article Markdown actually references the captured asset. A stylesheet, script, icon or PDF can exist in the capture record and still stay out of the export, because those files have no article-body meaning in a Markdown vault. An unreferenced captured image also stays out of the export.
+
+The extension comes from the recorded media type through an allowlist: `image/avif`, `image/gif`, `image/jpeg`, `image/png`, `image/svg+xml` and `image/webp`. The source URL is never consulted for the extension.
+
+If a referenced image record exists but its content-addressed body is missing or corrupt, the note is still exported and that one destination is left pointing at the original URL. The export warns about the damaged asset and exits non-zero, the same way it does for other unreadable archive state.
+
+Destination rewriting is done by a CommonMark parser used only to locate byte spans. The exporter does not render the parser's events back to Markdown. It replaces only the destination range inside an inline image and leaves every other byte of the stored article document untouched. A text scan cannot make that guarantee: link-shaped text can appear inside code spans and fenced code blocks, titles can follow destinations, destinations can be wrapped in angle brackets, and escaped brackets or parentheses can appear inside the syntax itself. The parser decides which spans are real Markdown image destinations; the original document remains the document that gets written.
+
 ## Front Matter
 
 Every note starts with YAML front matter. The schema is fixed:
@@ -64,5 +82,5 @@ The export invents nothing and ranks nothing. A value is eligible only if it tra
 
 - **No `--format` flag.** There is one export format, so a format flag would pretend a second one exists.
 - **No sync onto a previous export.** Preserving human edits and removing stale notes is a separate problem.
-- **No images.** Carrying note assets into the export has its own task because it needs path, reference and collision rules of its own.
+- **No non-image assets.** Stylesheets, scripts and other subresources belong to the captured page, not to the Markdown article projection.
 - **No ranking or enrichment.** Tags, summaries, related notes and reading order require judgment that is outside this projection.

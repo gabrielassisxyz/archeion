@@ -84,12 +84,14 @@ pub fn extract(
     };
 
     let mut truncated = Vec::new();
-    let markdown = markdown::render(&article.content, title, &mut truncated).map_err(&refused)?;
+    let prose = markdown::render(&article.content, title, &mut truncated).map_err(&refused)?;
     Ok(Some(Article {
         record: ArticleRecord {
             extractor_version: EXTRACTOR_VERSION,
             rules: ExtractionRules::Heuristic,
-            word_count: markdown::word_count(&markdown),
+            // Counted on the prose alone. The heading is a title handed in from the metadata
+            // record, so counting it here would report the same words twice across two files.
+            word_count: markdown::word_count(&prose.body),
             excerpt: non_empty(article.excerpt.as_deref()),
             byline: non_empty(article.byline.as_deref()),
             truncated,
@@ -98,7 +100,7 @@ pub fn extract(
                 peak_open_elements: measured.peak_open_elements,
             },
         },
-        markdown,
+        markdown: prose.document,
     }))
 }
 

@@ -16,7 +16,7 @@ By default, one capture is considered for each item: the most recent capture in 
 
 The destination must resolve to an absent or empty directory. Exporting over an existing tree is deliberately not implemented, because a previous export may contain human edits and the rules for preserving, replacing or deleting those files need their own design.
 
-The command prints the number of notes it wrote. If part of the archive is unreadable, export still writes the intact items, warns about the damaged paths and exits non-zero.
+The command prints the number of Markdown notes it wrote, including host indexes. If part of the archive is unreadable, export still writes the intact items, warns about the damaged paths and exits non-zero.
 
 ## Assets
 
@@ -35,6 +35,18 @@ The extension comes from the recorded media type through an allowlist: `image/av
 If a referenced image record exists but its content-addressed body is missing or corrupt, the note is still exported and that one destination is left pointing at the original URL. The export warns about the damaged asset and exits non-zero, the same way it does for other unreadable archive state.
 
 Destination rewriting is done by a CommonMark parser used only to locate byte spans. The exporter does not render the parser's events back to Markdown. It replaces only the destination range inside an inline image and leaves every other byte of the stored article document untouched. A text scan cannot make that guarantee: link-shaped text can appear inside code spans and fenced code blocks, titles can follow destinations, destinations can be wrapped in angle brackets, and escaped brackets or parentheses can appear inside the syntax itself. The parser decides which spans are real Markdown image destinations; the original document remains the document that gets written.
+
+## Links
+
+Exported notes link to each other when an inline Markdown link names another item in the same export. The destination is parsed as an absolute URL, passed through Archeion canonicalization, and looked up in the export's complete map of canonical URL to note path. When the target exists, only the destination span is replaced with a relative Markdown path to that note. The link text, title, escaping and surrounding prose stay byte identical.
+
+The lookup is by canonical URL rather than by raw string, so `https://www.example.com/page?utm_source=x#part` resolves to an exported note for `https://example.com/page` when the canonicalization rules make those one item. A target outside the collection stays as it was. A destination that never resolved to an absolute `http` or `https` URL also stays as it was, so relative links that the archive never resolved are not guessed during export.
+
+Resolution is deliberately two pass. The exporter first walks every selected article capture, assigns every note path and builds the canonical URL map. It writes no note body before that map is complete, because one page can cite another page that was captured later and appears later in the walk. With `--all-captures`, the map still has one path per canonical URL, so links point to the most recent exported capture for that item.
+
+## Host Indexes
+
+Each host directory contains `index.md`, a mechanical list of every exported note under that host. The list is ordered by capture date, with canonical URL as the deterministic tie breaker, and every entry is a normal relative Markdown link to the note file. With `--all-captures`, one item can therefore appear more than once, once for each exported capture. The index does not select, rank, group or summarize entries, because export records what the archive contains rather than deciding which page matters most.
 
 ## Front Matter
 

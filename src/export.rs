@@ -12,7 +12,7 @@ use url::Url;
 use crate::CanonicalUrl;
 use crate::metadata::PageMetadata;
 use crate::readability::Article;
-use crate::storage::{Archive, Asset, Capture, CaptureId, Item, ItemId, StorageError};
+use crate::storage::{Archive, Asset, Capture, CaptureId, ContentHash, Item, ItemId, StorageError};
 
 const SLUG_MAX_BYTES: usize = 80;
 const ID_PREFIX_BYTES: usize = 12;
@@ -46,7 +46,10 @@ pub enum ExportError {
 }
 
 struct ExportNote {
+    canonical_url: String,
     host: String,
+    path: PathBuf,
+    captured_at: Timestamp,
     date: String,
     slug: String,
     item_prefix: String,
@@ -75,7 +78,7 @@ struct DestinationState {
 
 struct ExportedAsset {
     filename: String,
-    bytes: Vec<u8>,
+    hash: ContentHash,
 }
 
 struct RewrittenAssets {
@@ -132,6 +135,7 @@ fn write_export(
         unreadable: walk.unreadable.iter().map(ToString::to_string).collect(),
     };
     let mut used = HashSet::new();
+    let mut notes = Vec::new();
     for item in walk.items {
         let captures = archive.list_captures(&item.canonical_url)?;
         let selected: Vec<CaptureId> = if options.all_captures {
@@ -141,10 +145,10 @@ fn write_export(
         };
         for capture_id in selected {
             match export_note(archive, &item, &capture_id) {
-                Ok(Some(note)) => {
+                Ok(Some(mut note)) => {
+                    note.path = unique_note_path(&note, &mut used);
                     report.unreadable.extend(note.unreadable.iter().cloned());
-                    write_note(destination, note, &mut used)?;
-                    report.notes_written += 1;
+                    notes.push(note);
                 }
                 Ok(None) => {}
                 Err(error) => report.unreadable.push(format!(
@@ -154,6 +158,15 @@ fn write_export(
             }
         }
     }
+    let link_targets = link_targets_by_url(&notes);
+    for note in &mut notes {
+        rewrite_note_links(&link_targets, &mut note.body, &note.path);
+    }
+    for note in &notes {
+        write_note(archive, destination, note)?;
+        report.notes_written += 1;
+    }
+    report.notes_written += write_host_indexes(destination, &notes)?;
     Ok(report)
 }
 
@@ -190,7 +203,10 @@ fn note_from(
     let title = metadata.and_then(|metadata| metadata.title.as_ref());
     let item_prefix = item.id.as_str()[..ID_PREFIX_BYTES].to_owned();
     ExportNote {
+        canonical_url: item.canonical_url.to_string(),
         host: item.canonical_url.host_dir().to_owned(),
+        path: PathBuf::new(),
+        captured_at: *fetched_at,
         date: fetched_at.strftime("%Y-%m-%d").to_string(),
         slug: slug_for(
             &item.canonical_url,
@@ -228,6 +244,43 @@ fn note_from(
     }
 }
 
+fn link_targets_by_url(notes: &[ExportNote]) -> HashMap<String, PathBuf> {
+    let mut targets: HashMap<String, usize> = HashMap::new();
+    for (index, note) in notes.iter().enumerate() {
+        match targets.get(&note.canonical_url) {
+            Some(existing) if notes[*existing].captured_at >= note.captured_at => {}
+            _ => {
+                targets.insert(note.canonical_url.clone(), index);
+            }
+        }
+    }
+    targets
+        .into_iter()
+        .map(|(url, index)| (url, notes[index].path.clone()))
+        .collect()
+}
+
+fn rewrite_note_links(targets: &HashMap<String, PathBuf>, markdown: &mut String, note_path: &Path) {
+    let replacements = markdown_destinations(markdown)
+        .into_iter()
+        .filter_map(|destination| {
+            if destination.kind != MarkdownDestinationKind::Link {
+                return None;
+            }
+            let Ok(target_url) = CanonicalUrl::parse(&destination.destination) else {
+                return None;
+            };
+            let target_path = targets.get(target_url.as_str())?;
+            Some((
+                destination.span,
+                relative_markdown_path(note_path, target_path),
+            ))
+        })
+        .collect();
+
+    apply_markdown_replacements(markdown, replacements);
+}
+
 fn rewrite_note_assets(
     archive: &Archive,
     capture: &Capture,
@@ -254,8 +307,8 @@ fn rewrite_note_assets(
         };
         let filename = format!("{}.{}", asset.body.sha256.as_str(), extension);
         if copied.insert(filename.clone()) {
-            let bytes = match archive.read_body(&asset.body.sha256) {
-                Ok(bytes) => bytes,
+            match archive.read_body(&asset.body.sha256) {
+                Ok(_) => {}
                 Err(error) => {
                     unreadable.push(format!(
                         "capture {} asset {}: {error}",
@@ -267,7 +320,7 @@ fn rewrite_note_assets(
             };
             exported.push(ExportedAsset {
                 filename: filename.clone(),
-                bytes,
+                hash: asset.body.sha256.clone(),
             });
         }
         replacements.push((destination.span, format!("../{ASSET_DIRECTORY}/{filename}")));
@@ -352,12 +405,8 @@ fn destination_is_empty(destination: &Path) -> Result<bool, ExportError> {
         .is_none())
 }
 
-fn write_note(
-    destination: &Path,
-    note: ExportNote,
-    used: &mut HashSet<PathBuf>,
-) -> Result<(), ExportError> {
-    write_assets(destination, &note.assets)?;
+fn write_note(archive: &Archive, destination: &Path, note: &ExportNote) -> Result<(), ExportError> {
+    write_assets(archive, destination, &note.assets)?;
 
     let host = destination.join(&note.host);
     fs::create_dir_all(&host).map_err(|source| ExportError::Io {
@@ -365,7 +414,7 @@ fn write_note(
         source,
     })?;
 
-    let path = unique_note_path(&host, &note, used);
+    let path = destination.join(&note.path);
 
     fs::write(&path, note_text(&note.front_matter, &note.body)).map_err(|source| ExportError::Io {
         path: path.clone(),
@@ -373,7 +422,11 @@ fn write_note(
     })
 }
 
-fn write_assets(destination: &Path, assets: &[ExportedAsset]) -> Result<(), ExportError> {
+fn write_assets(
+    archive: &Archive,
+    destination: &Path,
+    assets: &[ExportedAsset],
+) -> Result<(), ExportError> {
     if assets.is_empty() {
         return Ok(());
     }
@@ -384,7 +437,8 @@ fn write_assets(destination: &Path, assets: &[ExportedAsset]) -> Result<(), Expo
     })?;
     for asset in assets {
         let path = root.join(&asset.filename);
-        fs::write(&path, &asset.bytes).map_err(|source| ExportError::Io {
+        let bytes = archive.read_body(&asset.hash)?;
+        fs::write(&path, &bytes).map_err(|source| ExportError::Io {
             path: path.clone(),
             source,
         })?;
@@ -392,18 +446,86 @@ fn write_assets(destination: &Path, assets: &[ExportedAsset]) -> Result<(), Expo
     Ok(())
 }
 
-fn unique_note_path(host: &Path, note: &ExportNote, used: &mut HashSet<PathBuf>) -> PathBuf {
+fn unique_note_path(note: &ExportNote, used: &mut HashSet<PathBuf>) -> PathBuf {
     for name in [
         format!("{}-{}.md", note.date, note.slug),
         format!("{}-{}-{}.md", note.date, note.slug, note.item_prefix),
         format!("{}-{}-{}.md", note.date, note.slug, note.capture_id),
     ] {
-        let path = host.join(name);
+        let path = Path::new(&note.host).join(name);
         if used.insert(path.clone()) {
             return path;
         }
     }
     unreachable!("capture ids are unique within an export")
+}
+
+fn write_host_indexes(destination: &Path, notes: &[ExportNote]) -> Result<usize, ExportError> {
+    let mut by_host: HashMap<&str, Vec<&ExportNote>> = HashMap::new();
+    for note in notes {
+        by_host.entry(&note.host).or_default().push(note);
+    }
+
+    for (host, host_notes) in &mut by_host {
+        host_notes.sort_by(|left, right| {
+            left.date
+                .cmp(&right.date)
+                .then_with(|| left.canonical_url.cmp(&right.canonical_url))
+        });
+        let mut index = format!("# {host}\n\n");
+        for note in host_notes {
+            let filename = note
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("export note paths are UTF-8 filenames");
+            index.push_str("- [");
+            index.push_str(filename);
+            index.push_str("](");
+            index.push_str(filename);
+            index.push_str(")\n");
+        }
+        let path = destination.join(host).join("index.md");
+        fs::write(&path, index).map_err(|source| ExportError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    }
+
+    Ok(by_host.len())
+}
+
+fn relative_markdown_path(from_note: &Path, target_note: &Path) -> String {
+    let from_parent: Vec<_> = from_note
+        .parent()
+        .map(|path| path.iter().collect())
+        .unwrap_or_default();
+    let target_components: Vec<_> = target_note.iter().collect();
+    let common = from_parent
+        .iter()
+        .zip(&target_components)
+        .take_while(|(left, right)| left == right)
+        .count();
+
+    let mut relative = PathBuf::new();
+    for _ in common..from_parent.len() {
+        relative.push("..");
+    }
+    for component in &target_components[common..] {
+        relative.push(component);
+    }
+    markdown_path(&relative)
+}
+
+fn markdown_path(path: &Path) -> String {
+    path.iter()
+        .map(|component| {
+            component
+                .to_str()
+                .expect("export paths are generated as UTF-8")
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn note_text(front_matter: &FrontMatter, body: &str) -> String {

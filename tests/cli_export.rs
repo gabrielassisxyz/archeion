@@ -160,7 +160,7 @@ fn export_fixture() -> TempDir {
         "https://example.com/empty-title",
         "2026-07-25T14:03:22Z",
         Some(""),
-        "An article whose title record is empty.",
+        "An article whose title record is empty and links to [first](https://blog.example.com/first).",
     );
     write_article_capture(
         &archive,
@@ -274,7 +274,7 @@ fn export_writes_a_markdown_vault_for_the_latest_article_capture_per_item() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "exported 5 notes\n"
+        "exported 7 notes\n"
     );
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
     assert_eq!(
@@ -298,6 +298,12 @@ fn export_writes_a_markdown_vault_for_the_latest_article_capture_per_item() {
                     .to_owned(),
             ),
             (
+                "blog.example.com/index.md".to_owned(),
+                "# blog.example.com\n\n\
+                 - [2026-07-26-latest-article.md](2026-07-26-latest-article.md)\n"
+                    .to_owned(),
+            ),
+            (
                 "example.com/2026-07-25-empty-title.md".to_owned(),
                 "---\n\
                  title: \"\"\n\
@@ -310,7 +316,7 @@ fn export_writes_a_markdown_vault_for_the_latest_article_capture_per_item() {
                  word_count: 4\n\
                  excerpt: \"A short excerpt.\"\n\
                  ---\n\n\
-                 An article whose title record is empty."
+                 An article whose title record is empty and links to [first](../blog.example.com/2026-07-26-latest-article.md)."
                     .to_owned(),
             ),
             (
@@ -361,7 +367,98 @@ fn export_writes_a_markdown_vault_for_the_latest_article_capture_per_item() {
                  The second colliding title."
                     .to_owned(),
             ),
+            (
+                "example.com/index.md".to_owned(),
+                format!(
+                    "# example.com\n\n\
+                     - [2026-07-25-empty-title.md](2026-07-25-empty-title.md)\n\
+                     - [2026-07-25-quoted-secret.md](2026-07-25-quoted-secret.md)\n\
+                     - [2026-07-25-same-title.md](2026-07-25-same-title.md)\n\
+                     - [2026-07-25-same-title-{collision_suffix}.md](2026-07-25-same-title-{collision_suffix}.md)\n"
+                ),
+            ),
         ])
+    );
+}
+
+#[test]
+fn export_rewrites_links_to_notes_and_writes_a_host_index() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = Archive::open(dir.path()).expect("archive opens");
+
+    write_article_capture(
+        &archive,
+        "https://example.com/alpha",
+        "2026-07-26T23:00:00Z",
+        Some("Alpha"),
+        "Alpha cites [Beta](https://www.example.com/beta?utm_source=news#section), [Gamma](https://blog.example.com/gamma), [outside](https://outside.example.com/page) and [relative](/beta).",
+    );
+    write_article_capture(
+        &archive,
+        "https://example.com/beta",
+        "2026-07-26T01:00:00Z",
+        Some("Beta"),
+        "Beta cites [Alpha](https://example.com/alpha#top).",
+    );
+    write_article_capture(
+        &archive,
+        "https://blog.example.com/gamma",
+        "2026-07-27T10:00:00Z",
+        Some("Gamma"),
+        "Gamma cites [Alpha](https://example.com/alpha).",
+    );
+
+    let destination = TempDir::new().expect("temp dir");
+    let destination_path = destination.path().join("vault");
+    let output = archeion()
+        .arg("export")
+        .arg(dir.path())
+        .arg(&destination_path)
+        .output()
+        .expect("the binary runs");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "exported 5 notes\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+
+    let alpha = std::fs::read_to_string(destination_path.join("example.com/2026-07-26-alpha.md"))
+        .expect("alpha note reads");
+    assert!(
+        alpha.contains(
+            "Alpha cites [Beta](2026-07-26-beta.md), [Gamma](../blog.example.com/2026-07-27-gamma.md), [outside](https://outside.example.com/page) and [relative](/beta)."
+        ),
+        "{alpha}"
+    );
+
+    let beta = std::fs::read_to_string(destination_path.join("example.com/2026-07-26-beta.md"))
+        .expect("beta note reads");
+    assert!(
+        beta.contains("Beta cites [Alpha](2026-07-26-alpha.md)."),
+        "{beta}"
+    );
+
+    let gamma =
+        std::fs::read_to_string(destination_path.join("blog.example.com/2026-07-27-gamma.md"))
+            .expect("gamma note reads");
+    assert!(
+        gamma.contains("Gamma cites [Alpha](../example.com/2026-07-26-alpha.md)."),
+        "{gamma}"
+    );
+
+    let index = std::fs::read_to_string(destination_path.join("example.com/index.md"))
+        .expect("index reads");
+    assert_eq!(
+        index,
+        "# example.com\n\n\
+         - [2026-07-26-alpha.md](2026-07-26-alpha.md)\n\
+         - [2026-07-26-beta.md](2026-07-26-beta.md)\n"
     );
 }
 
@@ -470,7 +567,10 @@ fn export_carries_referenced_article_images_as_content_hashed_assets() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "exported 1 note\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "exported 2 notes\n"
+    );
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
 
     let png_name = format!("{}.png", ContentHash::of(png).as_str());
@@ -591,7 +691,10 @@ fn export_keeps_the_note_when_a_referenced_image_body_is_missing() {
         .expect("the binary runs");
 
     assert!(!output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "exported 1 note\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "exported 2 notes\n"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("warning: capture "), "{stderr}");
     assert!(stderr.contains(asset.body.sha256.as_str()), "{stderr}");
@@ -631,11 +734,15 @@ fn export_all_captures_includes_the_article_history() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "exported 6 notes\n"
+        "exported 8 notes\n"
     );
     let tree = exported_tree(&destination_path);
     assert!(tree.contains_key("blog.example.com/2026-07-25-older-article.md"));
     assert!(tree.contains_key("blog.example.com/2026-07-26-latest-article.md"));
+    assert!(
+        tree["example.com/2026-07-25-empty-title.md"]
+            .contains("[first](../blog.example.com/2026-07-26-latest-article.md)")
+    );
 }
 
 #[test]
@@ -655,7 +762,7 @@ fn export_writes_intact_items_and_reports_unreadable_item_directories() {
     assert!(!output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "exported 5 notes\n"
+        "exported 7 notes\n"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("warning: "), "{stderr}");
@@ -694,7 +801,7 @@ fn export_accepts_a_symlink_to_an_empty_destination_directory() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "exported 5 notes\n"
+        "exported 7 notes\n"
     );
     assert!(exported_tree(&real).contains_key("blog.example.com/2026-07-26-latest-article.md"));
 }

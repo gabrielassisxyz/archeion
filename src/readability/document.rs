@@ -111,6 +111,23 @@ pub(super) fn build(html: &str) -> Result<(Document, Measured), TooExpensive> {
     ))
 }
 
+/// How many words the whole page holds, as the denominator of the sliver rule in `mod.rs`.
+///
+/// Counted here because this is the last moment the tree exists in one piece, before the
+/// scorer takes it and decides which part of it is the article.
+///
+/// The bodies of scripts and styles are subtracted rather than left in. They are text nodes
+/// like any other, so a page carrying a few kilobytes of inline JSON-LD or a framework's
+/// serialized state would count them as prose it holds, and the article inside it would then
+/// look like a sliver of a much larger document. Refusing real articles for having a big
+/// script tag is the exact failure this rule is supposed to avoid, in reverse.
+pub(super) fn page_word_count(document: &Document) -> usize {
+    let body = document.select("body");
+    let words = |text: &str| text.split_whitespace().count();
+    // Disjoint subtrees, so the counts subtract cleanly.
+    words(&body.text()).saturating_sub(words(&body.select("script, style, noscript").text()))
+}
+
 /// Whether any element in the tree sits deeper than `ceiling`.
 ///
 /// It answers the question rather than measuring the depth so that it can stop at the first

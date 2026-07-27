@@ -43,6 +43,7 @@ fn article(markdown: &str, word_count: usize, excerpt: Option<&str>) -> Article 
             extractor_version: archeion::readability::EXTRACTOR_VERSION,
             rules: ExtractionRules::Heuristic,
             word_count,
+            page_word_count: word_count,
             excerpt: excerpt.map(str::to_owned),
             byline: None,
             truncated: Vec::new(),

@@ -1,0 +1,5 @@
+{
+  "why": "A site's front page, reduced from a real one that was archived as a 44-word article beside the site's own posts. It is admitted by the readability probe because it carries a tagline, a description and a footer blurb around its list of links, which is more prose than the hand-written listing beside it in this corpus has, and the block the scorer then returns is the footer. Refused rather than passed over, so the two numbers that refused it leave something to answer for.",
+  "outcome": "refused",
+  "title": "The Slow Kitchen"
+}

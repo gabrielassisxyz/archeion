@@ -1,0 +1,14 @@
+{
+  "why": "A note of a few dozen words, which is a page an archive has as much reason to keep as a long one. It is here as the other half of the front page beside it: both are shorter than any rule on length alone would admit, and what separates them is that this one is what its page is about. A rule that refused this would be measuring size instead of shape.",
+  "outcome": "article",
+  "title": "The oven is fixed",
+  "must_contain": [
+    "The element went in this morning",
+    "everything that has been on hold for two months"
+  ],
+  "must_not_contain": [
+    "Written by hand"
+  ],
+  "heading_levels": [1],
+  "word_count": { "min": 50, "max": 100 }
+}

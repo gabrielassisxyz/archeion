@@ -4,7 +4,9 @@
 
 use archeion::CanonicalUrl;
 use archeion::metadata::{self, PageMetadata, PageSource};
-use archeion::readability::{self, AdmissionCost, Article, ArticleRecord, ExtractionRules};
+use archeion::readability::{
+    self, AdmissionCost, Article, ArticleRecord, ExtractionRules, RefusedExtraction,
+};
 use archeion::storage::{
     Archive, AssetMiss, ContentHash, Header, ItemId, MissedAsset, NewAsset, NewCapture,
     StorageError,
@@ -176,6 +178,7 @@ fn an_article_is_stored_as_a_document_and_read_back_whole() {
             extractor_version: readability::EXTRACTOR_VERSION,
             rules: ExtractionRules::Heuristic,
             word_count: 5,
+            page_word_count: 5,
             excerpt: Some("Bread is mostly patience.".to_owned()),
             byline: None,
             truncated: Vec::new(),
@@ -215,6 +218,66 @@ fn an_article_is_stored_as_a_document_and_read_back_whole() {
     );
 }
 
+/// A refusal is one file and not a pair, and it stands where the article record would have
+/// been. The whole point of it is that the document beside it was never written: what a later
+/// review needs is the measurement that refused the page, and the prose is derivable from the
+/// stored response whenever that review wants to look at it.
+#[test]
+fn a_refused_extraction_is_stored_where_the_article_record_would_have_been() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/").expect("valid url");
+    let capture = archive
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
+        .expect("capture is stored");
+    let refused = RefusedExtraction {
+        extractor_version: readability::EXTRACTOR_VERSION,
+        rules: ExtractionRules::Heuristic,
+        word_count: 27,
+        page_word_count: 253,
+        excerpt: Some("Written by hand, published from a laptop.".to_owned()),
+    };
+
+    archive
+        .write_refused_extraction(&url, &capture.id, &refused)
+        .expect("the refusal is stored");
+
+    let captures_dir = dir
+        .path()
+        .join("items")
+        .join("example.com")
+        .join(ItemId::of(&url).as_str())
+        .join("captures");
+    assert!(
+        captures_dir
+            .join(format!("{}.article-refused.json", capture.id))
+            .is_file()
+    );
+    assert!(
+        !captures_dir
+            .join(format!("{}.article.md", capture.id))
+            .exists(),
+        "a refusal must not leave the document it refused to write"
+    );
+    assert_eq!(
+        archive
+            .read_refused_extraction(&url, &capture.id)
+            .expect("the refusal reads back"),
+        Some(refused)
+    );
+    assert_eq!(
+        archive
+            .read_article(&url, &capture.id)
+            .expect("reading an article is not an error"),
+        None
+    );
+}
+
 /// The failure ordering alone does not catch: writing over a pair that is already there. The
 /// new document lands, the process dies before the record, and both files exist and parse,
 /// with every field of the old record describing prose that is no longer on disk. Only the
@@ -239,6 +302,7 @@ fn an_article_described_by_a_record_from_a_previous_extraction_reads_as_absent()
             extractor_version: readability::EXTRACTOR_VERSION,
             rules: ExtractionRules::Heuristic,
             word_count: 3,
+            page_word_count: 3,
             excerpt: None,
             byline: None,
             truncated: Vec::new(),
@@ -298,6 +362,7 @@ fn an_article_whose_document_never_landed_reads_as_absent() {
                     extractor_version: readability::EXTRACTOR_VERSION,
                     rules: ExtractionRules::Heuristic,
                     word_count: 2,
+                    page_word_count: 2,
                     excerpt: None,
                     byline: None,
                     truncated: Vec::new(),
@@ -348,6 +413,7 @@ fn an_article_document_that_is_not_a_regular_file_is_refused_before_it_is_read()
             extractor_version: readability::EXTRACTOR_VERSION,
             rules: ExtractionRules::Heuristic,
             word_count: 5,
+            page_word_count: 5,
             excerpt: Some("Bread is mostly patience.".to_owned()),
             byline: None,
             truncated: Vec::new(),

@@ -33,9 +33,10 @@ It also survives the tool. A directory of Markdown files is readable in any edit
 5. select        find the article, drop the furniture
 6. convert       article markup to Markdown
 7. bound         cut what is over the ceiling and say so
+8. judge         refuse a sliver of a page that mostly said something else
 ```
 
-The order of the first four is the design, not an arrangement. Each guard has to run before the step it protects, and each would be useless after it.
+The order of the first four is the design, not an arrangement. Each guard has to run before the step it protects, and each would be useless after it. The last step is the opposite case: it weighs the extraction against the page it came out of, so it is the one thing here that can only run once both exist.
 
 Steps 3, 5 and 6 are separate functions rather than one block. That is not decoration: per-host extraction rules will hook between 2 and 4, telling the scorer directly which subtree is the article and which selectors are furniture, and the split is what makes that an addition rather than a rewrite. The record carries a `rules` field, `heuristic` until then, so a stored article always says how it was made.
 
@@ -65,9 +66,34 @@ This project already resolved that question. Metadata extraction picks a title a
 
 Most of the web is not. A listing page, a shop, a homepage and the shell of an application that renders itself in the browser are all captures with prose worth nothing, and writing an empty article record for each would fill the archive with files that say nothing.
 
-The gate is the algorithm's own readability probe, run before the scoring pass. It is cheap and it discriminates: a listing of links, an empty application shell and a page of navigation all fail it, while an article passes. A capture that fails the probe gets no article files at all, which is an ordinary outcome and not an error.
+The first gate is the algorithm's own readability probe, run before the scoring pass. It is cheap and it discriminates: a listing of links, an empty application shell and a page of navigation all fail it, while an article passes. A capture that fails the probe gets no article files at all, which is an ordinary outcome and not an error.
 
 Media types other than HTML never reach any of this, for the same reason they produce no metadata record.
+
+### The sliver rule, and the page the probe lets through
+
+A site's own front page defeats the probe. It carries a tagline, a description and a footer blurb around its list of links, which is more prose than an imagined listing has, so the probe admits it and the scorer then returns whichever of those blocks scored best. Capturing sixty pages of one site produced forty-eight articles from forty-six posts, and one of the extras was a front page stored as forty-four words of boilerplate, against a median of about two thousand for the real articles beside it.
+
+So a second gate runs after the extraction rather than before it: an extraction is refused when it is **both** under 100 words and under a quarter of the prose its page holds.
+
+**Link density, the obvious instrument, cannot see this.** A listing is made of links, and that is what the underlying algorithm already scores on, so the reasonable expectation is that a threshold somewhere in its configuration would refuse the page. It would not. The list is dropped as furniture before the article is formed, and what would be stored is genuine prose carrying no links at all. Nor is either number reachable through that configuration: `readable_min_score` and `readable_min_content_length` weigh text length alone, and `char_threshold` refuses nothing, because the grab loop falls back to its best attempt when no attempt reaches it.
+
+**Neither number would do on its own**, and each covers the other's mistake:
+
+| page | words | share of its page | kept by |
+|---|---|---|---|
+| a site's front page | 27 | 0.11 | nothing, which is the point |
+| a genuinely short post | 72 | 0.82 | the share |
+| an article under 40 related links and 20 comments | 253 | 0.21 | the length |
+| the corpus articles | 211 to 253 | 0.76 to 1.03 | both |
+
+A floor on length alone would discard the announcement and the single-paragraph note, which an archive has as much reason to keep as anything else. A floor on share alone would discard a real article whose page carries more comments than prose, and a comment section large enough to do that is ordinary.
+
+The page's prose is counted with the bodies of scripts and styles subtracted. They are text nodes like any other, so a page carrying a few kilobytes of inline JSON-LD would count them as prose it holds, and the article inside it would then look like a sliver of a much larger document.
+
+**Both numbers were chosen against pages from few origins, which is not enough**, and they are expected to move for the same reason the ceilings below are. So every article records `word_count` and `page_word_count`, and every refusal is written to the archive beside the capture it refused, as `<capture-id>.article-refused.json`. A count of refusals says the rule is firing; only the pages it refused and the ratios the kept articles reached can say whether it fired on something it should have kept. That file is the queue a later pass reads.
+
+Only pages the rule turned down are written there, never the many that the probe passed over. Those are most of the web, and a file for each of them would bury the few worth reviewing under the many that say nothing.
 
 ## What a hostile page costs
 
@@ -141,6 +167,7 @@ They are set where a hostile page is certainly refused, not where a real page is
   "extractor_version": 1,
   "rules": "heuristic",
   "word_count": 1240,
+  "page_word_count": 1418,
   "excerpt": "Bread is mostly patience.",
   "byline": "J. Writer",
   "cost": {
@@ -150,11 +177,27 @@ They are set where a hostile page is certainly refused, not where a real page is
 }
 ```
 
+`page_word_count` is the prose of the whole page the article came out of, which is the denominator of the sliver rule above. It is recorded for the pages that were kept and not only for the ones that were refused, on the same terms as `cost`: a file per refusal says the rule is firing, and only the ratios real articles reach can say whether it is about to start firing on them.
+
+A refused page gets a record of its own instead of this pair, holding the same two counts, the excerpt and nothing else:
+
+```json
+{
+  "extractor_version": 2,
+  "rules": "heuristic",
+  "word_count": 27,
+  "page_word_count": 253,
+  "excerpt": "Written by hand, published from a laptop on a kitchen table."
+}
+```
+
+There is no field naming the rule that refused it. One rule refuses here and its inputs are the two counts, so the comparison is readable from the record itself; a second rule is what would make naming them worth a field, and it will arrive with its own version bump.
+
 `rules` names what produced the extraction. `byline` is what the algorithm found in the page's own markup and is not the resolved author in the metadata record: the two disagree often, and collapsing them would hide which one to look at when an attribution comes out wrong. `word_count` counts the prose and not the heading, which is a title the metadata record already holds. `truncated` is absent when nothing was cut, which is the ordinary case.
 
 `markdown_sha256` is the address of the document beside it, and it is what makes the pair safe to rewrite. Ordering alone is enough only the first time: writing over an existing pair and stopping between the two files leaves new prose beside an old record, both present, both parsing, and every field describing something that is no longer there. A reader that finds the two disagreeing reports no article, because the response the article was derived from is still in the archive and the pass that re-extracts will simply redo it.
 
-`extractor_version` is bumped when the meaning of a field or a rule that fills one changes, not when a field is added, on the same terms as the metadata record.
+`extractor_version` is bumped when the meaning of a field or a rule that fills one changes, not when a field is added, on the same terms as the metadata record. It is 2 for the sliver rule: `page_word_count` arriving beside the counts would not have been enough on its own, but a page can now produce prose and still not be stored as an article, so the absence of a record beside a capture stopped meaning what it meant at 1.
 
 ## What was deliberately left out
 
@@ -163,7 +206,7 @@ They are set where a hostile page is certainly refused, not where a real page is
 - **Images pulled into the prose.** An article's images are already captured as subresources and addressed by content hash. Rewriting the Markdown to point at them is a question about how a reader resolves references, which belongs to the reader.
 - **Pagination.** An article split across numbered pages is captured as the several pages it is served as. Stitching them is a per-site rule in every implementation that does it, so it waits for the rules layer.
 - **Language-aware word counting.** The count splits on whitespace, which is wrong for languages that do not use it. It is a rough figure for sorting and filtering, not a measurement.
-- **Removing an article.** There is a way to write a pair and no way to un-write one, so an extractor that later decides a capture is not an article leaves the previous pair in place. Nothing needs it until a pass over an existing archive exists, and that pass is the caller that will define what removal should mean.
+- **Removing an article.** There is a way to write a pair and no way to un-write one, so an extractor that later decides a capture is not an article leaves the previous pair in place. The sliver rule made that reachable rather than hypothetical: re-reading a capture an older extractor kept now leaves the refusal beside the article it disagrees with, both on disk. Nothing needs solving until a pass over an existing archive exists, and that pass is the caller that will define what removal should mean.
 - **A ceiling on wall clock.** Every guard here bounds a shape that was measured. None of them bounds a shape that was not, and a per-document time limit is the only thing that would. It is not built because a thread cannot be stopped from outside in this language, so such a limit would bound how long a capture waits without bounding what it spends, and a host serving many such pages would saturate the machine either way.
 - **A guard on the metadata path.** The quadratic parse described above is a property of reading hostile markup, not of this module: metadata extraction takes 0.6 s on the same input where this took 18 s. It is bounded there, but by a memory ceiling that happens to cut the blowup short rather than by anything aimed at it. Giving it the same scan is its own change.
 
@@ -174,3 +217,5 @@ Extraction quality varies by site and cannot be asserted exactly. Pinning the cu
 The fixtures are hand written, one file of markup and one of expectations, and they are minimal reproductions of shapes rather than saved pages. Real pages would carry a licence question into a public repository and hundreds of kilobytes per case.
 
 This means the corpus does not discover the sites that need work; it cannot, since it only contains shapes someone already thought of. Discovery happens by running the tool. When a real page comes out wrong it is reduced by hand to the smallest markup that reproduces the failure, and that becomes a fixture. The corpus pins down what was found, so it cannot come back.
+
+The sliver rule above is the first thing that arrived that way, and the front page it was written for is in the corpus beside the listing that was imagined. Both stay: the imagined one covers the easy shape, and the easy shape is still worth pinning. So is the pairing, since a case that only proved the rule refuses something would be satisfied by a rule that refuses everything short. The genuinely short post beside it is what makes the refusal mean anything.

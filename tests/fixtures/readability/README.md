@@ -11,7 +11,7 @@ Nothing here asserts the output exactly. Extraction quality varies by site, and 
 ```json
 {
   "why": "what this case is here to prove",
-  "is_article": true,
+  "outcome": "article",
   "title": "the title the metadata extractor would have resolved, or null",
   "must_contain": ["prose that has to survive"],
   "must_not_contain": ["furniture that must not"],
@@ -20,7 +20,15 @@ Nothing here asserts the output exactly. Extraction quality varies by site, and 
 }
 ```
 
-`is_article: false` means the extractor must produce nothing, and every other field is then unused. `heading_levels` and `word_count` are optional.
+`outcome` is one of three, because the extractor has three answers and two of them are not an article:
+
+- `article`, and every other field asserts something about it.
+- `refused`, meaning prose came out and a rule here turned it down. It leaves a record beside the capture for a later review to answer, so the other fields are unused.
+- `nothing`, meaning the page held nothing worth reading and is passed over in silence. The other fields are unused.
+
+The last two are separate cases rather than one "not an article" because they leave different things behind. A fixture that only said "not an article" would keep passing if a refusal quietly became silence, and the queue of pages somebody is meant to review would empty without anyone noticing.
+
+`heading_levels` and `word_count` are optional.
 
 ## Where a case comes from
 

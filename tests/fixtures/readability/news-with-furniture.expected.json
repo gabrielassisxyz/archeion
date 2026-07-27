@@ -1,6 +1,6 @@
 {
   "why": "The hard case: no semantic article element, and the prose is interrupted by an advertisement block that sits inside the body rather than beside it.",
-  "is_article": true,
+  "outcome": "article",
   "title": "City council votes to keep the night buses",
   "must_contain": [
     "voted on Tuesday evening to keep all eleven night bus routes",

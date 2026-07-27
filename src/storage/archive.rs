@@ -20,7 +20,7 @@ use super::model::{
 use super::walk::ArchiveWalk;
 use crate::canonical_url::CanonicalUrl;
 use crate::metadata::PageMetadata;
-use crate::readability::{Article, ArticleRecord};
+use crate::readability::{Article, ArticleRecord, RefusedExtraction};
 
 const MARKER_FILE: &str = "archeion.json";
 const FORMAT_NAME: &str = "archeion-archive";
@@ -279,6 +279,37 @@ impl Archive {
         )
     }
 
+    /// Writes what an extraction measured about a page it refused to call an article.
+    ///
+    /// Only the pages the extractor's own rule turned down are written here, never the ones
+    /// that simply held no prose. Most of the web is the second kind, and a file for each of
+    /// those would bury the few that are worth reviewing under the many that say nothing.
+    ///
+    /// It is one file rather than a pair, because the point of the refusal is that the
+    /// document beside it was not written. The prose is still derivable from the stored
+    /// response whenever somebody re-reads these, which is what they are kept for.
+    pub fn write_refused_extraction(
+        &self,
+        url: &CanonicalUrl,
+        capture: &CaptureId,
+        refused: &RefusedExtraction,
+    ) -> Result<(), StorageError> {
+        write_json(&self.refused_extraction_path(url, capture), refused)
+    }
+
+    /// What an extraction refused to call an article, or `None`.
+    pub fn read_refused_extraction(
+        &self,
+        url: &CanonicalUrl,
+        capture: &CaptureId,
+    ) -> Result<Option<RefusedExtraction>, StorageError> {
+        read_optional_bounded_json(
+            &self.refused_extraction_path(url, capture),
+            MAX_ARTICLE_RECORD_BYTES,
+            "larger than an article record can be",
+        )
+    }
+
     /// The prose read out of a capture, or `None`.
     ///
     /// Absent is an ordinary answer: most of the web is not an article, a capture of an image
@@ -470,6 +501,15 @@ impl Archive {
         self.item_dir(url)
             .join("captures")
             .join(format!("{capture}.article.json"))
+    }
+
+    /// Named so that it sorts beside the article record it stands in for, and reads in a
+    /// directory listing as what it is: the decision about this capture's article was made,
+    /// and it was no.
+    fn refused_extraction_path(&self, url: &CanonicalUrl, capture: &CaptureId) -> PathBuf {
+        self.item_dir(url)
+            .join("captures")
+            .join(format!("{capture}.article-refused.json"))
     }
 
     fn body_path(&self, hash: &ContentHash) -> PathBuf {

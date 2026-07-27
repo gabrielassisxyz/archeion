@@ -36,6 +36,7 @@ fn article() -> Article {
             extractor_version: archeion::readability::EXTRACTOR_VERSION,
             rules: ExtractionRules::Heuristic,
             word_count: 5,
+            page_word_count: 5,
             excerpt: Some("This capture produced prose.".to_owned()),
             byline: None,
             truncated: Vec::new(),

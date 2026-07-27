@@ -1,6 +1,6 @@
 {
   "why": "The conventional shape: semantic article, entry-content, and the widgets, comments and share buttons every blog carries around it.",
-  "is_article": true,
+  "outcome": "article",
   "title": "How to bake bread",
   "must_contain": [
     "Bread is mostly patience",

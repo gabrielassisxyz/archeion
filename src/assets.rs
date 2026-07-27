@@ -63,20 +63,51 @@ pub(crate) struct CapturedAssets {
     pub missed: Vec<MissedAsset>,
 }
 
+/// How many requests in a row may produce no response at all before a capture stops asking.
+///
+/// This is the bound on how long one page can hold the pipeline. The pass runs inside the
+/// callback the crawl hands pages through, so while it waits on a host that accepts
+/// connections and then says nothing, the engine keeps fetching pages that nothing is reading:
+/// they fill the queue between the two, and what overflows was paid for and thrown away. The
+/// deadline alone does not cover that, since a page can spend the whole remaining budget one
+/// request timeout at a time.
+///
+/// Three, because silence in a row is a fact about what is answering rather than about each
+/// file: it survives a page referencing an unreachable host a couple of times, and it bounds
+/// the wait at three request timeouts instead of at everything the run has left. What it costs
+/// is a page whose first three references are on a dead host losing the rest, which is recorded
+/// rather than silent, and recoverable later from the reference list without a crawl.
+const MAX_CONSECUTIVE_SILENCES: usize = 3;
+
 /// What one ask taught the run, and what it cost to find out.
 struct Asked {
     learned: Learned,
     /// Bytes that came over the wire, kept or not. A body refused for its size was paid for
     /// before its size was known, and the ceiling that bounds a capture has to see that.
     transferred: u64,
+    on_the_wire: OnTheWire,
+}
+
+/// What one ask did on the wire. A capture reads this to tell a file that is missing from a
+/// host that has stopped answering, which are the same absence and a different problem.
+#[derive(PartialEq, Eq)]
+enum OnTheWire {
+    /// No request was made, because the address was refused before it was dialled. It says
+    /// nothing either way: it cost no wait, so it neither counts as silence nor clears it.
+    NothingSent,
+    /// A server answered, whatever it answered. A 404 is an answer.
+    Answered,
+    /// A request was made and produced no response at all.
+    Silent,
 }
 
 impl Asked {
-    /// An answer that cost no transfer: a URL refused before it was dialled.
+    /// An answer that cost no transfer and no request: a URL refused before it was dialled.
     fn for_nothing(reason: AssetMiss) -> Self {
         Self {
             learned: Learned::Missed(reason),
             transferred: 0,
+            on_the_wire: OnTheWire::NothingSent,
         }
     }
 }
@@ -143,6 +174,7 @@ impl<'a> AssetCapture<'a> {
     ) -> Result<CapturedAssets, StorageError> {
         let mut captured = CapturedAssets::default();
         let mut bytes_spent = 0u64;
+        let mut silences = 0usize;
 
         for reference in referenced {
             let dealt_with = captured.stored.len() + captured.missed.len();
@@ -151,14 +183,22 @@ impl<'a> AssetCapture<'a> {
                 continue;
             }
             let learned = match self.known.get(&reference.url) {
-                // A hit costs nothing, so it is served even when the run is out of time and it
-                // counts against no ceiling: the bytes are already in the archive and the
-                // record that references them is already written down.
+                // A hit costs nothing, so it is served even when the run is out of time or the
+                // capture has given up asking, and it counts against no ceiling: the bytes are
+                // already in the archive and the record that references them is written down.
                 Some(known) => known.clone(),
+                None if silences >= MAX_CONSECUTIVE_SILENCES => {
+                    Learned::Missed(AssetMiss::NothingWasAnswering)
+                }
                 None if self.out_of_time() => Learned::Missed(AssetMiss::DeadlineReached),
                 None => {
                     let asked = self.ask_for(&reference.url)?;
                     bytes_spent = bytes_spent.saturating_add(asked.transferred);
+                    match asked.on_the_wire {
+                        OnTheWire::Silent => silences += 1,
+                        OnTheWire::Answered => silences = 0,
+                        OnTheWire::NothingSent => {}
+                    }
                     self.known
                         .insert(reference.url.clone(), asked.learned.clone());
                     asked.learned
@@ -188,9 +228,15 @@ impl<'a> AssetCapture<'a> {
             // shape for it: to the capture, a subresource it cannot have is a subresource it
             // cannot have, and the reason it was refused travels with it.
             PageEvent::NoResponse(failure) => {
-                return Ok(Asked::for_nothing(AssetMiss::NoResponse {
-                    detail: failure.reason,
-                }));
+                return Ok(Asked {
+                    learned: Learned::Missed(AssetMiss::NoResponse {
+                        detail: failure.reason,
+                    }),
+                    transferred: 0,
+                    // The request was made and nothing came back, which is the outcome that
+                    // costs a whole request timeout and the only one worth counting.
+                    on_the_wire: OnTheWire::Silent,
+                });
             }
         };
 
@@ -202,6 +248,7 @@ impl<'a> AssetCapture<'a> {
             Ok(Asked {
                 learned: Learned::Missed(reason),
                 transferred: byte_len,
+                on_the_wire: OnTheWire::Answered,
             })
         };
         if !self.seed.allow_private_addresses && points_inside_a_network(&response.final_url) {
@@ -222,6 +269,7 @@ impl<'a> AssetCapture<'a> {
         Ok(Asked {
             learned: Learned::Stored(self.archive.store_asset(&new_asset(response))?),
             transferred: byte_len,
+            on_the_wire: OnTheWire::Answered,
         })
     }
 

@@ -1197,6 +1197,120 @@ mod tests {
         );
     }
 
+    /// A page referencing a host that accepts connections and says nothing is what holds the
+    /// whole pipeline: the pass runs inside the callback the crawl hands pages through, so every
+    /// request it waits out is time the engine spends fetching pages nothing is reading. After
+    /// enough silence the capture stops asking, and what it did not ask for says so.
+    #[test]
+    fn a_capture_stops_asking_once_nothing_is_answering() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut markup = String::from("<html><body>");
+        for index in 0..6 {
+            markup.push_str(&format!(r#"<img src="/{index}.png">"#));
+        }
+        markup.push_str("</body></html>");
+        // The last reference would have answered, and the point is that it is never asked.
+        let engine = ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, &markup)])
+            .serving(vec![subresource(
+                "https://example.com/5.png",
+                "image/png",
+                b"\x89PNG",
+            )]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.captures_written, 1);
+        assert_eq!(run.assets_stored, 0);
+        assert_eq!(
+            run.asset_fetches, 3,
+            "the capture kept waiting on a host that was not answering"
+        );
+        let capture = only_capture_of(&archive, "https://example.com/a");
+        let reasons: Vec<&AssetMiss> = capture
+            .assets_missed
+            .iter()
+            .map(|missed| &missed.reason)
+            .collect();
+        assert!(
+            matches!(
+                reasons.as_slice(),
+                [
+                    AssetMiss::NoResponse { .. },
+                    AssetMiss::NoResponse { .. },
+                    AssetMiss::NoResponse { .. },
+                    AssetMiss::NothingWasAnswering,
+                    AssetMiss::NothingWasAnswering,
+                    AssetMiss::NothingWasAnswering,
+                ]
+            ),
+            "{reasons:#?}"
+        );
+    }
+
+    /// Silence has to be consecutive to mean anything. A host that answers between two failures
+    /// is answering, and a page that references a couple of files that are gone is an ordinary
+    /// page rather than a reason to stop capturing it.
+    #[test]
+    fn a_host_that_answers_between_failures_is_not_taken_for_a_dead_one() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/a",
+            200,
+            r#"<html><body><img src="/gone-1.png"><img src="/gone-2.png"><img src="/here.png">
+               <img src="/gone-3.png"><img src="/gone-4.png"><img src="/also-here.png"></body></html>"#,
+        )])
+        .serving(vec![
+            subresource("https://example.com/here.png", "image/png", b"\x89PNG1"),
+            subresource("https://example.com/also-here.png", "image/png", b"\x89PNG2"),
+        ]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.assets_stored, 2);
+        assert_eq!(run.asset_fetches, 6, "a reference was never asked for");
+        let capture = only_capture_of(&archive, "https://example.com/a");
+        assert!(
+            capture
+                .assets_missed
+                .iter()
+                .all(|missed| matches!(missed.reason, AssetMiss::NoResponse { .. })),
+            "{:#?}",
+            capture.assets_missed
+        );
+    }
+
+    /// A refusal that never became a request cost no wait, so it is not silence. Counting it
+    /// would let a page full of addresses this archive will not dial stop it from capturing the
+    /// files that are perfectly reachable further down the same page.
+    #[test]
+    fn a_reference_refused_before_being_dialled_is_not_counted_as_silence() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/a",
+            200,
+            r#"<html><body><img src="http://127.0.0.1/1.png"><img src="http://10.0.0.1/2.png">
+               <img src="http://[::1]/3.png"><img src="http://169.254.169.254/4.png">
+               <img src="/here.png"></body></html>"#,
+        )])
+        .serving(vec![subresource(
+            "https://example.com/here.png",
+            "image/png",
+            b"\x89PNG",
+        )]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.assets_stored, 1);
+        assert_eq!(run.asset_fetches, 1);
+        assert_eq!(run.assets_missed, 4);
+    }
+
     /// The ceiling on bytes counts what came over the wire, not what was kept, and this is the
     /// page that tells the two apart: every file on it is just over the size one subresource
     /// may spend, so nothing is ever stored. A ceiling that counted stored bytes would sit at
@@ -1278,11 +1392,11 @@ mod tests {
         assert_eq!(capture.assets_missed[0].reason, AssetMiss::InsideANetwork);
     }
 
-    /// The shape an archiver is aimed at something with: a page whose references all answer
-    /// nothing. It stores nothing, so a ceiling counting what was stored would never be
-    /// reached, and the run would spend a request per address on somebody else's behalf.
+    /// The shape an archiver is aimed at something with: one page, a thousand addresses on a
+    /// host somebody else picked, none of them answering. It is also where all three bounds meet,
+    /// so what each one refused is asserted rather than only the total.
     #[test]
-    fn a_page_referencing_a_thousand_dead_addresses_costs_the_ceiling_and_not_a_thousand() {
+    fn a_page_referencing_a_thousand_dead_addresses_costs_three_requests() {
         let dir = TempDir::new().expect("temp dir");
         let archive = archive_in(&dir);
         let mut markup = String::from("<html><body>");
@@ -1299,10 +1413,29 @@ mod tests {
 
         assert_eq!(run.assets_stored, 0);
         assert_eq!(
-            run.asset_fetches, 128,
-            "the run made a request per dead address it was handed"
+            run.asset_fetches, 3,
+            "the run kept asking a host that had answered nothing three times over"
         );
         let capture = only_capture_of(&archive, "https://example.com/a");
+        let counted = |wanted: &AssetMiss| {
+            capture
+                .assets_missed
+                .iter()
+                .filter(|missed| {
+                    std::mem::discriminant(&missed.reason) == std::mem::discriminant(wanted)
+                })
+                .count()
+        };
+        // Three requests, then the capture stops asking, and the count ceiling takes over from
+        // there: it is what keeps the record itself from growing with a page's ambitions.
+        assert_eq!(
+            counted(&AssetMiss::NoResponse {
+                detail: String::new()
+            }),
+            3
+        );
+        assert_eq!(counted(&AssetMiss::NothingWasAnswering), 125);
+        assert_eq!(counted(&AssetMiss::CountCeilingReached), 872);
         assert_eq!(capture.assets_missed.len(), 1_000);
     }
 }

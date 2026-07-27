@@ -297,6 +297,10 @@ pub enum AssetMiss {
     ByteCeilingReached,
     /// The run's wall-clock budget was gone before this one was asked for.
     DeadlineReached,
+    /// The capture stopped asking, because the requests before this one had produced no
+    /// response at all several times over. That is a fact about what was answering rather than
+    /// about this file, so the file may well still be there.
+    NothingWasAnswering,
     /// The reference ended on an address that exists only inside a network, which a run that
     /// did not ask for those addresses had no business reaching.
     InsideANetwork,

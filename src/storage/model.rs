@@ -283,11 +283,15 @@ pub struct MissedAsset {
 pub enum AssetMiss {
     /// No server answered, or the engine refused to dial the address at all.
     NoResponse { detail: String },
-    /// The response was larger than one subresource may spend, so what arrived was dropped
-    /// rather than stored: half a stylesheet is not a stylesheet, and the size is kept
-    /// because it is what says how far over the ceiling the page was.
+    /// The response was larger than one subresource may spend. The size is kept because it is
+    /// what says how far over the ceiling the page was.
     TooLarge { byte_len: u64 },
-    /// The capture had already stored as many subresources as one capture may hold.
+    /// Less arrived than the response promised. Unlike a page, which is kept short and marked
+    /// as short, a subresource that is incomplete is not stored at all: it exists so the page
+    /// still works, a stylesheet missing its end does not, and this record has nowhere to say
+    /// that the bytes are partial.
+    ArrivedShort { byte_len: u64 },
+    /// The capture had already dealt with as many references as one capture may.
     CountCeilingReached,
     /// The capture had already spent the bytes one capture may spend on subresources.
     ByteCeilingReached,

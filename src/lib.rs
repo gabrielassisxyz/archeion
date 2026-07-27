@@ -1,3 +1,4 @@
+mod assets;
 pub mod canonical_url;
 pub mod capture;
 pub mod crawl;

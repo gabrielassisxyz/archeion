@@ -224,6 +224,21 @@ Three things are handled during the read rather than left to the converter, beca
 
 The middle one is not ceremony. The generated markup is balanced, so the quadratic parse that ceiling was originally measured against cannot come out of it, but depth can: a document of nothing but `>` opens a blockquote per character, and it is the converter's parser that pays for it. Well-formed markup peaks at its own nesting depth, so the same count answers both questions, and the scan that takes it reads bytes rather than parsing them.
 
+Measured on documents built to be the worst of each shape, at or just over the byte ceiling:
+
+| document | wall clock | outcome |
+|---|---|---|
+| 2 MiB of list items | 0.77 s | article |
+| 2 MiB of one-character paragraphs | 0.69 s | article |
+| 2 MiB of emphasis spans | 0.53 s | article |
+| 2 MiB of inline links | 0.42 s | article |
+| 2 MiB of `<` | 0.74 s | article |
+| a list nested 2 000 deep | 0.1 ms | refused, over the byte ceiling |
+| a blockquote nested 3 000 deep | 0.3 ms | refused, over the open-element ceiling |
+| a table of 200 000 rows | 0.05 ms | refused, over the byte ceiling |
+
+The two shapes that nest are the two the middle ceiling exists for, and each is turned away in well under a millisecond because both guards read the document rather than parse it. Nesting a list is quadratic in the bytes it costs, since every level pays for its own indentation, so the byte ceiling reaches it first; nesting a blockquote is linear, so the element scan is what reaches it. Unbalanced raw markup, which is the shape that makes the HTML path quadratic, cannot arise at all: it leaves the read as escaped text, so it opens nothing.
+
 The refusals are spelled by the same type the HTML path refuses with, so a page turned away for cost reads the same in a run report whichever of the two it came through.
 
 ### Which CommonMark extensions are read

@@ -118,8 +118,24 @@ fn render(document: &str, final_url: &str) -> Rendered {
     // with the start tag it belongs to, and it stays correct when a kept link follows a
     // dropped one.
     let (mut dropped_links, mut dropped_images) = (0usize, 0usize);
+    let mut inside_front_matter = false;
 
     let events = Parser::new_ext(document, extensions()).filter_map(|event| {
+        // Front matter is what the document says about itself, not what it says. It is dropped
+        // whole rather than merely left out of the markup, because the text inside it would
+        // otherwise be counted as article text, and a record reporting a page's own metadata as
+        // prose it holds is a record claiming something the document never said.
+        match &event {
+            Event::Start(Tag::MetadataBlock(_)) => inside_front_matter = true,
+            Event::End(TagEnd::MetadataBlock(_)) => {
+                inside_front_matter = false;
+                return None;
+            }
+            _ => {}
+        }
+        if inside_front_matter {
+            return None;
+        }
         if let Event::Text(text) | Event::Code(text) | Event::Html(text) | Event::InlineHtml(text) =
             &event
         {
@@ -406,6 +422,21 @@ mod tests {
             article.markdown
         );
         assert!(!article.markdown.contains("author"), "{}", article.markdown);
+    }
+
+    /// Front matter has to leave the count as well as the markup. It is what the document says
+    /// about itself, so counting it would have the record report a page's own metadata as prose
+    /// the page holds, and the number is the one thing about a served article that a later
+    /// calibration reads.
+    #[test]
+    fn front_matter_is_not_counted_as_text_the_document_said() {
+        let prose = "# A post\n\nProse.\n";
+        let front = format!("---\ntitle: {}\n---\n\n{prose}", "a".repeat(200));
+
+        assert_eq!(
+            article_of(&front).record.share,
+            article_of(prose).record.share
+        );
     }
 
     /// The extension that earns its place by what is lost without it. A pipe table read as

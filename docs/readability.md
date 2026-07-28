@@ -287,7 +287,9 @@ The excerpt is the one field here a page controls the length of, and the reader 
 
 `extractor_version` is bumped when the meaning of a field or a rule that fills one changes, not when a field is added, on the same terms as the metadata record. It is 2 for the sliver rule: `share` arriving beside the counts would not have been enough on its own, but a page can now produce prose and still not be stored as an article, so the absence of a record beside a capture stopped meaning what it meant at 1.
 
-The rules layer did not bump it, and the argument cuts close enough to be worth writing down. Two things about a version 2 record could be said to have changed: `page_chars` is the document the scorer was handed rather than the page, and a capture can now have no article because a host's `body` rule found nothing. Neither reaches a record already on disk. An extractor with no rule file does exactly what version 2 did, and every record written under a rule says so in `rules`, so nothing already written has to be reinterpreted; bumping would tell every reader otherwise. What changed for the pages with no record is the operator's own file, and it is in the archive beside them.
+The rules layer did not bump it, and the argument is close enough to be worth writing down, because the same sentence that justified 2 over 1 appears to apply again: a capture can now have no article because a host's `body` rule found nothing, so the absence of a record beside a capture means one more thing than it did.
+
+What settles it is that the version is a field, and a page with no article has no record to put it on. Bumping would stamp 3 on the records that do exist, telling every reader that those records mean something new, and they do not: `article_chars` and `page_chars` mean exactly what they meant at 2, `rules` says whether a rule reached the page, and an extractor with no rule file behaves as version 2 behaved. The one thing that genuinely changed cannot be versioned, because it is a silence, and a silence is not a record. What accounts for it is the rule file, which is in the archive beside the captures for that reason.
 
 ## What was deliberately left out
 

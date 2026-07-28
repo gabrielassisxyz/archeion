@@ -5,22 +5,26 @@ mod cli;
 use std::error::Error;
 use std::path::PathBuf;
 
+use archeion::crawl::settle_response_byte_ceiling;
 use clap::{Parser, Subcommand};
 
-/// Published because a script reading the records has no other way to tell a short answer
-/// from a complete one: a walk that skipped a damaged item still prints every item it could
-/// read, and the code is the only part of that which is not easy to miss.
+use cli::capture::CaptureArgs;
+
+/// The whole point of publishing these is that a script can tell the two failures apart. An
+/// archive that came up short is a reason to stop a pipeline; a URL nobody answered is the
+/// web, and a run that reported it did its job.
 const EXIT_CODES: &str = "\
 Exit codes:
-  0  the command did what it was asked
-  1  the archive is missing, damaged, or could not be written to
+  0  the command did what it was asked, including when a URL answered nothing
+  1  the archive is missing or damaged, a seed was refused, or a run ended up
+     holding less than it fetched
   2  the command line could not be read";
 
 #[derive(Debug, Parser)]
 #[command(version, about, after_help = EXIT_CODES)]
 struct Cli {
     /// Answer with records rather than with a table: one JSON object per item for `list`,
-    /// and one object for the run for `export`.
+    /// and one object for the run for `capture` and `export`.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -29,6 +33,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Crawl a seed into an archive.
+    Capture(CaptureArgs),
     /// List the items stored in an archive.
     List {
         /// Archive directory to read.
@@ -47,7 +53,19 @@ enum Command {
 }
 
 fn main() {
-    if let Err(error) = run(Cli::parse()) {
+    let cli = Cli::parse();
+
+    if let Command::Capture(args) = &cli.command
+        && let Some(bytes) = args.response_byte_ceiling()
+    {
+        // SAFETY: this process is still the one thread that started it. Nothing has run but
+        // the argument parse, and the engine builds the runtime it fetches on further in,
+        // which is also the last moment the ceiling could be settled: the engine reads the
+        // environment on its first fetch and keeps that value for the life of the process.
+        unsafe { settle_response_byte_ceiling(bytes) };
+    }
+
+    if let Err(error) = run(cli) {
         eprintln!("{error}");
         std::process::exit(1);
     }
@@ -55,6 +73,7 @@ fn main() {
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
+        Command::Capture(args) => cli::capture::capture(args, cli.json),
         Command::List { archive } => cli::list::list(archive, cli.json),
         Command::Export {
             all_captures,

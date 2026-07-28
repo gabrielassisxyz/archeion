@@ -5,6 +5,7 @@
 //! other direction is only the library's own types, which is why the shape of every machine
 //! readable answer is declared here rather than derived on a record that is free to grow.
 
+pub mod capture;
 pub mod export;
 pub mod list;
 

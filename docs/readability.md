@@ -67,9 +67,11 @@ This project already resolved that question. Metadata extraction picks a title a
 
 Most of the web is not. A listing page, a shop, a homepage and the shell of an application that renders itself in the browser are all captures with prose worth nothing, and writing an empty article record for each would fill the archive with files that say nothing.
 
-The first gate is the algorithm's own readability probe, run before the scoring pass. It is cheap and it discriminates: a listing of links, an empty application shell and a page of navigation all fail it, while an article passes. A capture that fails the probe gets no article files at all, which is an ordinary outcome and not an error.
+The first gate is the algorithm's own readability probe, run before the scoring pass. It is cheap and it discriminates: a listing of links, an empty application shell and a page of navigation all fail it, while an article passes. A capture that fails the probe gets no article document, which is an ordinary outcome and not an error.
 
 Media types other than HTML never reach any of this, for the same reason they produce no metadata record.
+
+A page that is HTML and still not an article gets a mark of its own, `<capture-id>.article-not-found.json`, when a capture or repass writes the derived layer. That mark exists because a later pass would otherwise spend the same parse again to reach the same answer. It is narrower than absence: absence still means no extractor has answered yet, a non-HTML response had nothing to read, or the derived layer was deliberately removed.
 
 ### The sliver rule, and the page the probe lets through
 
@@ -314,6 +316,17 @@ The excerpt is the one field here a page controls the length of, and the reader 
 }
 ```
 
+A page the extractor read and judged not to be an article gets the smaller marker below:
+
+```json
+{
+  "extractor_version": 2,
+  "rules": "heuristic"
+}
+```
+
+The same `rules` rule applies here as on an article or refusal. It is `heuristic` when the scorer made the decision, and `site:<host>` when a host rule actually reached the page or a `body` rule answered that the article it names is not present on this page.
+
 `rules` names what produced this extraction: `heuristic` when nothing was said about the host or when what was said matched nothing on this page, and `site:<host>` when a rule actually reached it. It stays one string across both, because every reader that filters on it compares it to a string and turning it into an object for the second case would break all of them for nothing. A value this extractor cannot account for is refused rather than read as `heuristic`, which would claim a page was read with nothing said about it.
 
 `byline` is what the algorithm found in the page's own markup and is not the resolved author in the metadata record: the two disagree often, and collapsing them would hide which one to look at when an attribution comes out wrong. `word_count` counts the prose and not the heading, which is a title the metadata record already holds; it stays a rough figure for sorting and filtering, which is why it is not what the sliver rule weighs. `truncated` is absent when nothing was cut, which is the ordinary case. On an article record, `markdown` means the prose file beside the record is a prefix of the article, and `excerpt` means the excerpt field itself is a prefix. On a refusal record, only `excerpt` can appear there.
@@ -322,9 +335,7 @@ The excerpt is the one field here a page controls the length of, and the reader 
 
 `extractor_version` is bumped when the meaning of a field or a rule that fills one changes, not when a field is added, on the same terms as the metadata record. It is 2 for the sliver rule: `share` arriving beside the counts would not have been enough on its own, but a page can now produce prose and still not be stored as an article, so the absence of a record beside a capture stopped meaning what it meant at 1.
 
-The rules layer did not bump it, and the argument is close enough to be worth writing down, because the same sentence that justified 2 over 1 appears to apply again: a capture can now have no article because a host's `body` rule found nothing, so the absence of a record beside a capture means one more thing than it did.
-
-What settles it is that the version is a field, and a page with no article has no record to put it on. Bumping would stamp 3 on the records that do exist, telling every reader that those records mean something new, and they do not: `article_chars` and `page_chars` mean exactly what they meant at 2, `rules` says whether a rule reached the page, and an extractor with no rule file behaves as version 2 behaved. The one thing that genuinely changed cannot be versioned, because it is a silence, and a silence is not a record. What accounts for it is the rule file, which is in the archive beside the captures for that reason.
+The rules layer and the not-article marker did not bump it. The records that exist did not change their meanings: `article_chars` and `page_chars` mean exactly what they meant at 2, and `rules` says whether a rule reached the page. The marker is a new record type with the same version as the extractor that made the decision. An older absence stays stale to a repass because it is absence, not because every article record needs a new number.
 
 ## What was deliberately left out
 
@@ -333,7 +344,6 @@ What settles it is that the version is a field, and a page with no article has n
 - **Images pulled into the prose.** An article's images are already captured as subresources and addressed by content hash. Rewriting the Markdown to point at them is a question about how a reader resolves references, which belongs to the reader.
 - **Pagination.** An article split across numbered pages is captured as the several pages it is served as. Stitching them is a per-site rule in every implementation that does it, so it waits for the rules layer.
 - **Language-aware word counting.** `word_count` splits on whitespace, which is wrong for languages that do not use it. It stays a rough figure for sorting and filtering rather than a measurement, and nothing decides anything on it: the sliver rule counts characters precisely so that a page in such a language is judged the same way as any other.
-- **Removing an article.** There is a way to write a pair and no way to un-write one, so an extractor that later decides a capture is not an article leaves the previous pair in place. The sliver rule made that reachable rather than hypothetical: re-reading a capture an older extractor kept now leaves the refusal beside the article it disagrees with, both on disk. Nothing needs solving until a pass over an existing archive exists, and that pass is the caller that will define what removal should mean.
 - **A ceiling on wall clock.** Every guard here bounds a shape that was measured. None of them bounds a shape that was not, and a per-document time limit is the only thing that would. It is not built because a thread cannot be stopped from outside in this language, so such a limit would bound how long a capture waits without bounding what it spends, and a host serving many such pages would saturate the machine either way.
 - **A guard on the metadata path.** The quadratic parse described above is a property of reading hostile markup, not of this module: metadata extraction takes 0.6 s on the same input where this took 18 s. It is bounded there, but by a memory ceiling that happens to cut the blowup short rather than by anything aimed at it. Giving it the same scan is its own change.
 

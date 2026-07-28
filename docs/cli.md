@@ -1,9 +1,10 @@
 # The command line
 
-Three verbs, one rule about where the archive goes, and one rule about what an exit code means.
+Four verbs, one rule about where the archive goes, and one rule about what an exit code means.
 
 ```sh
 archeion capture <archive> <seed-url> [options]
+archeion repass  <archive> [--allow-private-addresses]
 archeion list    <archive>
 archeion export  <archive> <destination> [--all-captures]
 ```
@@ -56,7 +57,23 @@ The flag wins over `SPIDER_MAX_SIZE_BYTES` already in the environment, which is 
 
 `list` walks the archive and prints one line per item: the canonical URL, how many captures it has, when the most recent one was taken, and whether that capture produced an article.
 
+`repass` walks the archive and refreshes derived records from responses already stored there. It re-runs metadata and readability extraction where a record is stale or absent, reads the archive's current `extraction-rules.json`, and can fetch only subresources a capture already recorded as missed by archive policy. It never fetches a page.
+
 `export` writes the article captures as a Markdown vault. [`export.md`](export.md) has the front matter, the slug rules and what is deliberately not part of it.
+
+## Repass
+
+`repass` exists because the response body is authoritative and the derived layer is disposable. A better extractor, or a rule written for a host after the capture was taken, can therefore be applied to captures already on disk.
+
+The pass opens an existing archive only. A missing path is an error rather than a new empty archive, because a repass with no captures to read is almost always a path typed wrong.
+
+The command writes new derived records before removing conflicting old ones. An interrupted pass therefore leaves the same kind of mixed archive that a normal capture already can: some captures carry older readings, some carry newer ones, and all intact captures stay readable.
+
+For article extraction, an existing article can become an article again, a refusal, or a not-article marker. A page refused by a cost guard does not erase an existing article, because lowering a ceiling silently would drop content the archive had already admitted.
+
+For subresources, the pass only asks for URLs already listed in `assets_missed` where the archive's own policy stopped the original asset capture, such as a count ceiling, byte ceiling, deadline or a host that had stopped answering before that URL was tried. A URL that directly answered nothing is not retried blindly. Recovered assets, and retry results that are still missing, are written beside the capture and folded into `Archive::read_capture`; the original capture record is not rewritten because its id includes the assets present when it was filed.
+
+`--allow-private-addresses` has the same meaning as it does on `capture`, but only for recovered subresources. It is off by default, so a stored page still cannot make a later pass read the local machine or network around it.
 
 ## Exit codes
 

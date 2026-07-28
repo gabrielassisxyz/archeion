@@ -18,7 +18,7 @@ use dom_smoothie::{Config, Readability, ReadabilityError};
 
 pub use model::{
     AdmissionCost, Article, ArticleBound, ArticleRecord, EXTRACTOR_VERSION, Extraction,
-    ExtractionRules, ProseShare, RefusedExtraction,
+    ExtractionRules, NonArticle, ProseShare, RefusedExtraction,
 };
 pub use rules::{SiteRule, SiteRules, UnusedRules};
 
@@ -132,8 +132,17 @@ pub fn extract(
         Some(matched) => document::narrow(&document, matched.rule),
         None => document::Narrowed::Untouched,
     };
+    let not_article = |rules| {
+        Extraction::NotArticle(NonArticle {
+            extractor_version: EXTRACTOR_VERSION,
+            rules,
+        })
+    };
     if narrowed == document::Narrowed::NotAnArticleHere {
-        return Ok(Extraction::Nothing);
+        let rules = matched
+            .map(|matched| ExtractionRules::Site(matched.host.to_owned()))
+            .unwrap_or(ExtractionRules::Heuristic);
+        return Ok(not_article(rules));
     }
     // A rule that named where the article is answered two questions this function otherwise
     // guesses at: whether the page is an article, and whether what came out of it is a sliver of
@@ -171,13 +180,13 @@ pub fn extract(
     // short post is then refused for being what the rule cut it down to. A forum topic of two
     // paragraphs under a thread of thirty is the shape that showed it.
     if !told_where_the_article_is && !readability.is_probably_readable() {
-        return Ok(Extraction::Nothing);
+        return Ok(not_article(applied));
     }
     let article = match readability.parse() {
         Ok(article) => article,
         // The scorer found nothing to keep. That is the same answer as the probe above,
         // reached one step later, and not a page anyone needs to go and look at.
-        Err(ReadabilityError::GrabFailed) => return Ok(Extraction::Nothing),
+        Err(ReadabilityError::GrabFailed) => return Ok(not_article(applied)),
         Err(error) => return Err(refused(error.to_string())),
     };
 
@@ -505,18 +514,26 @@ mod tests {
         assert!(!share(1, 0).is_a_sliver());
     }
 
-    /// Most of the web. Writing an empty record for each of these would fill the archive with
-    /// files that say nothing, which is why absence is the answer rather than an empty article.
+    /// Most of the web. These are not empty articles: they are pages the extractor read and
+    /// declined to call articles.
     #[test]
-    fn a_page_that_is_not_an_article_produces_nothing() {
+    fn a_page_that_is_not_an_article_says_so() {
         let listing = "<html><body><h1>Recipes</h1><ul>\
              <li><a href=\"/a\">Ten pasta shapes</a></li><li><a href=\"/b\">Bread</a></li>\
              <li><a href=\"/c\">Soup</a></li><li><a href=\"/d\">Cake</a></li></ul></body></html>";
         let spa_shell =
             "<html><body><div id=\"root\"></div><script src=\"/app.js\"></script></body></html>";
 
-        assert_eq!(extract_html(listing, Some("Recipes")), Extraction::Nothing);
-        assert_eq!(extract_html(spa_shell, None), Extraction::Nothing);
+        for extracted in [
+            extract_html(listing, Some("Recipes")),
+            extract_html(spa_shell, None),
+        ] {
+            let Extraction::NotArticle(non_article) = extracted else {
+                panic!("expected a non-article marker, got {extracted:?}");
+            };
+            assert_eq!(non_article.extractor_version, EXTRACTOR_VERSION);
+            assert_eq!(non_article.rules, ExtractionRules::Heuristic);
+        }
     }
 
     #[test]
@@ -713,7 +730,10 @@ mod tests {
                 None,
                 &rules_for_example(r#"{"body": ["div.story"]}"#)
             ),
-            Extraction::Nothing
+            Extraction::NotArticle(NonArticle {
+                extractor_version: EXTRACTOR_VERSION,
+                rules: ExtractionRules::Site("example.com".to_owned()),
+            })
         );
     }
 
@@ -746,7 +766,13 @@ mod tests {
             &rules_for_example(r#"{"body": ["article.story"]}"#),
         );
 
-        assert_eq!(extracted, Extraction::Nothing);
+        assert_eq!(
+            extracted,
+            Extraction::NotArticle(NonArticle {
+                extractor_version: EXTRACTOR_VERSION,
+                rules: ExtractionRules::Site("example.com".to_owned()),
+            })
+        );
     }
 
     /// A rule reaches the host it names and no other, checked through the whole entry point

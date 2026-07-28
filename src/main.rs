@@ -24,7 +24,7 @@ Exit codes:
 #[command(version, about, after_help = EXIT_CODES)]
 struct Cli {
     /// Answer with records rather than with a table: one JSON object per item for `list`,
-    /// and one object for the run for `capture` and `export`.
+    /// and one object for the run for `capture`, `repass` and `export`.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -35,6 +35,14 @@ struct Cli {
 enum Command {
     /// Crawl a seed into an archive.
     Capture(CaptureArgs),
+    /// Re-read stored captures and refresh their derived records.
+    Repass {
+        /// Let recovered subresources reach addresses that exist only inside a network.
+        #[arg(long)]
+        allow_private_addresses: bool,
+        /// Archive directory to update.
+        archive: PathBuf,
+    },
     /// List the items stored in an archive.
     List {
         /// Archive directory to read.
@@ -74,6 +82,10 @@ fn main() {
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Command::Capture(args) => cli::capture::capture(args, cli.json),
+        Command::Repass {
+            allow_private_addresses,
+            archive,
+        } => cli::repass::repass(archive, allow_private_addresses, cli.json),
         Command::List { archive } => cli::list::list(archive, cli.json),
         Command::Export {
             all_captures,

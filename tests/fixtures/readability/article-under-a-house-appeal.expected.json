@@ -1,0 +1,22 @@
+{
+  "why": "A site that opens every article with an appeal for subscriptions, written as prose and placed inside the article container, and closes it with a table of index terms. No scorer can tell the appeal from the article: it is several sentences of connected text, carries no links a link-density rule would catch, and sits where the prose sits. The shape comes from a technical news site whose extraction carried the appeal into the archive as the article's opening paragraph, which is what a per-host strip exists for.",
+  "outcome": "article",
+  "title": "What the compiler cannot promise you",
+  "rules": {
+    "why": "the subscription appeal is prose inside the article container, and the index table is furniture the scorer keeps",
+    "strip": ["blockquote.ad", "table.IndexEntries"]
+  },
+  "must_contain": [
+    "a type system does not make a program correct",
+    "put it where the data stops being someone else's",
+    "written where a compiler can read them"
+  ],
+  "must_not_contain": [
+    "For readers, by readers",
+    "a subscription keeps the next one coming",
+    "Index entries for this article",
+    "All rights reserved"
+  ],
+  "heading_levels": [1, 2, 2],
+  "word_count": { "min": 280, "max": 380 }
+}

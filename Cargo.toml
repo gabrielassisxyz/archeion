@@ -26,9 +26,12 @@ jiff = { version = "0.2.35", default-features = false, features = ["std", "serde
 # hostile input whose parse must stay bounded: this one never holds more of the document
 # than the token it is on, while a tree would cost the whole page in memory.
 lol_html = "2.9"
-# A CommonMark reader used to locate already rendered link destinations by byte offset.
-# Export still writes the original Markdown, replacing only destination spans.
-pulldown-cmark = { version = "0.13.4", default-features = false }
+# A CommonMark reader, used for two things. Export locates already rendered link destinations
+# by byte offset and rewrites only those spans, leaving the original Markdown alone. Readability
+# reads a document a site served as Markdown, which is why the `html` feature is on: the events
+# are turned back into markup so that the document goes through the same converter, and the same
+# escaping, as every article extracted from HTML.
+pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"

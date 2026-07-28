@@ -41,6 +41,8 @@ The order of the first four is the design, not an arrangement. Each guard has to
 
 Step 5 is where a host's own rules apply, and it sits where it does because it is the last moment the document exists in one piece and the first moment there is a tree to select in. The record carries a `rules` field naming what produced the extraction, so a stored article always says whether it was worked out or told.
 
+A response that already is the prose runs none of it. Steps 2 through 6 all exist to find an article inside markup, and there is no markup and nothing to find: the site published the separation this pipeline reconstructs. What it runs instead is in [the document a site already published](#the-document-a-site-already-published), which is the same last three steps and its own guards in front of them.
+
 ### The parser, and why there are two of them in this binary
 
 Metadata extraction reads a token stream and never holds more of the document than the token it is on. That is the right shape for reading tags, and it is the wrong shape for this: scoring a node for whether it is the article depends on its parent, its children and its siblings, so a tree is not an optimization here, it is the algorithm.
@@ -69,7 +71,7 @@ Most of the web is not. A listing page, a shop, a homepage and the shell of an a
 
 The first gate is the algorithm's own readability probe, run before the scoring pass. It is cheap and it discriminates: a listing of links, an empty application shell and a page of navigation all fail it, while an article passes. A capture that fails the probe gets no article document, which is an ordinary outcome and not an error.
 
-Media types other than HTML never reach any of this, for the same reason they produce no metadata record.
+Media types other than HTML and Markdown never reach any of this, for the same reason they produce no metadata record.
 
 A page that is HTML and still not an article gets a mark of its own, `<capture-id>.article-not-found.json`, when a capture or repass writes the derived layer. That mark exists because a later pass would otherwise spend the same parse again to reach the same answer. It is narrower than absence: absence still means no extractor has answered yet, a non-HTML response had nothing to read, or the derived layer was deliberately removed.
 
@@ -173,6 +175,97 @@ Two known gaps, neither built:
 
 - **Bundled rules.** Everything is operator-written today. A corpus worth distributing is a licensing question before it is a code question, and there is no corpus yet.
 - **A rule that a subdomain inherits.** Exact matching is what the sites seen needed. A newspaper whose jobs board is on a subdomain is the reason not to guess the other way.
+
+## The document a site already published
+
+Some sites serve a Markdown copy of every page beside its HTML, under the same path with a different extension. The convention is `llms.txt`, which proposes exactly that so a machine reading a site does not have to reconstruct its text, and it is spreading.
+
+Capturing one such site produced twelve pages with no article, and eleven of them were `text/markdown`. Every refusal was correct under the rule above, since readability reads HTML and there was no markup to strip. What it left is an archive holding the best possible article text for those pages and filing it as an ordinary capture nobody would find as prose.
+
+So a response that arrives as Markdown becomes the article. Nothing here can beat it: it is the author's own separation of the prose from the furniture rather than a guess at one.
+
+**`text/markdown` and `text/x-markdown`, and nothing else.** `text/plain` is what many servers answer with for a `.md` path and it is deliberately not admitted, because it is also what they answer with for a changelog, a log and a `robots.txt`. A server that has not said the document is Markdown has not said it is prose.
+
+### The record says nobody extracted anything
+
+`rules` gains a third value, `"served"`, beside `"heuristic"` and `"site:<host>"`. The first two name which extraction found the prose; the third says no extraction happened at all. That distinction is the point of the field here: a reader comparing two articles has to be able to tell the one that was reconstructed from the one that was published.
+
+The rest of the record follows from there:
+
+- **`share` is present, with both counts equal.** It is not a placeholder. The document is the whole page, so the share is one by construction, and the sliver rule cannot fire on it. That is the same answer a `body` rule already gets and for the same reason: somebody who looked at the site said where the prose is, and a floor calibrated against a handful of origins does not overrule that. Keeping the pair present is also what preserves `share` being absent meaning one thing, which is the only reason that absence is worth reading.
+- **`excerpt` and `byline` are absent.** The algorithm that fills them never ran, and a page description and an attribution are things this document did not say.
+- **`cost` is measured, not skipped.** `document_bytes` is the decoded response, and `peak_open_elements` is what the generated markup measured on the way to the converter.
+
+**`extractor_version` did not move, and that is a decision rather than an oversight.** No record that exists changed its meaning: `heuristic` and `site:<host>` say exactly what they said, and `served` is a value only records written afterwards can carry, which is the same ground on which the rules layer and the not-article marker did not bump it either. What did change is an absence, since a Markdown capture with no article beside it used to mean there was nothing to read. That is answered where absences are answered, by what a repass counts as a media type worth re-reading, and answering it there re-reads the handful of captures it applies to instead of rewriting every article record in the archive to carry a larger number.
+
+### It is not trusted, and the converter is why
+
+A served document arrives from the same place the HTML does. It passes through no converter that escapes anything, it can carry raw HTML, and the ceilings that bound a parse bound nothing in a document that is never parsed. Everything the HTML path learned about a page controlling its own document applies here with the safety net removed.
+
+This file already answered the same question once, about the title: it was the one page-controlled string that did not arrive through the converter, and what was done with it was to **send it through the converter**. A served document is that problem with nothing left over, so it gets the same answer. The Markdown is read, turned into markup, and handed to the same `htmd` conversion every extracted article goes through.
+
+What that buys is the property the rest of the archive already has. An `.article.md` is prose in a closed vocabulary, escaped by one escaper, whatever origin it came from. Storing the served bytes as they arrived would have made that a promise with two levels and left every future consumer to know which one it was holding.
+
+Four things are handled during the read rather than left to the converter, because once markup exists there is no telling it apart from markup this program wrote:
+
+- **Raw HTML becomes text.** It is the one construct a Markdown document can carry that an extracted article never can, since every renderer passes it through. It is kept as text rather than deleted, so the document still says what it said, inertly. A `<script>` served in a post is written `\<script>` and reads as the characters it is, which is what the title escaping already does.
+- **A fenced block is left alone.** It is already inert to a renderer and it is often the point of the document, so escaping inside one would corrupt the code it holds and buy nothing.
+- **A destination that exists to run loses its link.** The link text stays. The list of schemes an archived document may still point at is `http`, `https` and `mailto`, plus a fragment, which addresses this document and has nothing to hide a scheme in. A relative destination is resolved against the address the response came from, which is what the HTML path stores and what export compares notes by.
+- **An image's description is reduced to a description.** This is the round trip's own exception, and finding it is what made the rule above worth stating rather than assuming. Both converters flatten a description into an attribute, and the second writes that attribute into `![…](…)` escaping almost nothing, so the description is the one string on this path that reaches the archived document without passing through the escaper. What it can do with that is exactly what the title could: `![a\](javascript:alert(1))](/p.png)` ends its own description at the escaped `]` and hands the rest of the line to a destination nothing screened, and a description carrying `&#10;` writes a heading of its own at column zero. So four characters leave a description: `]`, which ends it, `[`, which opens another, a trailing `\`, which escapes the `]` that would have ended it, and a line break, which ends the line the whole construct sits on. Whitespace collapses to single spaces, for the reason it collapses in the title. An image's title is the same kind of string and is reduced the same way.
+
+**An image's description may hold another image**, which is an example in the CommonMark specification rather than a corner case, and it is why a dropped image is tracked with a stack rather than a count. A count suppresses the inner end tag instead of the outer one, and the converter then keeps reading the description past where it ended: `![foo ![bar](/url) baz](…)` stores `foo ![bar baz](/url)`, and the word `baz` silently leaves the body of the article and becomes part of an attribute.
+
+**The HTML path is weaker in both of these, and that is worth writing down rather than fixing in passing.** Measured, not assumed. On destinations it drops one spelled `javascript:` in lower case and keeps `JaVaScRiPt:`, `vbscript:` and `data:text/html,...`, which is an accident of the library that scores the page rather than a property this project ever stated. On image descriptions it has the same hole the served path just closed, reached from a page's own markup: `alt="x&#10;# Injected&#10;y"` writes a heading into the stored article at column zero, and `alt="a](javascript:alert(1))"` writes a destination nothing screened. Both are older than this change and neither is made worse by it. Closing either one changes the output of extractions already stored, which is a migration on the terms [`storage-model.md`](storage-model.md) sets rather than a fix made on the way past.
+
+### The ceilings, on a document nothing parses
+
+| ceiling | value | where it lands on this path |
+|---|---|---|
+| decoded document | 2 MiB | before anything is read, so it bounds how much work the read below can be asked to do |
+| nesting depth | 256 | on the document's own structure, counted while it is read and before any markup exists |
+| open elements | 2 048 | on the markup the read generates, which is where the record's measurement comes from |
+| Markdown kept | 1 MiB | the file that gets written, exactly as on the HTML path |
+
+**The depth ceiling is the one that decides whether the process survives the document**, and it is the same number the HTML path applies to its tree. A document of nothing but `>` opens a blockquote per level; the converter walks its tree with a stack frame per level; two thousand levels is a four kilobyte response that ends the whole run with a stack overflow rather than being refused as one page. Counting depth on the generated markup instead would mean generating it first, which is paying the cost the guard exists to avoid, so it is counted on the document's own structure as it is read, and the read stops at the first level past the ceiling.
+
+A level of Markdown counts as one nested container, so a list level counts twice, once for the list and once for the item. That errs toward refusing, which is the direction a guard against a stack overflow has to err in.
+
+**The open-element count is a measurement, not the bound.** A level of Markdown opens at most two elements, so under a depth ceiling of 256 it cannot reach 2 048. It is taken because it is what fills `peak_open_elements` on the record, and because the sentence before this one is an assumption about how a document's nesting maps onto the markup it generates: if it ever fires, that mapping is what changed. The quadratic parse it was originally measured against cannot arise here at all, since the generated markup is balanced, and unbalanced raw markup in the document leaves the read as escaped text and so opens nothing.
+
+Measured on documents built to be the worst of each shape, at or just over the ceiling each one meets:
+
+| document | wall clock | outcome |
+|---|---|---|
+| 2 MiB of list items | 0.77 s | article |
+| 2 MiB of one-character paragraphs | 0.69 s | article |
+| 2 MiB of emphasis spans | 0.53 s | article |
+| 2 MiB of inline links | 0.42 s | article |
+| 2 MiB of `<` | 0.74 s | article |
+| a blockquote nested 500 deep | 0.02 ms | refused, over the depth ceiling |
+| a blockquote nested 2 000 deep | 0.10 ms | refused, over the depth ceiling |
+| a list nested 2 000 deep | 0.10 ms | refused, over the byte ceiling |
+| a table of 200 000 rows | 0.05 ms | refused, over the byte ceiling |
+
+Every shape that nests is turned away in well under a millisecond, because the guard reads the document instead of building anything from it. Nesting a list costs bytes quadratic in its own depth, since every level pays for its own indentation, so the byte ceiling reaches those first; nesting a blockquote is linear in depth, so the depth ceiling is what reaches it.
+
+The refusals are spelled by the same type the HTML path refuses with, so a page turned away for cost reads the same in a run report whichever of the two it came through.
+
+### Which CommonMark extensions are read
+
+Two, and each is there because of what the document looks like without it rather than because of what it adds.
+
+- **Tables**, because the converter writes a table back out as a table, while a pipe table left unparsed collapses into one mangled paragraph and stops being a table at all.
+- **YAML metadata blocks**, because a document opening with `---` and no extension to read it parses as a horizontal rule followed by a setext heading, so its front matter becomes a heading the document never had.
+
+Strikethrough is the shape of the ones left out. The converter has no Markdown for `<del>`, so reading `~~gone~~` loses the marks, where leaving it unread keeps the characters standing as the text they already were. An extension is worth enabling only when parsing it preserves more than not parsing it does, and the same test settles the next one that is proposed.
+
+### A page and its Markdown are two items, deliberately
+
+`example.com/posts/a.html` and `example.com/posts/a.md` are different URLs, so they are different items with their own captures, and this change leaves them that way.
+
+Inferring the relation from a shared path stem is a guess about a server's routing, and a wrong one silently merges two pages that were never the same. A page that **declares** the relation, through a `rel="alternate"` link or a `Link` header, is a different and better signal, and nothing captured so far has carried one. When something does, that is the moment to build it.
+
+**Leaving them unrelated is also what satisfies the constraint this whole feature had to satisfy.** A site that serves Markdown badly, truncated, stale or generated wrong, must not silently beat a correct extraction from its own HTML. Because nothing is related, nothing is replaced: the served document produces its own article beside its own capture, the HTML page keeps its own extraction, and no preference is expressed anywhere. Relating the two is precisely what would create the need for a preference rule, and that rule is the decision deliberately deferred alongside.
 
 ## What a hostile page costs
 
@@ -325,9 +418,28 @@ A page the extractor read and judged not to be an article gets the smaller marke
 }
 ```
 
-The same `rules` rule applies here as on an article or refusal. It is `heuristic` when the scorer made the decision, and `site:<host>` when a host rule actually reached the page or a `body` rule answered that the article it names is not present on this page.
+The same `rules` rule applies here as on an article or refusal. It is `heuristic` when the scorer made the decision, `site:<host>` when a host rule actually reached the page or a `body` rule answered that the article it names is not present on this page, and `served` when the response was Markdown and held no prose, which is a document read and declined exactly as an HTML listing is.
 
-`rules` names what produced this extraction: `heuristic` when nothing was said about the host or when what was said matched nothing on this page, and `site:<host>` when a rule actually reached it. It stays one string across both, because every reader that filters on it compares it to a string and turning it into an object for the second case would break all of them for nothing. A value this extractor cannot account for is refused rather than read as `heuristic`, which would claim a page was read with nothing said about it.
+`rules` names how the prose in this record was obtained: `heuristic` when nothing was said about the host or when what was said matched nothing on this page, `site:<host>` when a rule actually reached it, and `served` when nothing scored anything because the response already was the prose. It stays one string across all three, because every reader that filters on it compares it to a string and turning it into an object would break all of them for nothing. A value this extractor cannot account for is refused rather than read as `heuristic`, which would claim a page was read with nothing said about it, and that refusal is what keeps a reader written before `served` existed from misreading one of those records rather than turning one away.
+
+A record for a document the site published looks like this. It carries no excerpt and no byline because nothing derived them, and its two counts are equal because the document is the whole page:
+
+```json
+{
+  "markdown_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "extractor_version": 2,
+  "rules": "served",
+  "word_count": 1240,
+  "share": {
+    "article_chars": 6120,
+    "page_chars": 6120
+  },
+  "cost": {
+    "document_bytes": 7104,
+    "peak_open_elements": 6
+  }
+}
+```
 
 `byline` is what the algorithm found in the page's own markup and is not the resolved author in the metadata record: the two disagree often, and collapsing them would hide which one to look at when an attribution comes out wrong. `word_count` counts the prose and not the heading, which is a title the metadata record already holds; it stays a rough figure for sorting and filtering, which is why it is not what the sliver rule weighs. `truncated` is absent when nothing was cut, which is the ordinary case. On an article record, `markdown` means the prose file beside the record is a prefix of the article, and `excerpt` means the excerpt field itself is a prefix. On a refusal record, only `excerpt` can appear there.
 
@@ -339,6 +451,8 @@ The rules layer and the not-article marker did not bump it. The records that exi
 
 ## What was deliberately left out
 
+- **Metadata for a document a site published.** The metadata extractor reads tags and a Markdown document has none, so a served capture has no title, author or date, and it appears in `list` and in `export` without one. Reading YAML front matter or the document's first heading would answer it, and both are changes to metadata extraction with precedence rules of their own to settle against the ones already written down there.
+- **Relating a page to the Markdown beside it.** Covered above.
 - **A third directive.** `body` and `strip` are what real pages have asked for. The fivefilters corpus grew to twenty directives against real sites, and every one of them arrived because a site demanded it; adding one here follows the same rule rather than anticipating it. What is already known to be missing, and deliberately waiting, is in the rules section above.
 - **Plain text beside the Markdown.** Covered above.
 - **Images pulled into the prose.** An article's images are already captured as subresources and addressed by content hash. Rewriting the Markdown to point at them is a question about how a reader resolves references, which belongs to the reader.
@@ -358,5 +472,7 @@ This means the corpus does not discover the sites that need work; it cannot, sin
 The sliver rule above is the first thing that arrived that way, and the front page it was written for is in the corpus beside the listing that was imagined. Both stay: the imagined one covers the easy shape, and the easy shape is still worth pinning. So is the pairing, since a case that only proved the rule refuses something would be satisfied by a rule that refuses everything short. The genuinely short post beside it is what makes the refusal mean anything.
 
 A fixture may declare the rule its host has been told, and two of them do. Those cases assert twice: that the extraction with the rule is the one declared, and that the extraction without it is not. The second is what keeps a rule from becoming decoration, because a rule that stopped being needed, whether the scorer improved or it never was needed, would otherwise sit in the corpus reading as evidence that a site has to be told while proving nothing.
+
+The corpus is markup, so the served path is not in it and could not be: there is nothing to score and no bound to assert about the scoring. What covers it instead is a case per decision beside the code, plus one test that crawls a Markdown post through a link on an ordinary index, against a server it starts on loopback. That last one is not redundant with the others. Whether the crawl engine follows a link to a document that is not markup and hands the response over as a page at all is a property of the engine and its configuration, it compiles either way, and every test that builds its own page events would pass either way.
 
 One shape found in the wild is deliberately not in the corpus. A forum topic whose replies outweigh the post by fifty to one comes back as the whole thread, and the reduced version of it does not: whether the scorer picks the post or the element above it turns on the arithmetic of how much text sits where, and a hand-written page small enough to read is too small to tip it. Contorting the markup until it tipped would pin an accident of the scoring rather than a property of the site, so the case lives here as a measurement instead.

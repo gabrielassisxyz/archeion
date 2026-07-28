@@ -138,7 +138,7 @@ Records are JSON, pretty printed. The format costs some bytes against the raw bo
 
 Beside each capture there may be a `<capture-id>.metadata.json`, holding what was read out of that response: its title, its author, its date, the tags behind them, its outbound links and the subresources it referenced. [`metadata-extraction.md`](metadata-extraction.md) has the fields and the rules.
 
-Beside a capture that turned out to be an article there is also a `<capture-id>.article.md`, its prose with the navigation, sidebars and banners taken out, and a `<capture-id>.article.json` describing it. Most captures have neither, because most of the web is not an article. [`readability.md`](readability.md) has the rules and the ceilings.
+Beside a capture that turned out to be an article there is also a `<capture-id>.article.md`, its prose with the navigation, sidebars and banners taken out, and a `<capture-id>.article.json` describing it. Most captures have neither, because most of the web is not an article. A capture the site served as Markdown has the same pair, holding what it published rather than anything taken out of markup, and the record says which of the two it is. [`readability.md`](readability.md) has the rules and the ceilings.
 
 A capture that produced prose the extractor then refused to call an article gets a `<capture-id>.article-refused.json` in place of that pair: the measurements the refusal was made on, so the rule that made it can be checked against real pages later. It is one file and not a pair on purpose, since the document beside it is the claim the refusal exists to avoid making, and it stays derivable from the stored response. Only pages the extractor turned down are written here, never the many that simply held no prose.
 

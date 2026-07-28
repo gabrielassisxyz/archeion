@@ -71,6 +71,8 @@ The command writes new derived records before removing conflicting old ones. An 
 
 For article extraction, an existing article can become an article again, a refusal, or a not-article marker. A page refused by a cost guard does not erase an existing article, because lowering a ceiling silently would drop content the archive had already admitted.
 
+A capture with no article beside it is re-read when it holds something the extractor now reads, which is how an archive filled before a media type was understood catches up. A response the site served as Markdown is the case that exists today: captures already on disk produce their articles on the next pass, from the stored bytes and without fetching anything.
+
 For subresources, the pass only asks for URLs already listed in `assets_missed` where the archive's own policy stopped the original asset capture, such as a count ceiling, byte ceiling, deadline or a host that had stopped answering before that URL was tried. A URL that directly answered nothing is not retried blindly. Recovered assets, and retry results that are still missing, are written beside the capture and folded into `Archive::read_capture`; the original capture record is not rewritten because its id includes the assets present when it was filed.
 
 `--allow-private-addresses` has the same meaning as it does on `capture`, but only for recovered subresources. It is off by default, so a stored page still cannot make a later pass read the local machine or network around it.

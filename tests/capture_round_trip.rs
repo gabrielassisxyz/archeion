@@ -184,6 +184,7 @@ fn an_article_is_stored_as_a_document_and_read_back_whole() {
             }),
             excerpt: Some("Bread is mostly patience.".to_owned()),
             byline: None,
+            accessible_for_free: None,
             truncated: Vec::new(),
             cost: AdmissionCost {
                 document_bytes: 4096,
@@ -283,6 +284,10 @@ fn an_article_record_written_before_the_sliver_rule_still_reads() {
     // Absent, and not zero. Nothing measured this page's text, and a record that answered
     // "no characters" would be a claim the extractor that wrote it never made.
     assert_eq!(article.record.share, None);
+    // Absent, and not "known complete". A record written before this field existed said
+    // nothing about a paywall either way, and reading the absence as a declaration of
+    // completeness would claim a page said something no page in this archive ever said.
+    assert_eq!(article.record.accessible_for_free, None);
 }
 
 #[test]
@@ -475,6 +480,7 @@ fn an_article_described_by_a_record_from_a_previous_extraction_reads_as_absent()
             }),
             excerpt: None,
             byline: None,
+            accessible_for_free: None,
             truncated: Vec::new(),
             cost: AdmissionCost {
                 document_bytes: 4096,
@@ -538,6 +544,7 @@ fn an_article_whose_document_never_landed_reads_as_absent() {
                     }),
                     excerpt: None,
                     byline: None,
+                    accessible_for_free: None,
                     truncated: Vec::new(),
                     cost: AdmissionCost {
                         document_bytes: 4096,
@@ -592,6 +599,7 @@ fn an_article_document_that_is_not_a_regular_file_is_refused_before_it_is_read()
             }),
             excerpt: Some("Bread is mostly patience.".to_owned()),
             byline: None,
+            accessible_for_free: None,
             truncated: Vec::new(),
             cost: AdmissionCost {
                 document_bytes: 4096,

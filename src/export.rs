@@ -70,6 +70,10 @@ struct FrontMatter {
     language: Option<String>,
     word_count: usize,
     excerpt: Option<String>,
+    /// What the page's own JSON-LD declared about paid access, carried through unchanged so a
+    /// vault reader can tell a short note from one that stops where a paywall does. `null` here
+    /// means nothing declared it, not that the note is known whole.
+    accessible_for_free: Option<bool>,
 }
 
 struct DestinationState {
@@ -237,6 +241,7 @@ fn note_from(
                 .map(|language| language.value.clone()),
             word_count: article.record.word_count,
             excerpt: article.record.excerpt.clone(),
+            accessible_for_free: article.record.accessible_for_free,
         },
         body: article.markdown,
         assets: Vec::new(),
@@ -544,6 +549,11 @@ fn note_text(front_matter: &FrontMatter, body: &str) -> String {
     push_optional_string(&mut note, "language", front_matter.language.as_deref());
     note.push_str(&format!("word_count: {}\n", front_matter.word_count));
     push_optional_string(&mut note, "excerpt", front_matter.excerpt.as_deref());
+    push_optional_bool(
+        &mut note,
+        "accessible_for_free",
+        front_matter.accessible_for_free,
+    );
     note.push_str("---\n\n");
     note.push_str(body);
     note
@@ -554,6 +564,15 @@ fn push_optional_string(output: &mut String, key: &str, value: Option<&str>) {
         Some(value) => push_string(output, key, value),
         None => output.push_str(&format!("{key}: null\n")),
     }
+}
+
+fn push_optional_bool(output: &mut String, key: &str, value: Option<bool>) {
+    let spelled = match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "null",
+    };
+    output.push_str(&format!("{key}: {spelled}\n"));
 }
 
 fn push_string(output: &mut String, key: &str, value: &str) {

@@ -276,6 +276,8 @@ fn capture_page(
 ///
 /// The title comes from the metadata rather than from this page's markup, so that the
 /// precedence rules that live there decide it once instead of this forming a second opinion.
+/// `accessible_for_free` is resolved the same way, from the JSON-LD metadata extraction already
+/// parsed, rather than this function reading raw blocks itself.
 fn read_prose(
     page: &PageResponse,
     metadata: Option<&PageMetadata>,
@@ -285,6 +287,8 @@ fn read_prose(
     let title = metadata
         .and_then(|metadata| metadata.title.as_ref())
         .map(|title| title.value.as_str());
+    let accessible_for_free =
+        metadata.and_then(|metadata| readability::declared_accessible_for_free(&metadata.json_ld));
     match readability::extract(
         PageSource {
             body: &page.body,
@@ -292,6 +296,7 @@ fn read_prose(
             final_url: &page.final_url,
         },
         title,
+        accessible_for_free,
         rules,
     ) {
         Ok(Extraction::Article(article)) => {

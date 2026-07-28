@@ -49,6 +49,7 @@ fn article(markdown: &str, word_count: usize, excerpt: Option<&str>) -> Article 
             }),
             excerpt: excerpt.map(str::to_owned),
             byline: None,
+            accessible_for_free: None,
             truncated: Vec::new(),
             cost: AdmissionCost {
                 document_bytes: 512,
@@ -296,6 +297,7 @@ fn export_writes_a_markdown_vault_for_the_latest_article_capture_per_item() {
                  language: \"en\"\n\
                  word_count: 4\n\
                  excerpt: \"Latest prose.\"\n\
+                 accessible_for_free: null\n\
                  ---\n\n\
                  # Latest article\n\n\
                  Latest prose."
@@ -319,6 +321,7 @@ fn export_writes_a_markdown_vault_for_the_latest_article_capture_per_item() {
                  language: \"en\"\n\
                  word_count: 4\n\
                  excerpt: \"A short excerpt.\"\n\
+                 accessible_for_free: null\n\
                  ---\n\n\
                  An article whose title record is empty and links to [first](../blog.example.com/2026-07-26-latest-article.md)."
                     .to_owned(),
@@ -335,6 +338,7 @@ fn export_writes_a_markdown_vault_for_the_latest_article_capture_per_item() {
                  language: \"en\"\n\
                  word_count: 4\n\
                  excerpt: \"A short excerpt.\"\n\
+                 accessible_for_free: null\n\
                  ---\n\n\
                  A hostile title stays data."
                     .to_owned(),
@@ -351,6 +355,7 @@ fn export_writes_a_markdown_vault_for_the_latest_article_capture_per_item() {
                  language: \"en\"\n\
                  word_count: 4\n\
                  excerpt: \"A short excerpt.\"\n\
+                 accessible_for_free: null\n\
                  ---\n\n\
                  The first colliding title."
                     .to_owned(),
@@ -367,6 +372,7 @@ fn export_writes_a_markdown_vault_for_the_latest_article_capture_per_item() {
                  language: \"en\"\n\
                  word_count: 4\n\
                  excerpt: \"A short excerpt.\"\n\
+                 accessible_for_free: null\n\
                  ---\n\n\
                  The second colliding title."
                     .to_owned(),
@@ -635,6 +641,7 @@ fn export_carries_referenced_article_images_as_content_hashed_assets() {
              language: \"en\"\n\
              word_count: 20\n\
              excerpt: \"Images.\"\n\
+             accessible_for_free: null\n\
              ---\n\n\
              `literal [text](https://example.com/x) here`\n\n\
              ```\n\
@@ -778,6 +785,57 @@ fn export_writes_intact_items_and_reports_unreadable_item_directories() {
     assert!(
         exported_tree(&destination_path)
             .contains_key("blog.example.com/2026-07-26-latest-article.md")
+    );
+}
+
+/// A note behind a paywall is exported like any other article, and the export is the only
+/// place a vault reader can learn that the prose beside it may stop where the wall does: the
+/// archive's own record is not something the reader opens.
+#[test]
+fn export_carries_a_pages_own_declaration_that_its_prose_may_be_partial() {
+    let archive_dir = TempDir::new().expect("temp dir");
+    let archive = Archive::open(archive_dir.path()).expect("archive opens");
+    let url = CanonicalUrl::parse("https://example.com/paywalled").expect("valid url");
+    let capture = archive
+        .write_capture(capture_of(
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            "Paywalled post",
+        ))
+        .expect("capture is written");
+    archive
+        .write_metadata(&url, &capture.id, &metadata(Some("Paywalled post")))
+        .expect("metadata is written");
+    let mut declared_partial = article(
+        "# Paywalled post\n\nA teaser, then a pitch to subscribe.",
+        6,
+        Some("A teaser, then a pitch to subscribe."),
+    );
+    declared_partial.record.accessible_for_free = Some(false);
+    archive
+        .write_article(&url, &capture.id, &declared_partial)
+        .expect("article is written");
+
+    let destination = TempDir::new().expect("temp dir");
+    let destination_path = destination.path().join("vault");
+    let output = archeion()
+        .arg("export")
+        .arg(archive_dir.path())
+        .arg(&destination_path)
+        .output()
+        .expect("the binary runs");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let note = exported_tree(&destination_path)
+        .remove("example.com/2026-07-25-paywalled-post.md")
+        .expect("the note was written");
+    assert!(
+        note.contains("accessible_for_free: false\n"),
+        "the declaration did not survive into the export:\n{note}"
     );
 }
 

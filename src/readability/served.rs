@@ -88,6 +88,9 @@ pub(super) fn read(document: &str, final_url: &str) -> Result<Extraction, String
             // claim the empty option exists to avoid.
             excerpt: None,
             byline: None,
+            // Metadata extraction reads tags, and a Markdown document has none: there is no
+            // JSON-LD to read a declaration from, on the same grounds `title` is absent above.
+            accessible_for_free: None,
             truncated,
             cost: AdmissionCost {
                 document_bytes: document.len(),

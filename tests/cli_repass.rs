@@ -47,6 +47,7 @@ fn stale_article() -> Article {
             }),
             excerpt: Some("Old prose".to_owned()),
             byline: None,
+            accessible_for_free: None,
             truncated: Vec::new(),
             cost: AdmissionCost {
                 document_bytes: 100,

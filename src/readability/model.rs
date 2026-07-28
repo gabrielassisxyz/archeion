@@ -21,6 +21,13 @@ use serde::{Deserialize, Serialize};
 /// descriptions are reduced to descriptions before they reach Markdown. Existing records may
 /// already hold headings or destinations injected through page attributes, so they need to be
 /// stale and rebuilt from the stored response.
+///
+/// `accessible_for_free` did not bump it, on the same terms the rules layer, the not-article
+/// marker and the byline bound already did not. No record that exists changed its meaning:
+/// `word_count`, `share`, `excerpt`, `byline` and `rules` say exactly what they said. The field
+/// is new and additive, and its absence on a record written before it existed is already the
+/// correct reading, "nothing was declared", rather than a claim the field never had a chance to
+/// make. Nothing here needs a repass to keep reading true.
 pub const EXTRACTOR_VERSION: u32 = 3;
 
 /// How the prose in a record was obtained.
@@ -131,6 +138,18 @@ pub struct ArticleRecord {
     /// author in the metadata record. The two disagree often, and collapsing them would hide
     /// which one to look at when an attribution comes out wrong.
     pub byline: Option<String>,
+    /// What the page's own JSON-LD declared about itself, through schema.org's
+    /// `isAccessibleForFree`, read on the response rather than guessed from the prose. A page
+    /// behind a paywall passes every other instrument this record has: the sliver rule sees a
+    /// healthy share, the word count is ordinary, and nothing about the shape of a teaser
+    /// followed by a subscription pitch differs from a short article that really is whole.
+    ///
+    /// `Some(false)` is the one declaration this exists to catch: the page said this content is
+    /// not accessible without paying for it, so the prose stored beside it may stop where the
+    /// wall does. `Some(true)` is the page saying the opposite. `None` is what an old record and
+    /// an ordinary page with nothing to say share, and it must not be read as `Some(true)`: no
+    /// page said this article is whole, only that none of them said otherwise.
+    pub accessible_for_free: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub truncated: Vec<ArticleBound>,
     /// What this page cost to admit, against the ceilings that admitted it.

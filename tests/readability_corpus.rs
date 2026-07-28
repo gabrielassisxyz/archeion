@@ -274,6 +274,7 @@ fn extract(page: &Path, name: &str, expected: &Expectation, rule: Rule) -> Extra
             final_url: &format!("https://{name}.example.com/page"),
         },
         expected.title.as_deref(),
+        None,
         &rules,
     )
     .unwrap_or_else(|error| panic!("{name} was refused: {error}"))

@@ -42,6 +42,7 @@ fn article() -> Article {
             }),
             excerpt: Some("This capture produced prose.".to_owned()),
             byline: None,
+            accessible_for_free: None,
             truncated: Vec::new(),
             cost: AdmissionCost {
                 document_bytes: 256,

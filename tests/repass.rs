@@ -6,7 +6,7 @@ use archeion::CanonicalUrl;
 use archeion::crawl::{
     CrawlEngine, CrawlError, CrawlOutcome, FetchFailure, PageEvent, PageResponse, Seed,
 };
-use archeion::metadata;
+use archeion::metadata::{self, PageSource};
 use archeion::readability::{
     self, AdmissionCost, Article, ArticleBound, ArticleRecord, ExtractionRules, ProseShare,
     RefusedExtraction, SiteRules,
@@ -115,6 +115,7 @@ fn article_record(version: u32, rules: ExtractionRules) -> ArticleRecord {
         }),
         excerpt: Some("Old prose".to_owned()),
         byline: None,
+        accessible_for_free: None,
         truncated: Vec::new(),
         cost: AdmissionCost {
             document_bytes: 100,
@@ -394,6 +395,64 @@ fn a_host_rule_applies_to_a_capture_that_was_already_stored() {
         ExtractionRules::Site("example.com".to_owned())
     );
     assert!(!article.markdown.contains("subscription pitch"));
+}
+
+/// The captures that motivated the declaration are the ones already on disk, taken before
+/// anything read it. Their responses carry the answer, so a pass has to find them: an article
+/// at the current version whose record says nothing, over a page that did say something, is
+/// stale for that reason alone.
+///
+/// This is the absence being answered by the pass rather than by the extractor version, which
+/// would have rewritten every article in the archive to reach the handful this applies to.
+#[test]
+fn an_article_stored_before_the_declaration_was_read_is_re_read_from_the_page_that_declared_it() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a").expect("valid URL");
+    let declaration = r#"<script type="application/ld+json">
+        {"@type": "Article", "isAccessibleForFree": false}
+        </script>"#;
+    let capture = archive
+        .write_capture(html_capture(&url, &article_page(declaration)))
+        .expect("capture is written");
+    archive
+        .write_metadata(
+            &url,
+            &capture.id,
+            &metadata::extract(PageSource {
+                body: article_page(declaration).as_bytes(),
+                content_type: Some("text/html; charset=utf-8"),
+                final_url: url.as_str(),
+            })
+            .expect("the page reads")
+            .expect("the page is html"),
+        )
+        .expect("metadata is written");
+    archive
+        .write_article(
+            &url,
+            &capture.id,
+            &Article {
+                markdown: "# A page\n\nBread is mostly patience.".to_owned(),
+                record: article_record(readability::EXTRACTOR_VERSION, ExtractionRules::Heuristic),
+            },
+        )
+        .expect("an article with no declaration on it is written");
+
+    let run = repass_archive(
+        &ScriptedEngine::new(Vec::new()),
+        &archive,
+        &SiteRules::default(),
+        RepassOptions::default(),
+    )
+    .expect("repass succeeds");
+
+    assert_eq!(run.articles_written, 1);
+    let article = archive
+        .read_article(&url, &capture.id)
+        .expect("article reads")
+        .expect("article exists");
+    assert_eq!(article.record.accessible_for_free, Some(false));
 }
 
 #[test]

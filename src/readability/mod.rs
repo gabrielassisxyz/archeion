@@ -111,7 +111,9 @@ pub struct UnreadableArticle {
 /// and lost it to the sliver rule above.
 ///
 /// `title` comes from the metadata record rather than from this page's markup, for the reason
-/// on `markdown::render`.
+/// on `markdown::render`. `accessible_for_free` is the same kind of value, handed in already
+/// resolved rather than derived here from raw JSON-LD, so this function reasons about one
+/// three-valued declaration and not about the shapes a page might have spelled it in.
 ///
 /// `rules` is the escape hatch for the sites the scorer cannot read. It is consulted before the
 /// page is scored and its host is recorded on whatever comes out, so an extraction always says
@@ -122,10 +124,13 @@ pub struct UnreadableArticle {
 /// has anything to do on a document with no markup in it to score. `rules` is part of what it
 /// skips, and it cannot be otherwise: a rule names a subtree of a tree nothing built here, so a
 /// host that has been told where its articles live is still told nothing about the Markdown
-/// copies it serves beside them.
+/// copies it serves beside them. `accessible_for_free` is not part of what it skips: a served
+/// document has no metadata record and therefore nothing to hand in, which is the same absence
+/// `title` already answers on that path.
 pub fn extract(
     source: PageSource<'_>,
     title: Option<&str>,
+    accessible_for_free: Option<bool>,
     rules: &SiteRules,
 ) -> Result<Extraction, UnreadableArticle> {
     let refused = |reason: String| UnreadableArticle {
@@ -240,6 +245,7 @@ pub fn extract(
             share: Some(share),
             excerpt,
             byline,
+            accessible_for_free,
             truncated,
             cost: AdmissionCost {
                 document_bytes: measured.byte_len,
@@ -286,6 +292,118 @@ fn non_empty(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Reads whether a page declared itself accessible without payment, from the JSON-LD blocks
+/// metadata extraction already parsed.
+///
+/// schema.org defines `isAccessibleForFree` on `CreativeWork`, so this is not a guess about one
+/// publisher's markup: it is the field a page uses to say the content in front of a reader
+/// either is or is not behind a wall, and the paywalled post that motivated this reads exactly
+/// as a healthy article by every other instrument this extractor has.
+///
+/// The blocks arrive as hostile input. Only a literal JSON boolean is read as a declaration;
+/// a string, a number or anything else found under the key is silently not one, on the same
+/// terms `named_entity` in the metadata module already reads a malformed author as none rather
+/// than as a guess at what it meant.
+///
+/// Nodes that disagree are answered toward the paywall: a page that anywhere says its content
+/// is not free is treated as having said so, even when another block claims otherwise, because
+/// missing a real wall defeats the reason this field exists and a spurious one costs a reader
+/// nothing worse than a second look at a note that turns out whole.
+///
+/// Exposed so a caller can resolve it from the metadata record before calling `extract`, on the
+/// same terms it already resolves `title` there.
+pub fn declared_accessible_for_free(json_ld: &[serde_json::Value]) -> Option<bool> {
+    let mut declared = None;
+    for node in schema_org_nodes(json_ld) {
+        match node
+            .get("isAccessibleForFree")
+            .and_then(serde_json::Value::as_bool)
+        {
+            Some(false) => return Some(false),
+            // Only from the node that is the document itself. A page describes several works
+            // in one block, its publisher and its site among them, and a site being free says
+            // nothing about the post on it: taking that as the article's own declaration lets
+            // a page make the archive claim a truncated note is whole, which is worse than the
+            // archive saying nothing. A refusal is not held to the same test, because a page
+            // has no reason to declare a wall it does not have.
+            Some(true) if describes_the_document(node) => declared = Some(true),
+            _ => {}
+        }
+    }
+    declared
+}
+
+/// The schema.org types a page uses for the document being read, rather than for the site
+/// around it or the organization behind it.
+///
+/// Kept to the types that mean an article, and deliberately not to `WebPage`, which a site
+/// puts on the wrapper that holds everything else and which would give back exactly the
+/// looseness this list exists to remove.
+const DOCUMENT_TYPES: [&str; 6] = [
+    "Article",
+    "NewsArticle",
+    "BlogPosting",
+    "Report",
+    "ScholarlyArticle",
+    "TechArticle",
+];
+
+/// Whether a node describes the document this extraction is reading.
+///
+/// `@type` may be a string or a list of them, since one work can be several types at once.
+fn describes_the_document(node: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    let names = match node.get("@type") {
+        Some(Value::String(name)) => return DOCUMENT_TYPES.contains(&name.as_str()),
+        Some(Value::Array(names)) => names,
+        _ => return false,
+    };
+    names
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|name| DOCUMENT_TYPES.contains(&name))
+}
+
+/// Flattens the shapes a JSON-LD block arrives in into the objects that might carry a field: a
+/// bare object, a list of them, or a `@graph` holding the list.
+///
+/// This mirrors the flattening metadata resolution already does over the same blocks, and it
+/// is kept local rather than shared: interpreting `isAccessibleForFree` is a decision this
+/// module owns about what an extracted article is, not a metadata field metadata resolution
+/// has any reason to know about.
+fn schema_org_nodes(blocks: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    use serde_json::Value;
+    let mut nodes = Vec::new();
+    for block in blocks {
+        match block {
+            // A list and a `@graph` compose: a block may be a list of objects, any of which
+            // holds a graph of its own. Taking the list alone reads the wrapper and misses
+            // every node in it, which is a shape real pages ship.
+            Value::Array(entries) => {
+                for entry in entries {
+                    push_node_and_its_graph(&mut nodes, entry);
+                }
+            }
+            Value::Object(_) => push_node_and_its_graph(&mut nodes, block),
+            _ => {}
+        }
+    }
+    nodes
+}
+
+/// Adds one node and whatever its `@graph` holds. The graph is not walked further than this,
+/// since a graph inside a graph is not a shape schema.org describes and following it would
+/// give a hostile page a depth to choose.
+fn push_node_and_its_graph<'a>(
+    nodes: &mut Vec<&'a serde_json::Value>,
+    node: &'a serde_json::Value,
+) {
+    if let Some(serde_json::Value::Array(graph)) = node.get("@graph") {
+        nodes.extend(graph.iter());
+    }
+    nodes.push(node);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +423,18 @@ mod tests {
     }
 
     fn extract_with(html: &str, title: Option<&str>, rules: &SiteRules) -> Extraction {
+        extract_declaring(html, title, None, rules)
+    }
+
+    /// The one helper here that exposes `accessible_for_free`, for the tests whose subject is
+    /// the declaration itself. Every other helper passes `None`, since the shape of the page
+    /// they build has nothing to do with what a paywall would have declared about it.
+    fn extract_declaring(
+        html: &str,
+        title: Option<&str>,
+        accessible_for_free: Option<bool>,
+        rules: &SiteRules,
+    ) -> Extraction {
         extract(
             PageSource {
                 body: html.as_bytes(),
@@ -312,6 +442,7 @@ mod tests {
                 final_url: "https://example.com/posts/one",
             },
             title,
+            accessible_for_free,
             rules,
         )
         .expect("a page this test wrote is readable")
@@ -346,6 +477,7 @@ mod tests {
                     content_type,
                     final_url: "https://example.com/logo.png",
                 },
+                None,
                 None,
                 &SiteRules::default(),
             );
@@ -638,6 +770,7 @@ mod tests {
                 final_url: "https://example.com/deep",
             },
             None,
+            None,
             &SiteRules::default(),
         )
         .expect_err("refused");
@@ -902,6 +1035,7 @@ mod tests {
                     final_url: "https://example.com/posts/one.md",
                 },
                 None,
+                None,
                 &SiteRules::default(),
             )
             .expect("a document this test wrote")
@@ -943,6 +1077,7 @@ mod tests {
                 final_url: "https://example.com/posts/one.md",
             },
             None,
+            None,
             &SiteRules::default(),
         )
         .expect("readable");
@@ -966,6 +1101,7 @@ mod tests {
                 final_url: "https://example.com/",
             },
             None,
+            None,
             &SiteRules::default(),
         )
         .expect("readable");
@@ -974,5 +1110,171 @@ mod tests {
         };
 
         assert!(article.markdown.contains("café"), "{}", article.markdown);
+    }
+
+    /// The defect this field exists to catch: every other instrument on the record reads a
+    /// paywalled teaser as a healthy article, and only the page's own declaration says
+    /// otherwise.
+    #[test]
+    fn an_article_declared_not_free_is_marked_partial() {
+        let article = article_from_declaring(&article_page(""), Some("t"), Some(false));
+
+        assert_eq!(article.record.accessible_for_free, Some(false));
+    }
+
+    #[test]
+    fn an_article_declared_free_is_marked_complete() {
+        let article = article_from_declaring(&article_page(""), Some("t"), Some(true));
+
+        assert_eq!(article.record.accessible_for_free, Some(true));
+    }
+
+    /// The third state, distinct from both. A reader that read this the same as "declared
+    /// free" would treat an ordinary page, which is most of the web, as one that was vouched
+    /// for by a declaration nobody made.
+    #[test]
+    fn an_article_with_no_declaration_says_nothing_was_declared() {
+        let article = article_from_declaring(&article_page(""), Some("t"), None);
+
+        assert_eq!(article.record.accessible_for_free, None);
+    }
+
+    fn article_from_declaring(
+        html: &str,
+        title: Option<&str>,
+        accessible_for_free: Option<bool>,
+    ) -> Article {
+        match extract_declaring(html, title, accessible_for_free, &SiteRules::default()) {
+            Extraction::Article(article) => article,
+            other => panic!("expected an article, got {other:?}"),
+        }
+    }
+
+    mod declared_accessible_for_free_tests {
+        use super::declared_accessible_for_free;
+        use serde_json::json;
+
+        #[test]
+        fn a_page_declaring_it_false_is_read_as_false() {
+            let blocks = [json!({"@type": "Article", "isAccessibleForFree": false})];
+            assert_eq!(declared_accessible_for_free(&blocks), Some(false));
+        }
+
+        /// A page describes several works in one block, and a free site says nothing about the
+        /// post on it. Taking that as the article's own word would let a page make the archive
+        /// claim a truncated note is whole, which is worse than the archive saying nothing.
+        #[test]
+        fn a_claim_of_free_access_by_something_that_is_not_the_document_is_not_the_document_s() {
+            let blocks = [json!([
+                {"@type": "WebSite", "isAccessibleForFree": true},
+                {"@type": "Article", "headline": "a post that said nothing either way"},
+            ])];
+            assert_eq!(declared_accessible_for_free(&blocks), None);
+        }
+
+        /// The refusal is not held to that test. A page has no reason to declare a wall it does
+        /// not have, so the conservative answer stays reachable from anywhere in the block.
+        #[test]
+        fn a_refusal_anywhere_in_the_block_is_still_read_as_a_refusal() {
+            let blocks = [json!([
+                {"@type": "WebSite", "isAccessibleForFree": false},
+                {"@type": "Article", "headline": "a post behind whatever that was"},
+            ])];
+            assert_eq!(declared_accessible_for_free(&blocks), Some(false));
+        }
+
+        /// One work can be several types at once, and a page writes that as a list.
+        #[test]
+        fn a_node_typed_as_several_things_counts_if_one_of_them_is_the_document() {
+            let blocks = [json!({
+                "@type": ["CreativeWork", "BlogPosting"],
+                "isAccessibleForFree": true,
+            })];
+            assert_eq!(declared_accessible_for_free(&blocks), Some(true));
+        }
+
+        /// A list and a graph compose, which is a shape real pages ship: a block is a list whose
+        /// entries hold graphs of their own. Reading only the outer list finds the wrappers and
+        /// none of the nodes.
+        #[test]
+        fn a_graph_nested_inside_a_list_is_still_read() {
+            let blocks = [json!([
+                {"@graph": [{"@type": "Article", "isAccessibleForFree": false}]},
+            ])];
+            assert_eq!(declared_accessible_for_free(&blocks), Some(false));
+        }
+
+        #[test]
+        fn a_page_declaring_it_true_is_read_as_true() {
+            let blocks = [json!({"@type": "Article", "isAccessibleForFree": true})];
+            assert_eq!(declared_accessible_for_free(&blocks), Some(true));
+        }
+
+        #[test]
+        fn a_page_declaring_nothing_reads_as_no_declaration() {
+            assert_eq!(declared_accessible_for_free(&[]), None);
+
+            let blocks = [json!({"@type": "Article", "headline": "A page"})];
+            assert_eq!(declared_accessible_for_free(&blocks), None);
+        }
+
+        /// Hostile shapes: the property schema.org types as a boolean, spelled by a page as
+        /// something else. Neither is read as a declaration, on the same terms a malformed
+        /// author elsewhere in this archive is read as none rather than as a guess.
+        #[test]
+        fn a_declaration_spelled_as_the_wrong_type_is_not_read_as_one() {
+            for hostile in [
+                json!({"isAccessibleForFree": "false"}),
+                json!({"isAccessibleForFree": "true"}),
+                json!({"isAccessibleForFree": 0}),
+                json!({"isAccessibleForFree": 1}),
+                json!({"isAccessibleForFree": null}),
+                json!({"isAccessibleForFree": ["false"]}),
+                json!({"isAccessibleForFree": {}}),
+            ] {
+                assert_eq!(
+                    declared_accessible_for_free(std::slice::from_ref(&hostile)),
+                    None,
+                    "{hostile}"
+                );
+            }
+        }
+
+        /// A block that is a bare array of nodes, and a block that nests its nodes inside
+        /// `@graph`, which is the shape a page attaches its own type to alongside the site's.
+        #[test]
+        fn a_declaration_nested_inside_an_array_or_a_graph_is_still_read() {
+            let array_block = json!([
+                {"@type": "Organization", "name": "A Site"},
+                {"@type": "Article", "isAccessibleForFree": false},
+            ]);
+            assert_eq!(declared_accessible_for_free(&[array_block]), Some(false));
+
+            let graph_block = json!({
+                "@context": "https://schema.org",
+                "@graph": [
+                    {"@type": "WebSite", "name": "A Site"},
+                    {"@type": "Article", "isAccessibleForFree": false},
+                ],
+            });
+            assert_eq!(declared_accessible_for_free(&[graph_block]), Some(false));
+        }
+
+        /// Repeated and conflicting. The conservative reading is the one that keeps a real wall
+        /// from being missed: a page that anywhere says its content is not free is read as
+        /// having said so, whatever another block claims.
+        #[test]
+        fn conflicting_declarations_resolve_toward_the_paywall() {
+            let blocks = [
+                json!({"@type": "Article", "isAccessibleForFree": true}),
+                json!({"@type": "Article", "isAccessibleForFree": false}),
+            ];
+            assert_eq!(declared_accessible_for_free(&blocks), Some(false));
+
+            // Order does not decide it: the same pair, read in the other order, still resolves
+            // to the paywall.
+            let reversed = [blocks[1].clone(), blocks[0].clone()];
+            assert_eq!(declared_accessible_for_free(&reversed), Some(false));
+        }
     }
 }

@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::CanonicalUrl;
 use crate::assets::{AssetCapture, retryable_miss};
 use crate::crawl::{CrawlEngine, Seed};
-use crate::metadata::{self, AssetKind, PageSource, ReferencedAsset};
+use crate::metadata::{self, AssetKind, PageMetadata, PageSource, ReferencedAsset};
 use crate::readability::{self, Extraction, ExtractionRules, SiteRules};
 use crate::storage::{Archive, Capture, CaptureId, StorageError};
 
@@ -173,7 +173,7 @@ fn repass_capture(
         .as_ref()
         .is_some_and(|metadata| metadata.extractor_version < metadata::EXTRACTOR_VERSION)
         || (metadata.is_none() && is_html(capture));
-    let article_stale = article_state.is_stale(capture, rules);
+    let article_stale = article_state.is_stale(capture, rules, metadata.as_ref());
     if !metadata_stale && !article_stale {
         run.derived_unchanged += 1;
         return Ok(());
@@ -218,7 +218,10 @@ fn repass_capture(
             .as_ref()
             .and_then(|metadata| metadata.title.as_ref())
             .map(|title| title.value.as_str());
-        match readability::extract(source, title, rules) {
+        let accessible_for_free = current_metadata
+            .as_ref()
+            .and_then(|metadata| readability::declared_accessible_for_free(&metadata.json_ld));
+        match readability::extract(source, title, accessible_for_free, rules) {
             Ok(extracted) => {
                 write_extraction(archive, url, capture, article_state, extracted, run)?
             }
@@ -296,7 +299,12 @@ impl ArticleState {
         Ok(Self::Missing)
     }
 
-    fn is_stale(&self, capture: &Capture, rules: &SiteRules) -> bool {
+    fn is_stale(
+        &self,
+        capture: &Capture,
+        rules: &SiteRules,
+        metadata: Option<&PageMetadata>,
+    ) -> bool {
         let current_rule_exists = rules.has_rule_for(&capture.final_url);
         if current_rule_exists || self.was_made_by_a_site_rule() {
             return true;
@@ -304,6 +312,7 @@ impl ArticleState {
         match self {
             Self::Article(article) => {
                 article.record.extractor_version < readability::EXTRACTOR_VERSION
+                    || self.has_an_unread_declaration(metadata)
             }
             Self::Refused(refused) => refused.extractor_version < readability::EXTRACTOR_VERSION,
             Self::NotArticle(non_article) => {
@@ -311,6 +320,25 @@ impl ArticleState {
             }
             Self::Missing => reads_as_prose(capture),
         }
+    }
+
+    /// Whether the page declared how much of itself it was serving and the record does not say.
+    ///
+    /// This is where the absence is answered, rather than by moving the extractor version. The
+    /// version says a record was written under weaker rules and means something else now, which
+    /// is not true here: a record with no declaration says nothing, and nothing is what it said.
+    /// What is true is that the answer has been sitting in the stored response all along, so the
+    /// captures worth re-reading are the ones whose own JSON-LD carries it, and moving the
+    /// version would instead rewrite every article in the archive to reach them. It is the same
+    /// answer the served-Markdown absence already got, for the same reason.
+    fn has_an_unread_declaration(&self, metadata: Option<&PageMetadata>) -> bool {
+        let Self::Article(article) = self else {
+            return false;
+        };
+        article.record.accessible_for_free.is_none()
+            && metadata.is_some_and(|metadata| {
+                readability::declared_accessible_for_free(&metadata.json_ld).is_some()
+            })
     }
 
     fn was_made_by_a_site_rule(&self) -> bool {

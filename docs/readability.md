@@ -375,6 +375,7 @@ They are set where a hostile page is certainly refused, not where a real page is
   },
   "excerpt": "Bread is mostly patience.",
   "byline": "J. Writer",
+  "accessible_for_free": null,
   "cost": {
     "document_bytes": 48213,
     "peak_open_elements": 42
@@ -385,6 +386,26 @@ They are set where a hostile page is certainly refused, not where a real page is
 `share` is what the sliver rule measured: the article's own text, and the text of the whole page it came out of. It is recorded for the pages that were kept and not only for the ones that were refused, on the same terms as `cost`: a file per refusal says the rule is firing, and only the shares real articles reach can say whether it is about to start firing on them. The two counts and not the ratio between them, because a ratio is a division somebody already did at a precision they chose, and the question these exist to answer is about the distribution of both sides.
 
 It is absent on records written before the rule existed, which is not the same as a page whose text measured nothing. A reader that treated a missing `share` as a pair of zeroes would fill the calibration it exists for with pages nobody measured.
+
+### What the page declared about paying for it
+
+A post behind a paywall is prose like any other, and every instrument above reads it as a healthy article: the word count is ordinary, and the sliver rule sees a share close to one, because what the page served really is almost all teaser and pitch. One capture measured a paywalled post at 303 words and a share of 1286 of 1584 characters, both numbers a short, complete post could just as easily have produced. Nothing about the shape of the text tells the two apart.
+
+Something else does. schema.org defines `isAccessibleForFree` on `CreativeWork`, and a paywalled page's own JSON-LD carries it as `false`. That is a declaration the response made about itself, not a guess this extractor formed by reading the prose, and it is the only field on this record that can be. It is read out of the JSON-LD blocks metadata extraction already parsed and stored, so no page is read twice to fill it.
+
+`accessible_for_free` is `Option<bool>`, and the three values it can hold say three different things: `true` is the page declaring itself whole, `false` is the page declaring a wall, and `null` is nothing declared, which is what an ordinary page and an old record both produce. `null` must not be read as `true`: no page said this article is complete, only that none of them said otherwise. A bare boolean cannot make that distinction, which is why this is not one.
+
+The JSON-LD a captured page carries is hostile input, the same as the markup around it. Only a literal JSON boolean under the key is read as a declaration; a string, a number, `null` under the key, or any other shape is silently not one, on the same terms a malformed `author` elsewhere in metadata resolution is read as absent rather than guessed at. The blocks are flattened the way metadata resolution already flattens them, a bare object, a list of them, or a `@graph` holding the list, and the two compose, since a list whose entries hold graphs is a shape real pages ship.
+
+The two answers are not reached on the same terms, and the asymmetry is the point. A page describes several works in one block, its publisher and the site around it among them, and a site being free says nothing about the post on it, so a claim of free access counts only from a node typed as the document being read. Taking it from anywhere would let a page make the archive assert that a truncated note is whole, which is worse than the archive saying nothing at all. A refusal is not held to that test and counts from any node, because a page has no reason to declare a wall it does not have. For the same reason, nodes that disagree resolve toward the paywall: any node saying `false` decides it, since missing a real wall defeats the reason this field exists and a spurious one costs a reader nothing worse than a second look at a note that turns out whole.
+
+This is deliberately not a text heuristic and deliberately not aimed at one publisher. Matching on a page's own `paywall` class names, or hardcoding anything about the one platform the capture that motivated this came from, would have been a guess about markup, and this project already has one rule about that: the signal is what the response declared, never a guess from the text.
+
+**A page behind a paywall is still archived as an article.** It is prose, it is what the server sent, and refusing it would lose the teaser and every other field on this record for no gain. It is kept and marked, not dropped, and the marking is carried into the export so a vault reader can tell without opening the archive.
+
+`accessible_for_free` did not move `extractor_version`. It is a new, additive field, and its absence on a record written before it existed is already the correct reading: nothing here said either way, which is exactly what an unmarked archive item should say. See the `extractor_version` history below.
+
+The absence is answered where absences are answered, by what a repass counts as worth re-reading, which is the same place the served-Markdown absence was answered and for the same reason. An article at the current version whose record carries no declaration, over a page whose stored JSON-LD does carry one, is stale for that alone. That reaches the captures this field exists for, the ones taken before anything read the declaration, without moving a version that would rewrite every article in the archive to reach a handful of them.
 
 A refused page gets a record of its own instead of this pair, holding the same measurement, the excerpt and nothing else:
 
@@ -431,6 +452,7 @@ The byline is also page-controlled, but it cannot answer the same way. A cut exc
   },
   "excerpt": "Bread is mostly patience.",
   "byline": null,
+  "accessible_for_free": null,
   "truncated": ["byline"],
   "cost": {
     "document_bytes": 48213,
@@ -456,7 +478,7 @@ The same `rules` rule applies here as on an article or refusal. It is `heuristic
 
 `rules` names how the prose in this record was obtained: `heuristic` when nothing was said about the host or when what was said matched nothing on this page, `site:<host>` when a rule actually reached it, and `served` when nothing scored anything because the response already was the prose. It stays one string across all three, because every reader that filters on it compares it to a string and turning it into an object would break all of them for nothing. A value this extractor cannot account for is refused rather than read as `heuristic`, which would claim a page was read with nothing said about it, and that refusal is what keeps a reader written before `served` existed from misreading one of those records rather than turning one away.
 
-A record for a document the site published looks like this. It carries no excerpt and no byline because nothing derived them, and its two counts are equal because the document is the whole page:
+A record for a document the site published looks like this. It carries no excerpt and no byline because nothing derived them, no declaration because a Markdown document has no JSON-LD for anything to read, and its two counts are equal because the document is the whole page:
 
 ```json
 {
@@ -481,7 +503,7 @@ A record for a document the site published looks like this. It carries no excerp
 
 `extractor_version` is bumped when the meaning of a field or a rule that fills one changes, not when a field is added, on the same terms as the metadata record. It is 3 today. It became 2 for the sliver rule: `share` arriving beside the counts would not have been enough on its own, but a page can now produce prose and still not be stored as an article, so the absence of a record beside a capture stopped meaning what it meant at 1. It became 3 when HTML article links and image descriptions stopped reaching the stored Markdown as page-controlled syntax.
 
-The rules layer, the not-article marker and the byline bound did not bump it. For the byline, a present value still means the attribution the page carried, and `truncated: ["byline"]` is an added answer only records written after the bound can carry. The records that exist did not change their meanings: `article_chars` and `page_chars` mean exactly what they meant at 2, and `rules` says whether a rule reached the page. The marker is a new record type with the same version as the extractor that made the decision. An older absence stays stale to a repass because it is absence, not because every article record needs a new number.
+The rules layer, the not-article marker, the byline bound and `accessible_for_free` did not bump it. For the byline, a present value still means the attribution the page carried, and `truncated: ["byline"]` is an added answer only records written after the bound can carry. The records that exist did not change their meanings: `article_chars` and `page_chars` mean exactly what they meant at 2, and `rules` says whether a rule reached the page. The marker is a new record type with the same version as the extractor that made the decision. An older absence stays stale to a repass because it is absence, not because every article record needs a new number. `accessible_for_free` is the same shape again: a record written before it existed said nothing about a paywall, and reading its absence as "nothing declared" is not a claim that record never had a chance to make, it is the true answer either way.
 
 ## What was deliberately left out
 

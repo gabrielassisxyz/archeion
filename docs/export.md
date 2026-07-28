@@ -63,14 +63,17 @@ site_name: "Example Site"
 language: "en"
 word_count: 420
 excerpt: "The first sentence of the article."
+accessible_for_free: null
 ---
 ```
 
-`title`, `author`, `site_name`, `language`, `published_at` and `excerpt` are `null` when the archive has no value for them. `canonical_url` comes from the item record. `captured_at` comes from the capture record. `word_count` and `excerpt` come from the article record. `published_at` uses the parsed timestamp from the metadata record when it has one, otherwise it uses the raw publication date string the page supplied.
+`title`, `author`, `site_name`, `language`, `published_at` and `excerpt` are `null` when the archive has no value for them. `canonical_url` comes from the item record. `captured_at` comes from the capture record. `word_count`, `excerpt` and `accessible_for_free` come from the article record. `published_at` uses the parsed timestamp from the metadata record when it has one, otherwise it uses the raw publication date string the page supplied.
 
 Timestamp fields are RFC 3339 strings. The examples above have whole-second precision because those records do, but the export preserves fractional seconds when the stored record has them.
 
-The YAML emitter is local to this command. String values are always double quoted, and quotes, backslashes, newlines, carriage returns, tabs and control characters are escaped. The schema is small and fixed, so a general YAML dependency would add maintenance and audit surface without buying a capability the command needs.
+`accessible_for_free` carries the page's own declaration, read from its JSON-LD, about whether the content in front of a reader was accessible without paying for it. `false` is what a paywall declares, and it is the one value that says the note's prose may stop where the wall does: the archive still keeps the response, but what got exported is only as much of it as the site let a reader without a subscription see. `true` is the page declaring itself whole. `null` is `word_count` and `excerpt`'s own case again: nothing in the archive said either way, and that is not the same claim as `true`, so a reader must not treat the two as interchangeable.
+
+The YAML emitter is local to this command. String values are always double quoted, booleans and `null` are written bare, and quotes, backslashes, newlines, carriage returns, tabs and control characters inside a string are escaped. The schema is small and fixed, so a general YAML dependency would add maintenance and audit surface without buying a capability the command needs.
 
 ## Slugs
 

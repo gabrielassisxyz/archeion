@@ -85,6 +85,7 @@ const MAX_ELEMENTS_TO_SCORE: usize = 50_000;
 /// as the ceilings above.
 const MIN_ARTICLE_CHARS: usize = 300;
 const MAX_EXCERPT_BYTES: usize = 4 * 1024;
+const MAX_BYLINE_BYTES: usize = 4 * 1024;
 
 /// The share is a quarter, compared by multiplying out. Integer arithmetic has no rounding to
 /// reason about, and it answers "keep" for a page holding no text rather than dividing by it.
@@ -221,6 +222,7 @@ pub fn extract(
             truncated,
         }));
     }
+    let byline = bounded_byline(article.byline.as_deref(), &mut truncated);
     let prose = markdown::render(
         &article.content,
         title,
@@ -237,7 +239,7 @@ pub fn extract(
             word_count: markdown::word_count(&prose.body),
             share: Some(share),
             excerpt,
-            byline: non_empty(article.byline.as_deref()),
+            byline,
             truncated,
             cost: AdmissionCost {
                 document_bytes: measured.byte_len,
@@ -256,6 +258,15 @@ fn bounded_excerpt(excerpt: Option<&str>, truncated: &mut Vec<ArticleBound>) -> 
     let end = markdown::floor_char_boundary(&excerpt, MAX_EXCERPT_BYTES);
     truncated.push(ArticleBound::Excerpt);
     Some(excerpt[..end].to_owned())
+}
+
+fn bounded_byline(byline: Option<&str>, truncated: &mut Vec<ArticleBound>) -> Option<String> {
+    let byline = non_empty(byline)?;
+    if byline.len() <= MAX_BYLINE_BYTES {
+        return Some(byline);
+    }
+    truncated.push(ArticleBound::Byline);
+    None
 }
 
 impl ProseShare {
@@ -445,6 +456,23 @@ mod tests {
     }
 
     #[test]
+    fn an_article_drops_a_byline_too_large_to_claim_as_attribution() {
+        let byline = "A".repeat(MAX_BYLINE_BYTES + 1);
+        let article = article_from(
+            &format!(
+                "<html><head><meta name=\"author\" content=\"{byline}\"></head>\
+                 <body><article><h1>How to bake bread</h1>{}</article></body></html>",
+                "<p>Bread is mostly patience, and the dough will tell you when it is ready.</p>"
+                    .repeat(8)
+            ),
+            Some("How to bake bread"),
+        );
+
+        assert_eq!(article.record.byline, None);
+        assert_eq!(article.record.truncated, [ArticleBound::Byline]);
+    }
+
+    #[test]
     fn a_refusal_records_when_its_excerpt_was_cut() {
         let excerpt = "A".repeat(MAX_EXCERPT_BYTES - 1) + "é beyond the ceiling";
         let page = front_page().replacen(
@@ -462,6 +490,23 @@ mod tests {
         assert_eq!(stored.len(), MAX_EXCERPT_BYTES - 1);
         assert!(excerpt.starts_with(&stored));
         assert_eq!(refused.truncated, [ArticleBound::Excerpt]);
+    }
+
+    #[test]
+    fn a_refusal_does_not_record_a_byline_it_does_not_carry() {
+        let byline = "A".repeat(MAX_BYLINE_BYTES + 1);
+        let page = front_page().replacen(
+            "<html>",
+            &format!("<html><head><meta name=\"author\" content=\"{byline}\"></head>"),
+            1,
+        );
+
+        let extracted = extract_html(&page, Some("The Slow Kitchen"));
+        let Extraction::Refused(refused) = extracted else {
+            panic!("a front page was not refused: {extracted:?}");
+        };
+
+        assert!(refused.truncated.is_empty());
     }
 
     #[test]

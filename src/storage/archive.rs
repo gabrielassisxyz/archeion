@@ -30,6 +30,7 @@ const EXTRACTION_RULES_FILE: &str = "extraction-rules.json";
 const FORMAT_NAME: &str = "archeion-archive";
 const FORMAT_VERSION: u32 = 1;
 const MAX_ARTICLE_RECORD_BYTES: u64 = 64 * 1024;
+const ARTICLE_RECORD_TOO_LARGE: &str = "larger than an article record can be";
 const MAX_ARTICLE_MARKDOWN_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_RECOVERED_ASSETS_RECORD_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -333,11 +334,7 @@ impl Archive {
         url: &CanonicalUrl,
         capture: &CaptureId,
     ) -> Result<Option<RefusedExtraction>, StorageError> {
-        read_optional_bounded_json(
-            &self.refused_extraction_path(url, capture),
-            MAX_ARTICLE_RECORD_BYTES,
-            "larger than an article record can be",
-        )
+        read_optional_article_state_record(&self.refused_extraction_path(url, capture))
     }
 
     /// Marks a captured page as one the article extractor read and deliberately passed over.
@@ -358,11 +355,7 @@ impl Archive {
         url: &CanonicalUrl,
         capture: &CaptureId,
     ) -> Result<Option<NonArticle>, StorageError> {
-        read_optional_bounded_json(
-            &self.non_article_path(url, capture),
-            MAX_ARTICLE_RECORD_BYTES,
-            "larger than an article record can be",
-        )
+        read_optional_article_state_record(&self.non_article_path(url, capture))
     }
 
     /// The prose read out of a capture, or `None`.
@@ -379,13 +372,10 @@ impl Archive {
         capture: &CaptureId,
     ) -> Result<Option<Article>, StorageError> {
         let record_path = self.article_record_path(url, capture);
-        let Some(stored) = read_optional_bounded_json::<StoredArticle>(
-            &record_path,
-            MAX_ARTICLE_RECORD_BYTES,
-            "larger than an article record can be",
-        )?
-        else {
-            return Ok(None);
+        let stored = match read_optional_article_state_record::<StoredArticle>(&record_path) {
+            Ok(Some(stored)) => stored,
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(error),
         };
         let path = self.article_markdown_path(url, capture);
         let Some(bytes) = read_optional_regular_file(
@@ -822,6 +812,19 @@ fn read_optional_bounded_json<T: DeserializeOwned>(
             path: path.to_owned(),
             source,
         })
+}
+
+fn read_optional_article_state_record<T: DeserializeOwned>(
+    path: &Path,
+) -> Result<Option<T>, StorageError> {
+    match read_optional_bounded_json(path, MAX_ARTICLE_RECORD_BYTES, ARTICLE_RECORD_TOO_LARGE) {
+        Ok(record) => Ok(record),
+        Err(StorageError::RefusedRecord {
+            path: refused,
+            reason,
+        }) if refused == path && reason == ARTICLE_RECORD_TOO_LARGE => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn read_optional_regular_file(

@@ -8,8 +8,8 @@ use archeion::crawl::{
 };
 use archeion::metadata;
 use archeion::readability::{
-    self, AdmissionCost, Article, ArticleRecord, ExtractionRules, ProseShare, RefusedExtraction,
-    SiteRules,
+    self, AdmissionCost, Article, ArticleBound, ArticleRecord, ExtractionRules, ProseShare,
+    RefusedExtraction, SiteRules,
 };
 use archeion::repass::{RepassOptions, repass_archive};
 use archeion::storage::{Archive, AssetMiss, Header, MissedAsset, NewCapture};
@@ -278,6 +278,60 @@ fn a_stale_article_that_is_now_a_listing_stops_reading_as_one() {
             .read_non_article(&url, &capture.id)
             .expect("non-article marker reads")
             .is_some()
+    );
+}
+
+#[test]
+fn an_oversized_article_state_record_is_rebuilt_by_repass() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid URL");
+    let byline = "A".repeat(70 * 1024);
+    let body = format!(
+        "<html><head><title>A page</title><meta name=\"author\" content=\"{byline}\"></head>\
+         <body><article>{}</article></body></html>",
+        "<p>Bread is mostly patience, and the dough will tell you when it is ready.</p>".repeat(8)
+    );
+    let capture = archive
+        .write_capture(html_capture(&url, &body))
+        .expect("capture is written");
+    archive
+        .write_refused_extraction(
+            &url,
+            &capture.id,
+            &RefusedExtraction {
+                extractor_version: readability::EXTRACTOR_VERSION,
+                rules: ExtractionRules::Heuristic,
+                share: ProseShare {
+                    article_chars: 137,
+                    page_chars: 1188,
+                },
+                excerpt: Some(byline),
+                truncated: Vec::new(),
+            },
+        )
+        .expect("old oversized refusal is written");
+
+    let run = repass_archive(
+        &ScriptedEngine::new(Vec::new()),
+        &archive,
+        &SiteRules::default(),
+        RepassOptions::default(),
+    )
+    .expect("repass succeeds");
+
+    assert_eq!(run.articles_written, 1);
+    let article = archive
+        .read_article(&url, &capture.id)
+        .expect("rebuilt article reads")
+        .expect("article was rebuilt");
+    assert_eq!(article.record.byline, None);
+    assert_eq!(article.record.truncated, [ArticleBound::Byline]);
+    assert!(
+        archive
+            .read_refused_extraction(&url, &capture.id)
+            .expect("old refusal does not remain readable")
+            .is_none()
     );
 }
 

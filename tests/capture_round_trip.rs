@@ -285,6 +285,59 @@ fn an_article_record_written_before_the_sliver_rule_still_reads() {
     assert_eq!(article.record.share, None);
 }
 
+#[test]
+fn an_article_record_too_large_to_read_is_stale_not_fatal() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+    let capture = archive
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
+        .expect("capture is stored");
+    let markdown = "# How to bake bread\n\nBread is mostly patience.";
+    let captures_dir = dir
+        .path()
+        .join("items")
+        .join("example.com")
+        .join(ItemId::of(&url).as_str())
+        .join("captures");
+
+    std::fs::write(
+        captures_dir.join(format!("{}.article.md", capture.id)),
+        markdown,
+    )
+    .expect("the document is written");
+    std::fs::write(
+        captures_dir.join(format!("{}.article.json", capture.id)),
+        format!(
+            r#"{{
+  "markdown_sha256": "{}",
+  "extractor_version": 2,
+  "rules": "heuristic",
+  "word_count": 5,
+  "share": {{ "article_chars": 240, "page_chars": 300 }},
+  "excerpt": null,
+  "byline": "{}",
+  "cost": {{ "document_bytes": 4096, "peak_open_elements": 12 }}
+}}"#,
+            ContentHash::of(markdown.as_bytes()),
+            "A".repeat(70 * 1024)
+        ),
+    )
+    .expect("the record is written");
+
+    assert_eq!(
+        archive
+            .read_article(&url, &capture.id)
+            .expect("an oversized derived record is stale rather than fatal"),
+        None
+    );
+}
+
 /// A refusal is one file and not a pair, and it stands where the article record would have
 /// been. The whole point of it is that the document beside it was never written: what a later
 /// review needs is the measurement that refused the page, and the prose is derivable from the

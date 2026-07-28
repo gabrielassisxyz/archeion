@@ -366,7 +366,7 @@ They are set where a hostile page is certainly refused, not where a real page is
 ```json
 {
   "markdown_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "extractor_version": 2,
+  "extractor_version": 3,
   "rules": "heuristic",
   "word_count": 1240,
   "share": {
@@ -390,7 +390,7 @@ A refused page gets a record of its own instead of this pair, holding the same m
 
 ```json
 {
-  "extractor_version": 2,
+  "extractor_version": 3,
   "rules": "heuristic",
   "share": {
     "article_chars": 137,
@@ -402,11 +402,11 @@ A refused page gets a record of its own instead of this pair, holding the same m
 
 There is no field naming the rule that refused it. One rule refuses here and its inputs are the two counts, so the comparison is readable from the record itself; a second rule is what would make naming them worth a field, and it will arrive with its own version bump.
 
-The excerpt is the one field here a page controls the length of, and the reader of these records refuses a file over 64 KiB. A page serving an enormous description could therefore write a refusal that would not read back, which would be reported by path rather than silently skipped. Both article and refusal records cut the excerpt to 4 KiB before writing. When that happens, `truncated` carries `excerpt`, and the stored value is only a prefix kept for review. The excerpt below is shortened for display; a real record with this flag stores a prefix close to the ceiling:
+The excerpt is the page-controlled field that both article and refusal records carry, and the reader of these records refuses a file over 64 KiB. A page serving an enormous description could therefore write a refusal that would not read back, which would be reported by path rather than silently skipped. Both article and refusal records cut the excerpt to 4 KiB before writing. When that happens, `truncated` carries `excerpt`, and the stored value is only a prefix kept for review. The excerpt below is shortened for display; a real record with this flag stores a prefix close to the ceiling:
 
 ```json
 {
-  "extractor_version": 2,
+  "extractor_version": 3,
   "rules": "heuristic",
   "share": {
     "article_chars": 137,
@@ -417,11 +417,37 @@ The excerpt is the one field here a page controls the length of, and the reader 
 }
 ```
 
+The byline is also page-controlled, but it cannot answer the same way. A cut excerpt is still an excerpt: the record says it is a prefix, and the reader knows what kind of value it holds. A cut byline can become a false attribution. If a page named twenty authors and only the first three fit, storing those three would claim an authorship the page did not claim. So an article byline over 4 KiB is not stored at all. When that happens, `byline` is absent and `truncated` carries `byline`, which says the page did provide an attribution but the record could not carry it honestly:
+
+```json
+{
+  "markdown_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "extractor_version": 3,
+  "rules": "heuristic",
+  "word_count": 1240,
+  "share": {
+    "article_chars": 6120,
+    "page_chars": 7043
+  },
+  "excerpt": "Bread is mostly patience.",
+  "byline": null,
+  "truncated": ["byline"],
+  "cost": {
+    "document_bytes": 48213,
+    "peak_open_elements": 42
+  }
+}
+```
+
+The 4 KiB ceiling is the first guess, not a measured distribution. The local corpus had too few bylines to calibrate a real percentile, so it borrows the already documented excerpt budget as a conservative record budget: enough for verbose real attributions, small enough that one free-text field cannot push the JSON record toward the 64 KiB reader ceiling. Like the other ceilings, it is meant to move once `AdmissionCost` and real archives give better evidence.
+
+Article-state records written before these ceilings can already be larger than the reader accepts. A derived article, refusal or not-article record over the 64 KiB record ceiling is treated as absent rather than fatal: the response body is still the authority, and `repass` can rebuild the derived answer from it. The `.article.md` beside an oversized article record may still be on disk, but the pair is not trusted until the record is readable again.
+
 A page the extractor read and judged not to be an article gets the smaller marker below:
 
 ```json
 {
-  "extractor_version": 2,
+  "extractor_version": 3,
   "rules": "heuristic"
 }
 ```
@@ -435,7 +461,7 @@ A record for a document the site published looks like this. It carries no excerp
 ```json
 {
   "markdown_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "extractor_version": 2,
+  "extractor_version": 3,
   "rules": "served",
   "word_count": 1240,
   "share": {
@@ -449,13 +475,13 @@ A record for a document the site published looks like this. It carries no excerp
 }
 ```
 
-`byline` is what the algorithm found in the page's own markup and is not the resolved author in the metadata record: the two disagree often, and collapsing them would hide which one to look at when an attribution comes out wrong. `word_count` counts the prose and not the heading, which is a title the metadata record already holds; it stays a rough figure for sorting and filtering, which is why it is not what the sliver rule weighs. `truncated` is absent when nothing was cut, which is the ordinary case. On an article record, `markdown` means the prose file beside the record is a prefix of the article, and `excerpt` means the excerpt field itself is a prefix. On a refusal record, only `excerpt` can appear there.
+`byline` is what the algorithm found in the page's own markup and is not the resolved author in the metadata record: the two disagree often, and collapsing them would hide which one to look at when an attribution comes out wrong. `word_count` counts the prose and not the heading, which is a title the metadata record already holds; it stays a rough figure for sorting and filtering, which is why it is not what the sliver rule weighs. `truncated` is absent when nothing was cut, which is the ordinary case. On an article record, `markdown` means the prose file beside the record is a prefix of the article, `excerpt` means the excerpt field itself is a prefix, and `byline` means the byline was too large to store as a truthful attribution. On a refusal record, only `excerpt` can appear there.
 
 `markdown_sha256` is the address of the document beside it, and it is what makes the pair safe to rewrite. Ordering alone is enough only the first time: writing over an existing pair and stopping between the two files leaves new prose beside an old record, both present, both parsing, and every field describing something that is no longer there. A reader that finds the two disagreeing reports no article, because the response the article was derived from is still in the archive and the pass that re-extracts will simply redo it.
 
-`extractor_version` is bumped when the meaning of a field or a rule that fills one changes, not when a field is added, on the same terms as the metadata record. It is 2 for the sliver rule: `share` arriving beside the counts would not have been enough on its own, but a page can now produce prose and still not be stored as an article, so the absence of a record beside a capture stopped meaning what it meant at 1.
+`extractor_version` is bumped when the meaning of a field or a rule that fills one changes, not when a field is added, on the same terms as the metadata record. It is 3 today. It became 2 for the sliver rule: `share` arriving beside the counts would not have been enough on its own, but a page can now produce prose and still not be stored as an article, so the absence of a record beside a capture stopped meaning what it meant at 1. It became 3 when HTML article links and image descriptions stopped reaching the stored Markdown as page-controlled syntax.
 
-The rules layer and the not-article marker did not bump it. The records that exist did not change their meanings: `article_chars` and `page_chars` mean exactly what they meant at 2, and `rules` says whether a rule reached the page. The marker is a new record type with the same version as the extractor that made the decision. An older absence stays stale to a repass because it is absence, not because every article record needs a new number.
+The rules layer, the not-article marker and the byline bound did not bump it. For the byline, a present value still means the attribution the page carried, and `truncated: ["byline"]` is an added answer only records written after the bound can carry. The records that exist did not change their meanings: `article_chars` and `page_chars` mean exactly what they meant at 2, and `rules` says whether a rule reached the page. The marker is a new record type with the same version as the extractor that made the decision. An older absence stays stale to a repass because it is absence, not because every article record needs a new number.
 
 ## What was deliberately left out
 

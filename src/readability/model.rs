@@ -94,6 +94,9 @@ impl<'de> Deserialize<'de> for ExtractionRules {
 pub enum ArticleBound {
     /// The excerpt was cut. What is stored is enough for review, not the whole page claim.
     Excerpt,
+    /// The byline was too large to store without risking the record. No prefix is stored,
+    /// because a partial attribution can claim authorship the page did not claim.
+    Byline,
     /// The Markdown was cut. What is stored is a prefix of the article, not the article.
     Markdown,
 }

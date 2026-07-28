@@ -13,6 +13,7 @@ mod markdown;
 mod markup_scan;
 mod model;
 mod rules;
+mod served;
 
 use dom_smoothie::{Config, Readability, ReadabilityError};
 
@@ -113,17 +114,27 @@ pub struct UnreadableArticle {
 /// `rules` is the escape hatch for the sites the scorer cannot read. It is consulted before the
 /// page is scored and its host is recorded on whatever comes out, so an extraction always says
 /// whether it was worked out or told.
+///
+/// A response that already is the prose is answered before any of that. Nothing below can beat
+/// a site's own separation of its article from its furniture, and none of the machinery below
+/// has anything to do on a document with no markup in it to score. `rules` is part of what it
+/// skips, and it cannot be otherwise: a rule names a subtree of a tree nothing built here, so a
+/// host that has been told where its articles live is still told nothing about the Markdown
+/// copies it serves beside them.
 pub fn extract(
     source: PageSource<'_>,
     title: Option<&str>,
     rules: &SiteRules,
 ) -> Result<Extraction, UnreadableArticle> {
-    let Some(html) = crate::metadata::decoded_html(source) else {
-        return Ok(Extraction::Nothing);
-    };
     let refused = |reason: String| UnreadableArticle {
         url: source.final_url.to_owned(),
         reason,
+    };
+    if let Some(document) = crate::metadata::decoded_markdown(source) {
+        return served::read(&document, source.final_url).map_err(refused);
+    }
+    let Some(html) = crate::metadata::decoded_html(source) else {
+        return Ok(Extraction::Nothing);
     };
 
     let (document, measured) = document::build(&html).map_err(|cost| refused(cost.reason()))?;
@@ -805,6 +816,7 @@ mod tests {
                 ExtractionRules::Site("lwn.net".to_owned()),
                 "\"site:lwn.net\"",
             ),
+            (ExtractionRules::Served, "\"served\""),
         ] {
             let written = serde_json::to_string(&rules).expect("a record is writable");
             assert_eq!(written, spelled);
@@ -822,6 +834,71 @@ mod tests {
                 "{unreadable} was read as an extraction rule"
             );
         }
+    }
+
+    /// Which media types reach the served reader, checked at the entry point rather than only
+    /// where the list is written. `text/plain` is what many servers answer with for a `.md`
+    /// path, and admitting it would turn every changelog and log in an archive into an article.
+    #[test]
+    fn only_a_response_that_said_it_is_markdown_is_read_as_the_prose_it_carries() {
+        let document = b"# The oven is fixed\n\nThe element went in this morning.\n";
+        let served = |content_type| {
+            extract(
+                PageSource {
+                    body: document,
+                    content_type,
+                    final_url: "https://example.com/posts/one.md",
+                },
+                None,
+                &SiteRules::default(),
+            )
+            .expect("a document this test wrote")
+        };
+
+        for content_type in [
+            Some("text/markdown"),
+            Some("text/markdown; charset=utf-8"),
+            Some("Text/Markdown"),
+            Some("text/x-markdown"),
+        ] {
+            let Extraction::Article(article) = served(content_type) else {
+                panic!("{content_type:?} did not produce an article");
+            };
+            assert_eq!(article.record.rules, ExtractionRules::Served);
+        }
+
+        for content_type in [Some("text/plain"), Some("application/octet-stream"), None] {
+            assert_eq!(
+                served(content_type),
+                Extraction::Nothing,
+                "for {content_type:?}"
+            );
+        }
+    }
+
+    /// The response is what says how the bytes are read, and it is the only thing that does: a
+    /// Markdown document has no tag to declare an encoding in, and a line of prose that merely
+    /// looks like one must not decide how the document around it is decoded.
+    #[test]
+    fn a_served_document_in_a_legacy_encoding_keeps_its_prose_readable() {
+        let (windows_1252, _, _) =
+            encoding_rs::WINDOWS_1252.encode("# Petit d\u{e9}jeuner\n\nUn caf\u{e9}.\n");
+
+        let extracted = extract(
+            PageSource {
+                body: &windows_1252,
+                content_type: Some("text/markdown; charset=windows-1252"),
+                final_url: "https://example.com/posts/one.md",
+            },
+            None,
+            &SiteRules::default(),
+        )
+        .expect("readable");
+        let Extraction::Article(article) = extracted else {
+            panic!("expected an article, got {extracted:?}");
+        };
+
+        assert!(article.markdown.contains("café"), "{}", article.markdown);
     }
 
     #[test]

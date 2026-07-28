@@ -9,15 +9,26 @@ use serde::{Deserialize, Serialize};
 ///
 /// 2 is the sliver rule: a page can now produce prose and still be refused as an article, so
 /// the absence of a record beside a capture stopped meaning what it meant at 1.
+///
+/// The served document did not bump it. No record that exists changed its meaning: `heuristic`
+/// and `site:<host>` say exactly what they said, and `served` is a value only records written
+/// after it can carry. The absence it did change, a Markdown capture with no article beside it,
+/// is answered where absences are answered, by what a repass counts as a media type worth
+/// re-reading, and answering it there re-reads the handful of captures it applies to instead of
+/// rewriting every article record in the archive to carry a larger number.
 pub const EXTRACTOR_VERSION: u32 = 2;
 
-/// What decided where the article was in the page.
+/// How the prose in a record was obtained.
 ///
 /// A generic scorer reads markup that follows convention and fails on sites with a layout of
 /// their own, so a host can be told directly where its prose lives. Recording which of the two
 /// produced an extraction is what lets a reader tell a page the heuristic happened to get right
 /// from one that needed to be told, and it is what keeps a share measured under a rule out of
 /// the distribution the heuristic's own numbers are calibrated against.
+///
+/// The third answer is not a third way of finding the article. It says no extraction happened
+/// at all, which a reader comparing two articles has to be able to tell: one of them was
+/// reconstructed and the other was published.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtractionRules {
     /// The scoring algorithm, with nothing said about this host.
@@ -25,6 +36,9 @@ pub enum ExtractionRules {
     /// The scoring algorithm, over the document a host's rule left behind. The host is the one
     /// the rule is filed under, which is the canonical spelling and not the page's own.
     Site(String),
+    /// Nothing scored anything: the response was already the prose, and the site's own
+    /// separation of it from the furniture is what the record holds.
+    Served,
 }
 
 impl fmt::Display for ExtractionRules {
@@ -32,6 +46,7 @@ impl fmt::Display for ExtractionRules {
         match self {
             Self::Heuristic => formatter.write_str("heuristic"),
             Self::Site(host) => write!(formatter, "site:{host}"),
+            Self::Served => formatter.write_str("served"),
         }
     }
 }
@@ -52,6 +67,9 @@ impl<'de> Deserialize<'de> for ExtractionRules {
         let spelled = String::deserialize(deserializer)?;
         if spelled == "heuristic" {
             return Ok(Self::Heuristic);
+        }
+        if spelled == "served" {
+            return Ok(Self::Served);
         }
         match spelled.strip_prefix("site:") {
             Some(host) if !host.is_empty() => Ok(Self::Site(host.to_owned())),
@@ -95,6 +113,10 @@ pub struct ArticleRecord {
     /// Absent on records written before the rule existed, which is not the same as a page that
     /// measured nothing. A record must not answer a question the extractor that wrote it was
     /// never asked.
+    ///
+    /// A served document is measured like any other rather than left absent, and its two counts
+    /// are equal because the document is the whole page. That keeps the absence above meaning
+    /// one thing, which is the only reason it is worth reading.
     pub share: Option<ProseShare>,
     pub excerpt: Option<String>,
     /// The attribution the page's own markup carried, which is deliberately not the resolved

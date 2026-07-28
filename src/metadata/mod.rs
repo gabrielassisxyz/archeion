@@ -24,6 +24,14 @@ pub use model::{
 /// which is not a failure and does not produce an empty record.
 const HTML_MEDIA_TYPES: [&str; 2] = ["text/html", "application/xhtml+xml"];
 
+/// The media types that mean the response is already the prose, read by readability and never
+/// by this extractor: there are no tags in one to read.
+///
+/// `text/plain` is deliberately not here. It is what many servers answer with for a `.md` path,
+/// and admitting it would turn every changelog, log and `robots.txt` in an archive into an
+/// article. A server that has not said the document is Markdown has not said it is prose.
+const MARKDOWN_MEDIA_TYPES: [&str; 2] = ["text/markdown", "text/x-markdown"];
+
 /// A page the parser gave up on. It names the URL because the point of reporting it is to
 /// go and look at the stored body, and a count would leave nothing to look at.
 ///
@@ -76,6 +84,22 @@ pub(crate) fn decoded_html(source: PageSource<'_>) -> Option<Cow<'_, str>> {
     media_type
         .is_some_and(|media_type| HTML_MEDIA_TYPES.contains(&media_type.as_str()))
         .then(|| decode::decode_html(source.body, charset.as_deref()))
+}
+
+/// The document a response carried as Markdown, or `None` when it carried something else.
+///
+/// It lives beside `decoded_html` rather than in the extractor that reads it, for the reason
+/// above: which media types are worth reading and how their bytes become text is one question,
+/// and answering it in two places is how the two answers drift apart.
+///
+/// The encoding comes from the response alone. A `<meta charset>` near the top of a Markdown
+/// document is a line of prose, not a declaration, and honoring it would let a document that
+/// merely writes about markup decide how it is read.
+pub(crate) fn decoded_markdown(source: PageSource<'_>) -> Option<Cow<'_, str>> {
+    let (media_type, charset) = split_content_type(source.content_type);
+    media_type
+        .is_some_and(|media_type| MARKDOWN_MEDIA_TYPES.contains(&media_type.as_str()))
+        .then(|| decode::decode_text(source.body, charset.as_deref()))
 }
 
 /// Splits `text/html; charset=utf-8` into the media type and the charset, both lowercased.

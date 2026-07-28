@@ -23,17 +23,27 @@ const PRESCAN_BYTES: usize = 1024;
 /// bad byte still has a title, and refusing the whole document over it would archive less
 /// than the bytes support.
 pub(crate) fn decode_html<'a>(bytes: &'a [u8], declared_charset: Option<&str>) -> Cow<'a, str> {
-    let fallback = declared_charset
-        .and_then(label_to_encoding)
-        .or_else(|| {
-            prescan_meta_charset(bytes)
-                .as_deref()
-                .and_then(label_to_encoding)
-        })
-        .unwrap_or(UTF_8);
+    let fallback = declared_charset.and_then(label_to_encoding).or_else(|| {
+        prescan_meta_charset(bytes)
+            .as_deref()
+            .and_then(label_to_encoding)
+    });
+    decode_with(bytes, fallback)
+}
+
+/// Decodes a body that is not markup.
+///
+/// The same order minus the prescan, because there is no document to prescan: what looks like
+/// a `<meta charset>` inside a Markdown file is a line of text, and reading it as a
+/// declaration would let a document that writes about markup decide how it is read.
+pub(crate) fn decode_text<'a>(bytes: &'a [u8], declared_charset: Option<&str>) -> Cow<'a, str> {
+    decode_with(bytes, declared_charset.and_then(label_to_encoding))
+}
+
+fn decode_with<'a>(bytes: &'a [u8], fallback: Option<&'static Encoding>) -> Cow<'a, str> {
     // `decode` sniffs a byte order mark first and lets it override the fallback, which is
     // exactly the precedence wanted here and the reason it is preferred over `decode_with_bom_removal`.
-    let (text, _encoding_used, _had_errors) = fallback.decode(bytes);
+    let (text, _encoding_used, _had_errors) = fallback.unwrap_or(UTF_8).decode(bytes);
     text
 }
 

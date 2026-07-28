@@ -24,6 +24,11 @@ use tempfile::TempDir;
 const INDEX: &str = r#"<html><head><title>An index</title></head>
     <body><ul><li><a href="/article.html">the article</a></li></ul></body></html>"#;
 const STYLESHEET: &[u8] = b"body { color: rebeccapurple }";
+/// An index whose entry is served as Markdown beside nothing else, which is the shape the
+/// `llms.txt` convention produces and the one a real capture found.
+const MARKDOWN_INDEX: &str = r#"<html><head><title>An index</title></head>
+    <body><ul><li><a href="/post.md">the post</a></li></ul></body></html>"#;
+const POST_MARKDOWN: &[u8] = b"# The oven is fixed\n\nThe element went in this morning.\n";
 
 fn article_page() -> String {
     format!(
@@ -96,6 +101,63 @@ fn a_seed_is_crawled_into_an_archive_that_the_run_creates() {
         .expect("the prose is stored")
         .expect("the article page produced prose");
     assert!(article.markdown.contains("Bread is mostly patience"));
+}
+
+/// A page the site published as Markdown, crawled the way one is really reached: through a
+/// link on an ordinary HTML index.
+///
+/// It opens a socket for the reason the test above does, and it is the only thing that can
+/// answer the question the scripted engines cannot. Whether the crawl engine follows a link to
+/// a document that is not markup, and hands the response over as a page rather than dropping
+/// it, is a property of the engine and its configuration: it compiles either way, and every
+/// test that builds its own events would pass either way.
+#[test]
+fn a_post_the_site_serves_as_markdown_is_archived_as_the_article_it_already_is() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let site = Site::start();
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(site.url("/markdown-index.html"))
+        .args([
+            "--max-pages",
+            "4",
+            "--concurrency",
+            "1",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stdout_of(&output).contains("articles      1 extracted"),
+        "{}",
+        stdout_of(&output)
+    );
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    let url = CanonicalUrl::parse(&site.url("/post.md")).expect("valid url");
+    let captures = archive.list_captures(&url).expect("captures are listed");
+    let article = archive
+        .read_article(&url, &captures[0])
+        .expect("the prose is stored")
+        .expect("the served document is the article");
+    assert!(
+        article
+            .markdown
+            .contains("The element went in this morning")
+    );
+    // The record says the site published this rather than that anything scored it, which is
+    // what a reader comparing two articles has to be able to tell.
+    assert_eq!(
+        article.record.rules,
+        archeion::readability::ExtractionRules::Served
+    );
 }
 
 /// A run creating the archive is the only way to get a first one, and a path typed wrong is
@@ -316,6 +378,12 @@ fn answer(mut stream: TcpStream) -> std::io::Result<()> {
         "/index.html" => ("200 OK", "text/html; charset=utf-8", INDEX.as_bytes()),
         "/article.html" => ("200 OK", "text/html; charset=utf-8", article.as_bytes()),
         "/style.css" => ("200 OK", "text/css", STYLESHEET),
+        "/markdown-index.html" => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            MARKDOWN_INDEX.as_bytes(),
+        ),
+        "/post.md" => ("200 OK", "text/markdown; charset=utf-8", POST_MARKDOWN),
         _ => ("404 Not Found", "text/plain", b"not here"),
     };
     let head = format!(

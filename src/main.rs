@@ -7,9 +7,22 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+/// Published because a script reading the records has no other way to tell a short answer
+/// from a complete one: a walk that skipped a damaged item still prints every item it could
+/// read, and the code is the only part of that which is not easy to miss.
+const EXIT_CODES: &str = "\
+Exit codes:
+  0  the command did what it was asked
+  1  the archive is missing, damaged, or could not be written to
+  2  the command line could not be read";
+
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(version, about, after_help = EXIT_CODES)]
 struct Cli {
+    /// Answer with records rather than with a table: one JSON object per item for `list`,
+    /// and one object for the run for `export`.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -18,9 +31,6 @@ struct Cli {
 enum Command {
     /// List the items stored in an archive.
     List {
-        /// Emit one JSON object per item.
-        #[arg(long)]
-        json: bool,
         /// Archive directory to read.
         archive: PathBuf,
     },
@@ -45,11 +55,11 @@ fn main() {
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
-        Command::List { json, archive } => cli::list::list(archive, json),
+        Command::List { archive } => cli::list::list(archive, cli.json),
         Command::Export {
             all_captures,
             archive,
             destination,
-        } => cli::export::export(archive, destination, all_captures),
+        } => cli::export::export(archive, destination, all_captures, cli.json),
     }
 }

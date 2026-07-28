@@ -358,10 +358,8 @@ impl Scanner {
         let Some(srcset) = srcset else {
             return;
         };
-        for candidate in srcset.split(',') {
-            if let Some(url) = candidate.split_ascii_whitespace().next() {
-                self.see_asset(url.to_owned(), AssetKind::Image);
-            }
+        for url in srcset_urls(&srcset) {
+            self.see_asset(url.to_owned(), AssetKind::Image);
         }
     }
 
@@ -375,6 +373,79 @@ impl Scanner {
         }
         self.page
     }
+}
+
+/// The URLs a `srcset` lists, in the order it lists them.
+///
+/// The separator is a comma, and a comma is legal inside a URL: an image served through a
+/// transformation network spells its parameters that way, `w_320,h_213,c_fill`. Splitting on
+/// the character alone turns one candidate into a handful of fragments, and a fragment is a
+/// relative reference, so the archive ends up asking the page's own origin for addresses that
+/// were never on the page. That is a request the page did not make, which is a rate limit at
+/// best and a page choosing where the archive knocks at worst.
+///
+/// What separates candidates is therefore the end of the URL rather than the character: a URL
+/// runs to whitespace, and the comma that follows it, or the commas it ends with when it
+/// carries no descriptor, are the separator. This is the specification's own reading, and the
+/// only one under which `a.png,b.png` is the single address a browser requests.
+///
+/// What is deliberately not done is validating the descriptor. A browser drops a candidate
+/// whose descriptor is malformed, and this keeps it, because the two are answering different
+/// questions: a browser is choosing which one image to fetch for a viewport, and the archive
+/// is recording every address the page listed, having already said above that it does not model
+/// that choice. It buys no safety either way, since a page that wants a request made writes a
+/// descriptor that is valid.
+///
+/// Lazy rather than collected, so an attribute holding more candidates than the archive will
+/// keep costs the ceiling above rather than a vector the size of the attribute.
+fn srcset_urls(srcset: &str) -> impl Iterator<Item = &str> {
+    let bytes = srcset.as_bytes();
+    let mut position = 0;
+
+    std::iter::from_fn(move || {
+        loop {
+            // Whitespace and commas are skipped together, so an empty candidate between two
+            // separators disappears rather than becoming an empty address.
+            while position < bytes.len()
+                && (bytes[position].is_ascii_whitespace() || bytes[position] == b',')
+            {
+                position += 1;
+            }
+            let start = position;
+            while position < bytes.len() && !bytes[position].is_ascii_whitespace() {
+                position += 1;
+            }
+            if start == position {
+                return None;
+            }
+
+            let token = &srcset[start..position];
+            let url = token.trim_end_matches(',');
+            // A URL that kept its last character ran to whitespace rather than to a separator,
+            // so a descriptor follows and reaches to the next comma. A descriptor may hold one
+            // inside parentheses, and being inside them is a state rather than a depth: a
+            // second opening parenthesis is content there, so counting it would hide the comma
+            // that ends the candidate and swallow the next one.
+            if url.len() == token.len() {
+                let mut inside_parentheses = false;
+                while position < bytes.len() {
+                    match bytes[position] {
+                        b'(' => inside_parentheses = true,
+                        b')' => inside_parentheses = false,
+                        b',' if !inside_parentheses => {
+                            position += 1;
+                            break;
+                        }
+                        _ => {}
+                    }
+                    position += 1;
+                }
+            }
+            if !url.is_empty() {
+                return Some(url);
+            }
+        }
+    })
 }
 
 /// Appends what fits and reports whether the ceiling was reached. Characters are appended

@@ -20,6 +20,11 @@ dom_smoothie = "0.18"
 # them, readable for metadata.
 encoding_rs = "0.8.35"
 htmd = "0.5"
+# The streaming parser hands back an attribute's bytes as written, references and all: a
+# value is markup, not text, and something in this tree already decodes it correctly for
+# readability's own output. Already reachable through dom_smoothie, so this only names a
+# transitive dependency directly rather than adding a new one.
+html-escape = "0.2"
 jiff = { version = "0.2.35", default-features = false, features = ["std", "serde"] }
 # A streaming rewriter rather than a DOM, used here only to read. Everything metadata
 # extraction looks at is a tag and an attribute, and a page arriving from the open web is

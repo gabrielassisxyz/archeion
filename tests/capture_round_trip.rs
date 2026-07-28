@@ -1246,11 +1246,12 @@ fn a_derived_record_edited_to_hold_something_else_is_refused() {
     // Derived or not, a file read back off disk is input from outside this process.
     let path = metadata_file(dir.path(), &url, &capture.id);
     let record = std::fs::read_to_string(&path).expect("read record");
-    std::fs::write(
-        &path,
-        record.replace("\"extractor_version\": 1", "\"extractor_version\": []"),
-    )
-    .expect("write record");
+    // Written against the version the extractor actually stamped, so that bumping it leaves
+    // this test asserting what it says rather than silently editing nothing.
+    let stamped = format!("\"extractor_version\": {}", metadata::EXTRACTOR_VERSION);
+    let edited = record.replace(&stamped, "\"extractor_version\": []");
+    assert_ne!(edited, record, "the record should carry {stamped}");
+    std::fs::write(&path, edited).expect("write record");
 
     assert!(matches!(
         archive.read_metadata(&url, &capture.id),

@@ -118,6 +118,7 @@ dependencies = [
  "dom_smoothie",
  "encoding_rs",
  "htmd",
+ "html-escape",
  "jiff",
  "lol_html",
  "pulldown-cmark",

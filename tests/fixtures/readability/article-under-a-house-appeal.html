@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>What the compiler cannot promise you</title></head>
+<body>
+<div class="topnav"><a href="/">Home</a><a href="/archives">Archives</a><a href="/subscribe">Subscribe</a></div>
+<div class="maincolumn">
+<div class="PageHeadline"><h1>What the compiler cannot promise you</h1></div>
+<div class="ArticleText"><main>
+<blockquote class="ad">
+  <strong>For readers, by readers</strong>
+  <p>Every article on this site is written by a person who was paid to write it, and paying them is what your subscription does. If this piece was worth your afternoon, a subscription keeps the next one coming, and there is a free trial month waiting if you would rather see a few more before deciding. We have no advertisers to answer to and no interest in acquiring any, which is a position that only holds while enough readers find it worth paying for.</p>
+</blockquote>
+<p>The talk opened with a claim that sounded like a provocation and turned out to be a definition: a type system does not make a program correct, it makes a class of incorrect programs impossible to write down. Everything after that followed from taking the distinction seriously.</p>
+<p>The example was a buffer whose length is carried beside it. Nothing in the language stops the two from disagreeing, because the language has no idea they are meant to agree. What the type system can do is refuse to hand out a pair that was never checked, so that the check happens once, at the boundary, instead of at every use where somebody might forget it.</p>
+<h2>Where the boundary goes</h2>
+<p>Putting the boundary in the right place is the whole difficulty. Too far out and every internal function carries proof obligations it should not have to think about. Too far in and the unchecked pair travels through half the program before anything looks at it, which is the situation the type system was supposed to prevent.</p>
+<p>The rule offered was to put it where the data stops being someone else's. A response arriving from the network is untrusted until it has been parsed into something whose shape is guaranteed, and the parse is the boundary whether or not anyone drew it there deliberately.</p>
+<h2>What it costs</h2>
+<p>It costs the ability to write the quick version. A function that takes the checked type cannot be called with the two loose values you happen to have, and the answer is not to add an escape hatch but to move the check earlier, which is usually more work than it sounds like and is the point.</p>
+<p>The closing argument was that this is not a technique for safety-critical software that has arrived in ordinary software by accident. It is what any program does when it stops being small, and the only question is whether the invariants are written where a compiler can read them or in a comment nobody updated.</p>
+<table class="IndexEntries">
+  <tr><th colspan="2">Index entries for this article</th></tr>
+  <tr><td><a href="/archives/conference/">Conference</a></td><td><a href="/archives/conference/#2026">Systems 2026</a></td></tr>
+  <tr><td><a href="/archives/guest/">GuestArticles</a></td><td><a href="/archives/guest/#anon">Anonymous</a></td></tr>
+</table>
+</main></div>
+</div>
+<div class="footer"><p>Copyright 2026. All rights reserved.</p></div>
+</body>
+</html>

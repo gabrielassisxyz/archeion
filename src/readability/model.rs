@@ -1,5 +1,7 @@
 //! What an extraction produced: the Markdown document and the record beside it.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// The extractor that produced a record. Bumped when the meaning of a field or a rule that
@@ -12,14 +14,55 @@ pub const EXTRACTOR_VERSION: u32 = 2;
 /// What decided where the article was in the page.
 ///
 /// A generic scorer reads markup that follows convention and fails on sites with a layout of
-/// their own, so a per-host override layer is coming. Recording which of the two produced an
-/// extraction is what lets a reader tell a page the heuristic happened to get right from one
-/// that needed to be told.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// their own, so a host can be told directly where its prose lives. Recording which of the two
+/// produced an extraction is what lets a reader tell a page the heuristic happened to get right
+/// from one that needed to be told, and it is what keeps a share measured under a rule out of
+/// the distribution the heuristic's own numbers are calibrated against.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtractionRules {
     /// The scoring algorithm, with nothing said about this host.
     Heuristic,
+    /// The scoring algorithm, over the document a host's rule left behind. The host is the one
+    /// the rule is filed under, which is the canonical spelling and not the page's own.
+    Site(String),
+}
+
+impl fmt::Display for ExtractionRules {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Heuristic => formatter.write_str("heuristic"),
+            Self::Site(host) => write!(formatter, "site:{host}"),
+        }
+    }
+}
+
+/// One string and not a value whose shape depends on which variant it is.
+///
+/// `rules` was a string when the only answer was `heuristic`, and every reader that filters on
+/// it, `jq` at a prompt included, compares it to one. Turning it into an object for the second
+/// variant would break all of them for nothing, so the host is spelled inside the string.
+impl Serialize for ExtractionRules {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtractionRules {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let spelled = String::deserialize(deserializer)?;
+        if spelled == "heuristic" {
+            return Ok(Self::Heuristic);
+        }
+        match spelled.strip_prefix("site:") {
+            Some(host) if !host.is_empty() => Ok(Self::Site(host.to_owned())),
+            // A record naming rules this extractor cannot account for is refused rather than
+            // read as the heuristic, which would claim the page was read with nothing said
+            // about it.
+            _ => Err(serde::de::Error::custom(format!(
+                "{spelled:?} does not name an extraction rule"
+            ))),
+        }
+    }
 }
 
 /// A ceiling the article reached, recorded rather than silently applied.
@@ -72,9 +115,14 @@ pub struct ArticleRecord {
 pub struct ProseShare {
     /// The extracted article's own text, without the Markdown that will be written around it.
     pub article_chars: usize,
-    /// The page's text with the bodies of scripts, styles and templates left out, and the rest
-    /// left in: navigation, banners, and every block the scorer discarded. It is not what a
-    /// reader would have seen, since a page can hide text with CSS and this never resolves it.
+    /// The text of the document the scorer was handed, with the bodies of scripts, styles and
+    /// templates left out and the rest left in: navigation, banners, and every block the scorer
+    /// discarded. It is not what a reader would have seen, since a page can hide text with CSS
+    /// and this never resolves it.
+    ///
+    /// The document and not the page, because a host's rule may have narrowed one to the other
+    /// before this was counted. `rules` on the record beside it is what says which, and a
+    /// calibration that mixes the two is comparing an article against itself.
     pub page_chars: usize,
 }
 

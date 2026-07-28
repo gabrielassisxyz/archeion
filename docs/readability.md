@@ -30,15 +30,16 @@ It also survives the tool. A directory of Markdown files is readable in any edit
 2. weigh         refuse markup too expensive to parse
 3. build         text to a document tree
 4. guard         refuse a document too deep to score
-5. select        find the article, drop the furniture
-6. convert       article markup to Markdown
-7. bound         cut what is over the ceiling and say so
-8. judge         refuse a sliver of a page that mostly said something else
+5. narrow        apply what this host has been told, if anything
+6. select        find the article, drop the furniture
+7. convert       article markup to Markdown
+8. bound         cut what is over the ceiling and say so
+9. judge         refuse a sliver of a page that mostly said something else
 ```
 
 The order of the first four is the design, not an arrangement. Each guard has to run before the step it protects, and each would be useless after it. The last step is the opposite case: it weighs the extraction against the page it came out of, so it is the one thing here that can only run once both exist.
 
-Steps 3, 5 and 6 are separate functions rather than one block. That is not decoration: per-host extraction rules will hook between 2 and 4, telling the scorer directly which subtree is the article and which selectors are furniture, and the split is what makes that an addition rather than a rewrite. The record carries a `rules` field, `heuristic` until then, so a stored article always says how it was made.
+Step 5 is where a host's own rules apply, and it sits where it does because it is the last moment the document exists in one piece and the first moment there is a tree to select in. The record carries a `rules` field naming what produced the extraction, so a stored article always says whether it was worked out or told.
 
 ### The parser, and why there are two of them in this binary
 
@@ -103,6 +104,73 @@ A floor alone would discard the announcement and the single-paragraph note, whic
 **These numbers were chosen against pages from few origins, which is not enough**, and they are expected to move for the same reason the ceilings below are. So every article records what it measured, and every refusal is written to the archive beside the capture it refused, as `<capture-id>.article-refused.json`. A count of refusals says the rule is firing; only the pages it refused and the shares the kept articles reached can say whether it fired on something it should have kept. That file is the queue a later pass reads.
 
 Only pages the rule turned down are written there, never the many that the probe passed over. Those are most of the web, and a file for each of them would bury the few worth reviewing under the many that say nothing.
+
+## Per-host rules, for the sites the scorer cannot read
+
+A scoring heuristic reads markup that follows convention and fails on sites with a layout of their own. Everyone who has taken this seriously converged on the same architecture: the heuristic as the baseline, plus a per-host override expressed as data rather than as code. `ftr-site-config` has over a thousand files, one per domain; Mercury had roughly 150 extractors, one module per domain; Firefox reader mode has no override layer at all and is notoriously weak on exactly these sites.
+
+The rules live in the archive, at `extraction-rules.json` beside `archeion.json`, and they are the one file there a person writes rather than the program. They are in the archive rather than in a configuration directory because a re-pass over these stored responses has to read them to produce the same articles again: an archive that travels without its rules extracts differently on the next machine and says nothing about why.
+
+```json
+{
+  "hosts": {
+    "lwn.net": {
+      "why": "the subscription appeal is prose inside the article container",
+      "strip": ["blockquote.ad", "table.IndexEntries"]
+    },
+    "tildes.net": {
+      "why": "a topic page nests the replies inside the same element as the post",
+      "body": ["div.topic-full-text"]
+    }
+  }
+}
+```
+
+The key is the host as canonicalization spells it, which is the same string the archive files the item under: `www.` folded away, the case flattened. The match is exact, so a subdomain is a different site until one asks for something else. `why` is read by a person and never by the extractor, and it is there because a rule whose reason is not written down is a rule nobody can decide to delete a year from now.
+
+### The two directives, and the pages that asked for them
+
+**`strip` is where furniture survived the scorer.** A site that opens every article with an appeal for subscriptions, written as prose and placed inside the article container, defeats every generic instrument at once: it is several sentences of connected text, it carries no links a link-density rule would catch, and it sits exactly where the prose sits. The extraction carried it into the archive as the article's opening paragraph. The same page closed with a table of index terms that came through as a table of index terms. Neither is a defect in the scoring; both are cases where only somebody who has looked at the site can say which block is not the article.
+
+**`body` is where the scorer chose the wrong subtree, or the page is not an article at all.** A forum's topic pages nest the replies inside the same element as the post, so what landed in the archive was a fifty-word post with five thousand words of other people's writing appended and nothing marking where the post ended. There is no container holding the post alone above it and no selector for the replies that the site would not eventually rename, so naming the post's own element is the only statement that separates them.
+
+The second half of `body` is what makes it a statement about the site rather than about one page. The same forum's group listing carries the opening paragraph of every topic, which is several hundred words of genuine prose, so the sliver rule keeps it and a listing lands in the archive filed beside the articles. A host that has declared where its articles live has answered that too: **a page with none of it is not an article**. Falling back to the heuristic there would switch the rule off on exactly the pages that motivated it.
+
+### What applying a rule changes
+
+`body` runs first and `strip` second, which is the order the pipeline reads in: narrow to the article, then take the furniture out of it. It also makes a `strip` selector cheaper to write, since by the time one runs it only has to describe what is left.
+
+For `body`, the first selector that matches anything wins, and what it matched becomes the whole document. A second selector is an alternative spelling of where the article is, not an addition: taking every selector's matches would glue two unrelated blocks together on the pages where a site's old and new markup both happen to appear. A match nested inside another match is dropped, since moving both would pull the inner one out of the outer one and hand back the article reordered.
+
+The subtree is moved inside the tree it is already in. Nothing is serialized and parsed again, which matters because the ceilings above have already been paid by the time a rule runs, and a second parse would be a second chance to pay them.
+
+Two guesses give way to a rule that named the article, and both are guesses this file argues for elsewhere. Both are **skipped** rather than left to be outrun:
+
+- **The readability probe.** It weighs a document; a `body` rule leaves behind a document that is only the article; a short post is then refused for being what the rule cut it down to. The forum topic above is the shape that showed it, at 210 characters after narrowing.
+- **The sliver rule.** Narrowing looks like it settles the comparison, since `page_chars` is counted after the rule and the article is now the page. It does not. `article_chars` is what the scorer kept and `page_chars` is what it was handed, and the scorer takes blocks out of the very container the rule named: a form, a link-dense table, anything `clean_conditionally` decides is not prose. What is left is then a sliver of a document the rule itself assembled, and the page the rule exists to rescue is refused. A short post above a five-button signup form reaches 59 against 399.
+
+`share` is still recorded under a rule, and `rules` on the record is what keeps it usable: a share measured on a document a rule narrowed is not comparable with one measured on a whole page, and the calibration these numbers exist for has to be able to leave those rows out.
+
+A `strip` says nothing about where the article is, so it changes neither, and a rule whose selectors all missed changes nothing at all: that page records `heuristic`. A host's rule is written for its articles, and the same host serves listings and index pages the rule never touches, so marking those as extracted under a rule would take the majority of a host's records out of the calibration just described.
+
+A rule reaches only inside `<body>`. Everything else a selector can name is either meaningless, as an article that is the whole page, or destructive: a `strip` on `html` leaves the scorer no tree, and a `body` of `*` reparents the `<head>` into the document body, after which the page has no head and its title text starts counting as text the page said. A page with no body at all is a `<frameset>`, which has no article in it; a host that named where its articles are has therefore already answered for it, and a host that only named furniture has nothing there to take out.
+
+### A broken rule file costs extractions, never a capture
+
+Everything that can go wrong degrades to the heuristic and reports why. A file that is absent is the ordinary case and says nothing at all. A file that no parser will read, one larger than 256 KiB, or a path that is not a regular file, leaves the extractor exactly where it was. A selector no CSS parser will read drops its host and no other: dropping the whole file would let one typo silently switch off every rule beside it, and dropping the selector alone would leave a rule doing something its author did not write.
+
+The alternative would be a run that refuses to archive anything because a configuration file has a comma in the wrong place, and the response is the part that cannot be recovered later.
+
+A selector arrives from a file this program did not write, so it is compiled once when the file is read rather than where it is used: the parser behind `Document::select` answers a bad selector with a panic, and only the explicit compile answers with an error.
+
+### What is waiting, and what would make it move
+
+`body` and `strip` are what real pages have asked for so far. The trigger for a third directive is the same as the trigger for these two: a real site captured, its Markdown coming out wrong, the page reduced by hand to the smallest markup that reproduces the failure, and the heuristic fixed if it can be. Only what survives that becomes a rule. The corpus does not discover these, it pins down what was already found, which is why every rule in it has to be shown failing without itself.
+
+Two known gaps, neither built:
+
+- **Bundled rules.** Everything is operator-written today. A corpus worth distributing is a licensing question before it is a code question, and there is no corpus yet.
+- **A rule that a subdomain inherits.** Exact matching is what the sites seen needed. A newspaper whose jobs board is on a subdomain is the reason not to guess the other way.
 
 ## What a hostile page costs
 
@@ -211,15 +279,21 @@ There is no field naming the rule that refused it. One rule refuses here and its
 
 The excerpt is the one field here a page controls the length of, and the reader of these records refuses a file over 64 KiB. A page serving an enormous description can therefore write a refusal that will not read back, which is reported by path rather than silently skipped. The article record has carried the same hazard since before this rule, and bounding both is its own change.
 
-`rules` names what produced the extraction. `byline` is what the algorithm found in the page's own markup and is not the resolved author in the metadata record: the two disagree often, and collapsing them would hide which one to look at when an attribution comes out wrong. `word_count` counts the prose and not the heading, which is a title the metadata record already holds; it stays a rough figure for sorting and filtering, which is why it is not what the sliver rule weighs. `truncated` is absent when nothing was cut, which is the ordinary case.
+`rules` names what produced this extraction: `heuristic` when nothing was said about the host or when what was said matched nothing on this page, and `site:<host>` when a rule actually reached it. It stays one string across both, because every reader that filters on it compares it to a string and turning it into an object for the second case would break all of them for nothing. A value this extractor cannot account for is refused rather than read as `heuristic`, which would claim a page was read with nothing said about it.
+
+`byline` is what the algorithm found in the page's own markup and is not the resolved author in the metadata record: the two disagree often, and collapsing them would hide which one to look at when an attribution comes out wrong. `word_count` counts the prose and not the heading, which is a title the metadata record already holds; it stays a rough figure for sorting and filtering, which is why it is not what the sliver rule weighs. `truncated` is absent when nothing was cut, which is the ordinary case.
 
 `markdown_sha256` is the address of the document beside it, and it is what makes the pair safe to rewrite. Ordering alone is enough only the first time: writing over an existing pair and stopping between the two files leaves new prose beside an old record, both present, both parsing, and every field describing something that is no longer there. A reader that finds the two disagreeing reports no article, because the response the article was derived from is still in the archive and the pass that re-extracts will simply redo it.
 
 `extractor_version` is bumped when the meaning of a field or a rule that fills one changes, not when a field is added, on the same terms as the metadata record. It is 2 for the sliver rule: `share` arriving beside the counts would not have been enough on its own, but a page can now produce prose and still not be stored as an article, so the absence of a record beside a capture stopped meaning what it meant at 1.
 
+The rules layer did not bump it, and the argument is close enough to be worth writing down, because the same sentence that justified 2 over 1 appears to apply again: a capture can now have no article because a host's `body` rule found nothing, so the absence of a record beside a capture means one more thing than it did.
+
+What settles it is that the version is a field, and a page with no article has no record to put it on. Bumping would stamp 3 on the records that do exist, telling every reader that those records mean something new, and they do not: `article_chars` and `page_chars` mean exactly what they meant at 2, `rules` says whether a rule reached the page, and an extractor with no rule file behaves as version 2 behaved. The one thing that genuinely changed cannot be versioned, because it is a silence, and a silence is not a record. What accounts for it is the rule file, which is in the archive beside the captures for that reason.
+
 ## What was deliberately left out
 
-- **Per-host extraction rules.** A generic scorer works on markup that follows convention and fails on sites with a layout of their own, and the answer everyone converges on is a per-host override layer expressed as selectors. It is not built yet because the shape of the rule is not known yet: `body` and `strip` cover the cases imagined, and the fivefilters corpus grew to twenty directives against real sites. Committing to a format before three concrete sites have demanded one is inventing a schema. The seam is in place and the trigger is a real site coming out wrong, not a gap in the test corpus.
+- **A third directive.** `body` and `strip` are what real pages have asked for. The fivefilters corpus grew to twenty directives against real sites, and every one of them arrived because a site demanded it; adding one here follows the same rule rather than anticipating it. What is already known to be missing, and deliberately waiting, is in the rules section above.
 - **Plain text beside the Markdown.** Covered above.
 - **Images pulled into the prose.** An article's images are already captured as subresources and addressed by content hash. Rewriting the Markdown to point at them is a question about how a reader resolves references, which belongs to the reader.
 - **Pagination.** An article split across numbered pages is captured as the several pages it is served as. Stitching them is a per-site rule in every implementation that does it, so it waits for the rules layer.
@@ -237,3 +311,7 @@ The fixtures are hand written, one file of markup and one of expectations, and t
 This means the corpus does not discover the sites that need work; it cannot, since it only contains shapes someone already thought of. Discovery happens by running the tool. When a real page comes out wrong it is reduced by hand to the smallest markup that reproduces the failure, and that becomes a fixture. The corpus pins down what was found, so it cannot come back.
 
 The sliver rule above is the first thing that arrived that way, and the front page it was written for is in the corpus beside the listing that was imagined. Both stay: the imagined one covers the easy shape, and the easy shape is still worth pinning. So is the pairing, since a case that only proved the rule refuses something would be satisfied by a rule that refuses everything short. The genuinely short post beside it is what makes the refusal mean anything.
+
+A fixture may declare the rule its host has been told, and two of them do. Those cases assert twice: that the extraction with the rule is the one declared, and that the extraction without it is not. The second is what keeps a rule from becoming decoration, because a rule that stopped being needed, whether the scorer improved or it never was needed, would otherwise sit in the corpus reading as evidence that a site has to be told while proving nothing.
+
+One shape found in the wild is deliberately not in the corpus. A forum topic whose replies outweigh the post by fifty to one comes back as the whole thread, and the reduced version of it does not: whether the scorer picks the post or the element above it turns on the arithmetic of how much text sits where, and a hand-written page small enough to read is too small to tip it. Contorting the markup until it tipped would pin an accident of the scoring rather than a property of the site, so the case lives here as a measurement instead.

@@ -18,6 +18,7 @@ use std::time::Duration;
 use archeion::CanonicalUrl;
 use archeion::capture::capture_seed;
 use archeion::crawl::{CrawlError, Seed, SpiderEngine};
+use archeion::readability::SiteRules;
 use archeion::storage::Archive;
 use tempfile::TempDir;
 
@@ -31,7 +32,13 @@ fn a_redirect_into_the_metadata_service_is_refused_and_nothing_of_it_is_archived
     let archive = Archive::open(dir.path()).expect("the archive opens");
     let port = serve_one_redirect_to(METADATA_URL);
 
-    let run = capture_seed(&SpiderEngine, &archive, &local_seed(port)).expect("the run completes");
+    let run = capture_seed(
+        &SpiderEngine,
+        &archive,
+        &local_seed(port),
+        &SiteRules::default(),
+    )
+    .expect("the run completes");
 
     assert_eq!(
         run.captures_written, 0,
@@ -64,8 +71,13 @@ fn a_seed_pointed_at_the_metadata_service_never_reaches_a_socket() {
     let dir = TempDir::new().expect("temp dir");
     let archive = Archive::open(dir.path()).expect("the archive opens");
 
-    let error = capture_seed(&SpiderEngine, &archive, &Seed::new(METADATA_URL))
-        .expect_err("the seed is refused");
+    let error = capture_seed(
+        &SpiderEngine,
+        &archive,
+        &Seed::new(METADATA_URL),
+        &SiteRules::default(),
+    )
+    .expect_err("the seed is refused");
 
     assert!(
         matches!(

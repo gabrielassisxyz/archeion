@@ -16,7 +16,8 @@ Nothing here asserts the output exactly. Extraction quality varies by site, and 
   "must_contain": ["prose that has to survive"],
   "must_not_contain": ["furniture that must not"],
   "heading_levels": [1, 2, 2],
-  "word_count": { "min": 80, "max": 200 }
+  "word_count": { "min": 80, "max": 200 },
+  "rules": { "why": "what this host had to be told", "strip": [".appeal"] }
 }
 ```
 
@@ -29,6 +30,8 @@ Nothing here asserts the output exactly. Extraction quality varies by site, and 
 The last two are separate cases rather than one "not an article" because they leave different things behind. A fixture that only said "not an article" would keep passing if a refusal quietly became silence, and the queue of pages somebody is meant to review would empty without anyone noticing.
 
 `heading_levels` and `word_count` are optional.
+
+`rules` is what this page's host has been told, in the shape `extraction-rules.json` declares it, and the page is served from `<name>.example.com` so the rule keys on it. A case that carries one asserts twice: the bounds above hold with the rule, and they do not hold without it. The second half is checked separately, and it is what keeps a rule from staying here after it stopped being needed.
 
 ## Where a case comes from
 

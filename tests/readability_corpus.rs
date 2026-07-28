@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use archeion::metadata::PageSource;
-use archeion::readability::{self, Article, Extraction};
+use archeion::readability::{self, Article, Extraction, SiteRules};
 use serde::Deserialize;
 
 /// Unknown fields are refused rather than ignored. A mistyped assertion that parses is worse
@@ -36,6 +36,12 @@ struct Expectation {
     heading_levels: Option<Vec<usize>>,
     #[serde(default)]
     word_count: Option<WordCount>,
+    /// What this page's host has been told, in the shape a rule file declares it. A case that
+    /// carries one is asserting two things at once: that the extraction with the rule is the one
+    /// declared above, and that without it the extraction is not, which
+    /// `no_rule_in_the_corpus_is_decorative` checks separately.
+    #[serde(default)]
+    rules: Option<serde_json::Value>,
 }
 
 /// What the extractor has to make of a page. The two ways of producing no article are
@@ -129,10 +135,18 @@ fn every_page_in_the_corpus_extracts_within_its_declared_bounds() {
     for page in cases {
         let name = file_stem(&page);
         let expected = expectation_for(&page, &name);
-        let extracted = extract(&page, &name, expected.title.as_deref());
+        let extracted = extract(&page, &name, &expected, Rule::Applied);
 
         match (&expected.outcome, extracted) {
-            (Outcome::Article, Extraction::Article(article)) => check(&name, &expected, &article),
+            (Outcome::Article, Extraction::Article(article)) => {
+                let broken = violations(&expected, &article);
+                assert!(
+                    broken.is_empty(),
+                    "{name}:\n{}\n\n{}",
+                    broken.join("\n"),
+                    article.markdown
+                );
+            }
             (Outcome::Refused, Extraction::Refused(_)) => {}
             (Outcome::Nothing, Extraction::Nothing) => {}
             (expected, Extraction::Article(article)) => panic!(
@@ -146,36 +160,75 @@ fn every_page_in_the_corpus_extracts_within_its_declared_bounds() {
     }
 }
 
-fn check(name: &str, expected: &Expectation, article: &Article) {
+/// A rule is an escape hatch for what the heuristic cannot do, so a case carrying one has to
+/// show the heuristic failing without it. Otherwise a rule that stopped being needed, because the
+/// scorer improved or because it never was, would sit in the corpus reading as evidence that a
+/// site needs telling while proving nothing at all.
+///
+/// What counts as failing is the case's own expectation: the same bounds, read against the
+/// extraction the heuristic reaches alone, have to be broken somewhere.
+#[test]
+fn no_rule_in_the_corpus_is_decorative() {
+    let decorative: Vec<String> = corpus()
+        .into_iter()
+        .filter_map(|page| {
+            let name = file_stem(&page);
+            let expected = expectation_for(&page, &name);
+            expected.rules.as_ref()?;
+            let alone = extract(&page, &name, &expected, Rule::Withheld);
+
+            let held = match (&expected.outcome, &alone) {
+                (Outcome::Article, Extraction::Article(article)) => {
+                    violations(&expected, article).is_empty()
+                }
+                (Outcome::Refused, Extraction::Refused(_)) => true,
+                (Outcome::Nothing, Extraction::Nothing) => true,
+                _ => false,
+            };
+            held.then(|| format!("{name} declares a rule and extracts the same without it"))
+        })
+        .collect();
+
+    assert!(decorative.is_empty(), "{decorative:?}");
+}
+
+/// Every bound the article breaks, rather than the first one.
+///
+/// It answers a list instead of asserting, because the same comparison is read two ways: an
+/// empty list is what the case declares, and a non-empty one is what proves a rule was needed.
+fn violations(expected: &Expectation, article: &Article) -> Vec<String> {
     let markdown = &article.markdown;
+    let mut broken = Vec::new();
     for prose in &expected.must_contain {
-        assert!(
-            markdown.contains(prose.as_str()),
-            "{name}: the article lost prose it had to keep: {prose:?}\n\n{markdown}"
-        );
+        if !markdown.contains(prose.as_str()) {
+            broken.push(format!("the article lost prose it had to keep: {prose:?}"));
+        }
     }
     for furniture in &expected.must_not_contain {
-        assert!(
-            !markdown.contains(furniture.as_str()),
-            "{name}: furniture survived into the article: {furniture:?}\n\n{markdown}"
-        );
+        if markdown.contains(furniture.as_str()) {
+            broken.push(format!(
+                "furniture survived into the article: {furniture:?}"
+            ));
+        }
     }
     if let Some(levels) = &expected.heading_levels {
-        assert_eq!(
-            &heading_levels(markdown),
-            levels,
-            "{name}: the heading hierarchy is not the one declared\n\n{markdown}"
-        );
+        let found = heading_levels(markdown);
+        if &found != levels {
+            broken.push(format!(
+                "the heading hierarchy is {found:?} and not {levels:?}"
+            ));
+        }
     }
     if let Some(range) = &expected.word_count {
         let counted = article.record.word_count;
-        assert!(
-            (range.min..=range.max).contains(&counted),
-            "{name}: {counted} words, outside the declared {}..={}\n\n{markdown}",
-            range.min,
-            range.max
-        );
+        if !(range.min..=range.max).contains(&counted) {
+            broken.push(format!(
+                "{counted} words, outside the declared {}..={}",
+                range.min, range.max
+            ));
+        }
     }
+    broken
 }
 
 /// The `#` prefixes in document order. Markdown puts them at the start of a line, and a `#`
@@ -199,19 +252,43 @@ fn heading_levels(markdown: &str) -> Vec<usize> {
     levels
 }
 
-fn extract(page: &Path, name: &str, title: Option<&str>) -> Extraction {
+/// Whether the case's host is told what its expectation declares, or nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rule {
+    Applied,
+    Withheld,
+}
+
+fn extract(page: &Path, name: &str, expected: &Expectation, rule: Rule) -> Extraction {
     let body = fs::read(page).unwrap_or_else(|error| panic!("reading {name}: {error}"));
+    let rules = match (rule, &expected.rules) {
+        (Rule::Applied, Some(declared)) => rules_for(name, declared),
+        _ => SiteRules::default(),
+    };
     readability::extract(
         PageSource {
             body: &body,
             content_type: Some("text/html; charset=utf-8"),
-            // Every fixture is filed under its own name, so a rule that ever keys on the host
-            // has somewhere to key from without the corpus having to be rearranged.
+            // Every fixture is filed under its own name, so a rule keys on the host of the page
+            // it was declared beside without the corpus having to be rearranged.
             final_url: &format!("https://{name}.example.com/page"),
         },
-        title,
+        expected.title.as_deref(),
+        &rules,
     )
     .unwrap_or_else(|error| panic!("{name} was refused: {error}"))
+}
+
+/// The declared rule, put through the same reader an operator's file goes through. Building the
+/// rule directly would let a case declare something no rule file could express.
+fn rules_for(name: &str, declared: &serde_json::Value) -> SiteRules {
+    let file = serde_json::json!({ "hosts": { format!("{name}.example.com"): declared } });
+    let (rules, unused) = SiteRules::parse(&file.to_string(), name);
+    assert!(
+        unused.is_empty(),
+        "{name} declares a rule nothing can read: {unused:?}"
+    );
+    rules
 }
 
 fn file_stem(page: &Path) -> String {

@@ -21,6 +21,7 @@ An asset arrives at the capture already stored, as a record, rather than as byte
 ```
 <archive>/
   archeion.json                                     format name and version
+  extraction-rules.json                             per-host extraction rules, written by hand
   blobs/sha256/<ab>/<cd>/<hash>                     response bodies, addressed by content
   items/<host>/<item-id>/item.json                  one item
   items/<host>/<item-id>/captures/<capture-id>.json one fetch of it
@@ -39,6 +40,10 @@ A real archive holding a single capture of one page, with one stylesheet as its 
 <archive>/items/blog.example.com/cc307a5a.../item.json
 <archive>/items/blog.example.com/cc307a5a.../captures/20260725T140322Z-16384aa6.json
 ```
+
+`extraction-rules.json` is the one file here a person writes rather than the program, and the only one whose absence is ordinary. It holds what a host has to be told about where its prose lives, and it sits in the archive because a re-pass over these stored responses has to read it to produce the same articles again. It is at the root rather than under `items/`, which the walk reads as records and nothing else. [`docs/readability.md`](readability.md) has the format and what a broken one costs.
+
+Note that an archive is created in an empty or absent directory, so the file is written into an archive that already exists rather than dropped into a directory that is about to become one.
 
 ### Bodies are addressed by their content
 

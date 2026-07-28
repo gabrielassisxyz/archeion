@@ -437,6 +437,26 @@ mod tests {
         assert_eq!(refused.truncated, [ArticleBound::Excerpt]);
     }
 
+    #[test]
+    fn an_article_inside_a_news_sized_wrapper_is_extracted() {
+        let article_page = article_page("<h1>How to bake bread</h1>");
+        let observed_news_article_bytes = 1_428_771;
+        let portal_unit = "<span data-portal=\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"></span>";
+        let portal_wrapper = portal_unit.repeat(20_000);
+        let filler_bytes = observed_news_article_bytes - article_page.len() - portal_wrapper.len();
+        let filler = format!("<!--{}-->", "x".repeat(filler_bytes - 7));
+        let page = article_page.replacen("<body>", &format!("<body>{portal_wrapper}"), 1);
+        let page = page.replacen("</body>", &format!("{filler}</body>"), 1);
+
+        let article = article_from(&page, Some("How to bake bread"));
+
+        assert_eq!(
+            article.record.cost.document_bytes,
+            observed_news_article_bytes
+        );
+        assert!(article.markdown.contains("Bread is mostly patience"));
+    }
+
     /// The other half of the rule, and the reason it is not a floor on length alone. A note
     /// of a few dozen words is a page an archive has as much reason to keep as any other, and
     /// what separates it from the front page above is not its size but that it is what its

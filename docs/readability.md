@@ -178,7 +178,7 @@ The archive fetches addresses it was pointed at by other pages. Two of the libra
 
 | ceiling | value | what it bounds | where it lands |
 |---|---|---|---|
-| decoded document | 1 MiB | how much work any of the below can be asked to do | the run report |
+| decoded document | 2 MiB | how much work any of the below can be asked to do | the run report |
 | open elements | 2 048 | the parse | the run report |
 | nesting depth | 256 | the scoring pass | the run report |
 | elements scored | 50 000 | the scoring pass on a wide document | the run report |
@@ -186,6 +186,26 @@ The archive fetches addresses it was pointed at by other pages. Two of the libra
 | Markdown kept | 1 MiB | the file that gets written | the stored record |
 
 Only the last two are recorded in the archive, as `truncated`, because they are the ones where a derived record still exists to describe what was cut. The first four produce no article or refusal record at all, so what they leave is an entry in the run's report naming the URL and the ceiling. That is the honest state of it: a page refused for cost and a page that simply was not an article look the same on disk.
+
+### The decoded document ceiling, and what news pages measured
+
+The decoded document ceiling started at 1 MiB because hostile markup already had a measured cost below that size. The first real article to push through it measured 1 428 771 decoded bytes and produced no article, while a sample of ninety-six article pages from large news sites put ordinary portal articles close to the same boundary. The largest pages in that sample were not large because the article was large: the article text was usually less than one percent of the decoded document.
+
+| page shape | decoded bytes | page text chars | article text chars | article share of bytes |
+|---|---:|---:|---:|---:|
+| refused news article | 1 428 771 | not recorded | not recorded | not recorded |
+| large AP article | 989 238 | 38 519 | 7 032 | 0.71% |
+| large AP article | 964 629 | 39 659 | 8 098 | 0.84% |
+| large AP article | 939 582 | 35 759 | 4 378 | 0.47% |
+| large AP article | 935 652 | 38 810 | 7 327 | 0.78% |
+| large CNBC article | 889 710 | 4 576 | 2 468 | 0.28% |
+| large AP article | 888 162 | 38 263 | 6 824 | 0.77% |
+| large CBS live article | 863 510 | 21 639 | 19 198 | 2.22% |
+| BBC article | 406 203 | 8 968 | 4 939 | 1.22% |
+| Guardian article | 318 106 | 7 120 | 5 174 | 1.63% |
+| NPR article | 163 000 | 8 991 | 7 666 | 4.70% |
+
+That leaves three possible responses. A per-host rule cannot help at this point in the pipeline, because rules need a tree and the document has to pass the ceilings before a tree exists. A cheaper guard is already present for the shape that makes parsing expensive, the open-element scan. Weighing some other pre-tree value would need a new scanner with its own definition of visible text, and no measurement yet says that extra moving part is the thing needed. The smaller change is to move the outer decoded-document ceiling to 2 MiB, keep the open-element and depth ceilings where the hostile-cost measurements put them, and let `AdmissionCost.document_bytes` continue collecting the distribution that can later justify moving the ceiling again.
 
 ### Nesting depth, and what the first measurement of it got wrong
 
@@ -225,17 +245,18 @@ The tree parser rescans its stack of open elements for every end tag that has to
 | 132 KB | 0.3 s |
 | 264 KB | 1.2 s |
 | 528 KB | 18.3 s |
-| 1 MiB, the ceiling | about 72 s, extrapolated |
+| 1 MiB | about 72 s, extrapolated |
+| 2 MiB, the decoded-document ceiling | about 288 s, extrapolated |
 
-Doubling the input quadruples the time. This is the reason the byte ceiling is 1 MiB rather than the 8 MiB it started at, and the reason 1 MiB is still not enough on its own.
+Doubling the input quadruples the time. This is the reason the byte ceiling is still far below the 8 MiB it started at, and the reason the byte ceiling is not enough on its own.
 
 Neither of the other guards helps. The depth ceiling is measured on a tree, and by the time there is a tree the cost has been paid; the element ceiling is applied by the scorer, one step later still. So the count is taken on the bytes, before anything is parsed, in `markup_scan`. A raw scan reads 8 MB in 3 ms where the token-stream parser takes 4 s on the same input, and it stops at the first element past the ceiling.
 
 Reading bytes rather than parsing them means the scan has to know a few things or it will refuse ordinary pages: void elements never close and would otherwise accumulate, so a gallery of images would look like unbalanced markup; `<` is an operator in every language a page embeds, so script and style bodies are skipped; attribute values hold `<` and `>` in ordinary prose; and a comment ends at `-->` and not at the first `>` inside it. Where it is still wrong it is wrong upward, as with prose that was never escaped, so it refuses rather than admits.
 
-### The ceilings are expected to come down
+### The ceilings are expected to move
 
-They are set where a hostile page is certainly refused, not where a real page is certainly kept, and the distance between those two is unknown. So every article records what it actually measured, in `cost`, for every page and not only for the refused ones: a count of refusals says whether a ceiling is firing, and only the values real articles reach can say whether a lower ceiling would start refusing them. After enough real captures, the ceilings move against that distribution rather than against a guess.
+They are set where a hostile page is certainly refused, not where a real page is certainly kept, and the distance between those two is unknown. So every article records what it actually measured, in `cost`, for every page and not only for the refused ones: a count of refusals says whether a ceiling is firing, and only the values real articles reach can say whether a ceiling would start refusing them. After enough real captures, the ceilings move against that distribution rather than against a guess.
 
 ## The record
 
@@ -278,7 +299,7 @@ A refused page gets a record of its own instead of this pair, holding the same m
 
 There is no field naming the rule that refused it. One rule refuses here and its inputs are the two counts, so the comparison is readable from the record itself; a second rule is what would make naming them worth a field, and it will arrive with its own version bump.
 
-The excerpt is the one field here a page controls the length of, and the reader of these records refuses a file over 64 KiB. A page serving an enormous description could therefore write a refusal that would not read back, which would be reported by path rather than silently skipped. Both article and refusal records cut the excerpt to 4 KiB before writing. When that happens, `truncated` carries `excerpt`, and the stored value is only a prefix kept for review:
+The excerpt is the one field here a page controls the length of, and the reader of these records refuses a file over 64 KiB. A page serving an enormous description could therefore write a refusal that would not read back, which would be reported by path rather than silently skipped. Both article and refusal records cut the excerpt to 4 KiB before writing. When that happens, `truncated` carries `excerpt`, and the stored value is only a prefix kept for review. The excerpt below is shortened for display; a real record with this flag stores a prefix close to the ceiling:
 
 ```json
 {

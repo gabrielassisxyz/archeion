@@ -4,8 +4,8 @@
 //! cannot be trusted with the input first. `html5ever` rescans its whole open-element stack
 //! for every end tag that has to search a scope, so markup that opens elements and never
 //! closes them costs time quadratic in its own size: 132 KB takes 0.3 s, 528 KB takes 18 s,
-//! and a document at the byte ceiling would take over an hour. Refusing it afterwards, which
-//! is what the depth guard does, refuses it having already paid.
+//! and a document near the byte ceiling would take several minutes. Refusing it afterwards,
+//! which is what the depth guard does, refuses it having already paid.
 //!
 //! So this reads bytes and no more. It is not a parser and cannot become one: it never
 //! allocates, it never looks back, and it stops at the first element past the ceiling.

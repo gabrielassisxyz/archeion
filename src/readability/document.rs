@@ -41,13 +41,13 @@ pub(super) const MAX_OPEN_ELEMENTS: usize = 2048;
 /// How large a decoded document may be before it is refused.
 ///
 /// It bounds nothing the two ceilings above do not already bound, and it is deliberately kept
-/// as the outer limit on how much work any of them can be asked to do. It is expected to come
-/// down: `ArticleRecord` records what each page actually measured, so the ceiling can be
-/// lowered against the distribution of real pages rather than against a guess.
+/// as the outer limit on how much work any of them can be asked to do. It is expected to move
+/// against real pages: `ArticleRecord` records what each page actually measured, so the
+/// ceiling can be calibrated against the distribution of articles rather than against a guess.
 ///
 /// It is not the counterpart of `MAX_PARSER_MEMORY_BYTES` in `metadata::scan`. That one is
 /// what `lol_html` may buffer on top of the document, and it refuses nothing by size.
-pub(super) const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
 
 /// What a document cost to admit, whether or not it was admitted.
 ///
@@ -629,10 +629,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_document_byte_ceiling_is_the_measured_limit() {
+        assert_eq!(MAX_DOCUMENT_BYTES, 2 * 1024 * 1024);
+
+        let frame = "<p></p>";
+        let at_the_ceiling = format!("<p>{}</p>", "x".repeat(MAX_DOCUMENT_BYTES - frame.len()));
+        let over_the_ceiling = format!(
+            "<p>{}</p>",
+            "x".repeat(MAX_DOCUMENT_BYTES - frame.len() + 1)
+        );
+
+        assert_eq!(at_the_ceiling.len(), MAX_DOCUMENT_BYTES);
+        assert!(build(&at_the_ceiling).is_ok());
+        assert_eq!(
+            build(&over_the_ceiling).err(),
+            Some(TooExpensive::Bytes {
+                byte_len: MAX_DOCUMENT_BYTES + 1
+            })
+        );
+    }
+
+    #[test]
+    fn a_news_sized_document_from_the_distribution_is_admitted() {
+        let observed_news_article_bytes = 1_428_771;
+        let frame = "<html><body><article><p></p></article></body></html>";
+        let prose_bytes = observed_news_article_bytes - frame.len();
+        let article = format!(
+            "<html><body><article><p>{}</p></article></body></html>",
+            "x".repeat(prose_bytes)
+        );
+
+        let (_, measured) = build(&article).expect("within the real article distribution");
+
+        assert_eq!(measured.byte_len, observed_news_article_bytes);
+    }
+
     /// The refusal that has to happen before the parse rather than after it. This markup makes
     /// `html5ever` rescan its open-element stack for every closing tag, which is quadratic in
-    /// the document's own size: at this size it is seconds, and at the byte ceiling it is over
-    /// an hour. The depth guard below refuses the same page, and refuses it having paid.
+    /// the document's own size: at this size it is seconds, and near the byte ceiling it would
+    /// be several minutes. The depth guard below refuses the same page, and refuses it having
+    /// paid.
     #[test]
     fn markup_that_only_opens_elements_is_refused_before_a_tree_is_built() {
         let flood = format!("{}{}", "<div>".repeat(80_000), "</p>".repeat(32_000));

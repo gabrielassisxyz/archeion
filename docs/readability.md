@@ -206,11 +206,14 @@ This file already answered the same question once, about the title: it was the o
 
 What that buys is the property the rest of the archive already has. An `.article.md` is prose in a closed vocabulary, escaped by one escaper, whatever origin it came from. Storing the served bytes as they arrived would have made that a promise with two levels and left every future consumer to know which one it was holding.
 
-Three things are handled during the read rather than left to the converter, because once markup exists there is no telling it apart from markup this program wrote:
+Four things are handled during the read rather than left to the converter, because once markup exists there is no telling it apart from markup this program wrote:
 
 - **Raw HTML becomes text.** It is the one construct a Markdown document can carry that an extracted article never can, since every renderer passes it through. It is kept as text rather than deleted, so the document still says what it said, inertly. A `<script>` served in a post is written `\<script>` and reads as the characters it is, which is what the title escaping already does.
 - **A fenced block is left alone.** It is already inert to a renderer and it is often the point of the document, so escaping inside one would corrupt the code it holds and buy nothing.
 - **A destination that exists to run loses its link.** The link text stays. The list of schemes an archived document may still point at is `http`, `https` and `mailto`, plus a fragment, which addresses this document and has nothing to hide a scheme in. A relative destination is resolved against the address the response came from, which is what the HTML path stores and what export compares notes by.
+- **An image's description is reduced to a description.** This is the round trip's own exception, and finding it is what made the rule above worth stating rather than assuming. Both converters flatten a description into an attribute, and the second writes that attribute into `![…](…)` escaping almost nothing, so the description is the one string on this path that reaches the archived document without passing through the escaper. What it can do with that is exactly what the title could: `![a\](javascript:alert(1))](/p.png)` ends its own description at the escaped `]` and hands the rest of the line to a destination nothing screened, and a description carrying `&#10;` writes a heading of its own at column zero. So four characters leave a description: `]`, which ends it, `[`, which opens another, a trailing `\`, which escapes the `]` that would have ended it, and a line break, which ends the line the whole construct sits on. Whitespace collapses to single spaces, for the reason it collapses in the title. An image's title is the same kind of string and is reduced the same way.
+
+**An image's description may hold another image**, which is an example in the CommonMark specification rather than a corner case, and it is why a dropped image is tracked with a stack rather than a count. A count suppresses the inner end tag instead of the outer one, and the converter then keeps reading the description past where it ended: `![foo ![bar](/url) baz](…)` stores `foo ![bar baz](/url)`, and the word `baz` silently leaves the body of the article and becomes part of an attribute.
 
 **The HTML path is weaker here, and that is worth writing down rather than fixing in passing.** Measuring what it actually does: it drops a destination spelled `javascript:` in lower case, and keeps `JaVaScRiPt:`, `vbscript:` and `data:text/html,...`. That is an accident of the library that scores the page, not a property this project ever stated, and closing it means changing the output of extractions already stored. It is a separate change.
 
@@ -219,12 +222,17 @@ Three things are handled during the read rather than left to the converter, beca
 | ceiling | value | where it lands on this path |
 |---|---|---|
 | decoded document | 2 MiB | before anything is read, so it bounds how much work the read below can be asked to do |
-| open elements | 2 048 | on the markup the read generates, before the converter's own parser sees it |
+| nesting depth | 256 | on the document's own structure, counted while it is read and before any markup exists |
+| open elements | 2 048 | on the markup the read generates, which is where the record's measurement comes from |
 | Markdown kept | 1 MiB | the file that gets written, exactly as on the HTML path |
 
-The middle one is not ceremony. The generated markup is balanced, so the quadratic parse that ceiling was originally measured against cannot come out of it, but depth can: a document of nothing but `>` opens a blockquote per character, and it is the converter's parser that pays for it. Well-formed markup peaks at its own nesting depth, so the same count answers both questions, and the scan that takes it reads bytes rather than parsing them.
+**The depth ceiling is the one that decides whether the process survives the document**, and it is the same number the HTML path applies to its tree. A document of nothing but `>` opens a blockquote per level; the converter walks its tree with a stack frame per level; two thousand levels is a four kilobyte response that ends the whole run with a stack overflow rather than being refused as one page. Counting depth on the generated markup instead would mean generating it first, which is paying the cost the guard exists to avoid, so it is counted on the document's own structure as it is read, and the read stops at the first level past the ceiling.
 
-Measured on documents built to be the worst of each shape, at or just over the byte ceiling:
+A level of Markdown counts as one nested container, so a list level counts twice, once for the list and once for the item. That errs toward refusing, which is the direction a guard against a stack overflow has to err in.
+
+**The open-element count is a measurement, not the bound.** A level of Markdown opens at most two elements, so under a depth ceiling of 256 it cannot reach 2 048. It is taken because it is what fills `peak_open_elements` on the record, and because the sentence before this one is an assumption about how a document's nesting maps onto the markup it generates: if it ever fires, that mapping is what changed. The quadratic parse it was originally measured against cannot arise here at all, since the generated markup is balanced, and unbalanced raw markup in the document leaves the read as escaped text and so opens nothing.
+
+Measured on documents built to be the worst of each shape, at or just over the ceiling each one meets:
 
 | document | wall clock | outcome |
 |---|---|---|
@@ -233,11 +241,12 @@ Measured on documents built to be the worst of each shape, at or just over the b
 | 2 MiB of emphasis spans | 0.53 s | article |
 | 2 MiB of inline links | 0.42 s | article |
 | 2 MiB of `<` | 0.74 s | article |
-| a list nested 2 000 deep | 0.1 ms | refused, over the byte ceiling |
-| a blockquote nested 3 000 deep | 0.3 ms | refused, over the open-element ceiling |
+| a blockquote nested 500 deep | 0.02 ms | refused, over the depth ceiling |
+| a blockquote nested 2 000 deep | 0.10 ms | refused, over the depth ceiling |
+| a list nested 2 000 deep | 0.10 ms | refused, over the byte ceiling |
 | a table of 200 000 rows | 0.05 ms | refused, over the byte ceiling |
 
-The two shapes that nest are the two the middle ceiling exists for, and each is turned away in well under a millisecond because both guards read the document rather than parse it. Nesting a list is quadratic in the bytes it costs, since every level pays for its own indentation, so the byte ceiling reaches it first; nesting a blockquote is linear, so the element scan is what reaches it. Unbalanced raw markup, which is the shape that makes the HTML path quadratic, cannot arise at all: it leaves the read as escaped text, so it opens nothing.
+Every shape that nests is turned away in well under a millisecond, because the guard reads the document instead of building anything from it. Nesting a list costs bytes quadratic in its own depth, since every level pays for its own indentation, so the byte ceiling reaches those first; nesting a blockquote is linear in depth, so the depth ceiling is what reaches it.
 
 The refusals are spelled by the same type the HTML path refuses with, so a page turned away for cost reads the same in a run report whichever of the two it came through.
 

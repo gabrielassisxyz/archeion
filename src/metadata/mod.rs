@@ -500,6 +500,46 @@ mod tests {
         );
     }
 
+    /// A comma separates candidates and is also legal inside a URL, which is how an image
+    /// served through a transformation network spells its parameters. Splitting on the
+    /// character alone turns one candidate into a handful of fragments, and a fragment is a
+    /// relative reference: the archive then asks the page's own origin for addresses that
+    /// were never on the page. The shape below is one attribute from a real publication.
+    #[test]
+    fn a_srcset_whose_urls_hold_commas_lists_only_the_candidates_the_page_wrote() {
+        let page = extract_html(
+            r#"<img srcset="https://cdn.example/fetch/w_320,h_213,c_fill/https%3A%2F%2Forigin%2Fone.jpeg 320w,
+                           https://cdn.example/fetch/w_640,h_426,c_fill/https%3A%2F%2Forigin%2Fone.jpeg 640w">"#,
+        );
+        let urls: Vec<&str> = page.assets.iter().map(|asset| asset.url.as_str()).collect();
+
+        assert_eq!(
+            urls,
+            [
+                "https://cdn.example/fetch/w_320,h_213,c_fill/https%3A%2F%2Forigin%2Fone.jpeg",
+                "https://cdn.example/fetch/w_640,h_426,c_fill/https%3A%2F%2Forigin%2Fone.jpeg",
+            ]
+        );
+    }
+
+    /// The separator has three spellings the parser has to agree on: a comma after
+    /// whitespace, a comma stuck to the end of a URL that carries no descriptor, and a run of
+    /// them around an empty candidate. None of the three may leave an empty address behind.
+    #[test]
+    fn a_candidate_separator_is_read_the_same_however_it_is_spelled() {
+        let page = extract_html(r#"<img srcset="/a.png,, /b.png 2x , /c.png">"#);
+        let urls: Vec<&str> = page.assets.iter().map(|asset| asset.url.as_str()).collect();
+
+        assert_eq!(
+            urls,
+            [
+                "https://example.com/a.png",
+                "https://example.com/b.png",
+                "https://example.com/c.png",
+            ]
+        );
+    }
+
     #[test]
     fn the_address_a_page_claims_for_itself_is_recorded_and_nothing_more() {
         let page = extract_html(r#"<link rel="canonical" href="/posts/one?utm_source=x">"#);

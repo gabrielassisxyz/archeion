@@ -358,10 +358,8 @@ impl Scanner {
         let Some(srcset) = srcset else {
             return;
         };
-        for candidate in srcset.split(',') {
-            if let Some(url) = candidate.split_ascii_whitespace().next() {
-                self.see_asset(url.to_owned(), AssetKind::Image);
-            }
+        for url in srcset_urls(&srcset) {
+            self.see_asset(url.to_owned(), AssetKind::Image);
         }
     }
 
@@ -375,6 +373,68 @@ impl Scanner {
         }
         self.page
     }
+}
+
+/// The URLs a `srcset` lists, in the order it lists them.
+///
+/// The separator is a comma, and a comma is legal inside a URL: an image served through a
+/// transformation network spells its parameters that way, `w_320,h_213,c_fill`. Splitting on
+/// the character alone turns one candidate into a handful of fragments, and a fragment is a
+/// relative reference, so the archive ends up asking the page's own origin for addresses that
+/// were never on the page. That is a request the page did not make, which is a rate limit at
+/// best and a page choosing where the archive knocks at worst.
+///
+/// What separates candidates is therefore the end of the URL rather than the character: a URL
+/// runs to whitespace, and the comma that follows it, or the commas it ends with when it
+/// carries no descriptor, are the separator. This is the specification's own reading, and the
+/// only one under which `a.png,b.png` is the single address a browser requests.
+fn srcset_urls(srcset: &str) -> Vec<&str> {
+    let bytes = srcset.as_bytes();
+    let mut urls = Vec::new();
+    let mut position = 0;
+
+    while position < bytes.len() {
+        // Whitespace and commas are skipped together, so an empty candidate between two
+        // separators disappears rather than becoming an empty address.
+        while position < bytes.len()
+            && (bytes[position].is_ascii_whitespace() || bytes[position] == b',')
+        {
+            position += 1;
+        }
+        let start = position;
+        while position < bytes.len() && !bytes[position].is_ascii_whitespace() {
+            position += 1;
+        }
+        if start == position {
+            break;
+        }
+
+        let token = &srcset[start..position];
+        let url = token.trim_end_matches(',');
+        if !url.is_empty() {
+            urls.push(url);
+        }
+        // A URL that kept its last character ran to whitespace rather than to a separator, so
+        // a descriptor follows and reaches to the next comma. A descriptor may hold one inside
+        // parentheses, which is why the nesting is tracked rather than the character alone.
+        if url.len() == token.len() {
+            let mut depth = 0_usize;
+            while position < bytes.len() {
+                match bytes[position] {
+                    b'(' => depth += 1,
+                    b')' => depth = depth.saturating_sub(1),
+                    b',' if depth == 0 => {
+                        position += 1;
+                        break;
+                    }
+                    _ => {}
+                }
+                position += 1;
+            }
+        }
+    }
+
+    urls
 }
 
 /// Appends what fits and reports whether the ceiling was reached. Characters are appended

@@ -91,7 +91,7 @@ pub(super) fn word_count(markdown: &str) -> usize {
 /// `str::floor_char_boundary` is still unstable, and truncating a multi-byte character in
 /// half panics. The ceiling above is reached by pages this project did not write, so the
 /// character sitting on it is not one anybody chose.
-fn floor_char_boundary(text: &str, at: usize) -> usize {
+pub(super) fn floor_char_boundary(text: &str, at: usize) -> usize {
     let mut at = at.min(text.len());
     while at > 0 && !text.is_char_boundary(at) {
         at -= 1;

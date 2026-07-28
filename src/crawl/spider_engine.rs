@@ -49,7 +49,12 @@ const USER_AGENT: &str = concat!(
 /// Sixty-four megabytes is far above any page and far below what losing a run costs. What
 /// exceeds it is kept up to the ceiling and marked as short, which is the trade the number
 /// buys: a partial record that says it is partial, rather than no run at all.
-const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The smallest ceiling the engine will honour. It raises anything between one byte and this
+/// to this, silently, so a caller asking for less would be told a number no run applies. It
+/// is published for the callers that have to refuse such a request rather than pass it on.
+pub const SMALLEST_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// The engine reads its byte ceiling from here and from nowhere else on the plain HTTP
 /// path: both of its configurable byte limits are browser-only.
@@ -61,6 +66,10 @@ const MAX_REDIRECTS: usize = 7;
 pub struct SpiderEngine;
 
 impl CrawlEngine for SpiderEngine {
+    fn check_seed(&self, seed: &Seed) -> Result<(), CrawlError> {
+        usable_seed_url(seed).map(|_url| ())
+    }
+
     fn crawl(
         &self,
         seed: &Seed,
@@ -163,8 +172,35 @@ fn response_byte_ceiling(already_settled: bool) -> Option<String> {
     if already_settled {
         None
     } else {
-        Some(MAX_RESPONSE_BYTES.to_string())
+        Some(DEFAULT_MAX_RESPONSE_BYTES.to_string())
     }
+}
+
+/// Chooses the ceiling for this process, ahead of the default above.
+///
+/// It exists because the ceiling has no other channel: the engine reads one environment
+/// variable and nothing else, so a caller that wants a different number has to write the
+/// same variable this file does, and the variable's name is not something a second place
+/// should know. What is settled here stands, since the default is only applied to an
+/// environment that carries nothing.
+///
+/// The value is process-wide and read by the engine on its first fetch, which is a property
+/// of the engine rather than a choice made here. A caller for which that is a lie, one
+/// process running two seeds that want different ceilings, cannot have what it is asking
+/// for and should not be calling this.
+///
+/// A number under `SMALLEST_MAX_RESPONSE_BYTES` is not the number that will be applied: the
+/// engine raises it to that floor without saying so. Refusing such a request belongs to the
+/// caller, which is the only place that knows how to tell somebody, so what is passed here
+/// is written down as it arrives rather than quietly corrected twice.
+///
+/// # Safety
+///
+/// This writes to the environment, so no other thread of the process may be running. In
+/// practice that means the top of `main`, before anything else has started.
+pub unsafe fn settle_response_byte_ceiling(bytes: usize) {
+    // SAFETY: the caller carries the promise above, that this process is still one thread.
+    unsafe { std::env::set_var(RESPONSE_BYTE_CEILING, bytes.to_string()) };
 }
 
 async fn crawl_seed(

@@ -6,7 +6,7 @@ Archeion captures a page, keeps the raw response exactly as it arrived, and reco
 
 ## Status
 
-Early, and honest about it: `archeion list <archive>` reports what a collection already holds, with `--json` for JSONL output. Crawling a seed into an archive works as a library and example while the command surface for capture stays deliberately undecided. [`docs/storage-model.md`](docs/storage-model.md) describes what an archive on disk looks like, [`docs/crawl-boundary.md`](docs/crawl-boundary.md) what the archive asks a crawl engine for, and [`docs/asset-capture.md`](docs/asset-capture.md) how the files a page needs are acquired and what bounds that. [`ROADMAP.md`](ROADMAP.md) tracks what exists, what is missing, and what is deliberately out of scope.
+Early, and honest about it: capturing, listing and exporting work end to end, and what is missing is everything that reprocesses an archive already on disk. [`docs/cli.md`](docs/cli.md) is the command surface and what each exit code means, [`docs/storage-model.md`](docs/storage-model.md) describes what an archive on disk looks like, [`docs/crawl-boundary.md`](docs/crawl-boundary.md) what the archive asks a crawl engine for, and [`docs/asset-capture.md`](docs/asset-capture.md) how the files a page needs are acquired and what bounds that. [`ROADMAP.md`](ROADMAP.md) tracks what exists, what is missing, and what is deliberately out of scope.
 
 ## Install
 
@@ -23,6 +23,16 @@ From source, with a Rust 1.96 or newer toolchain:
 ```sh
 cargo install --git https://github.com/gabrielassisxyz/archeion
 ```
+
+## Use
+
+```sh
+archeion capture ~/archive https://example.com/   # crawl a seed into a collection
+archeion list ~/archive                           # what the collection holds
+archeion export ~/archive ~/vault                 # the articles, as Markdown notes
+```
+
+A seed is one host, and the run is bounded: two hundred pages, two levels deep, a five minute wall clock, thirty seconds for any one request. Every one of those is a flag, and `archeion capture --help` prints them with the values they default to. A non-zero exit means the archive is not what it should be, never that a URL failed to answer. [`docs/cli.md`](docs/cli.md) has the whole surface.
 
 ## Design
 

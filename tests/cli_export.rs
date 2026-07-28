@@ -781,6 +781,37 @@ fn export_writes_intact_items_and_reports_unreadable_item_directories() {
     );
 }
 
+/// An export is a report on a run, so it answers with one object rather than with a line per
+/// note. The damage it found is inside that object as well as on stderr, because a reader
+/// consuming the records is exactly the one that cannot see a warning.
+#[test]
+fn export_reports_the_run_as_one_json_object() {
+    let archive = export_fixture();
+    add_unreadable_item_directory(archive.path());
+    let destination = TempDir::new().expect("temp dir");
+    let destination_path = destination.path().join("vault");
+
+    let output = archeion()
+        .arg("export")
+        .arg("--json")
+        .arg(archive.path())
+        .arg(&destination_path)
+        .output()
+        .expect("the binary runs");
+
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("one object and nothing else: {error}"));
+    assert_eq!(report["notes_written"], 7);
+    assert_eq!(
+        report["unreadable"]
+            .as_array()
+            .expect("the damage is a list")
+            .len(),
+        1
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn export_accepts_a_symlink_to_an_empty_destination_directory() {

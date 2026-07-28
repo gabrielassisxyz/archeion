@@ -388,53 +388,64 @@ impl Scanner {
 /// runs to whitespace, and the comma that follows it, or the commas it ends with when it
 /// carries no descriptor, are the separator. This is the specification's own reading, and the
 /// only one under which `a.png,b.png` is the single address a browser requests.
-fn srcset_urls(srcset: &str) -> Vec<&str> {
+///
+/// What is deliberately not done is validating the descriptor. A browser drops a candidate
+/// whose descriptor is malformed, and this keeps it, because the two are answering different
+/// questions: a browser is choosing which one image to fetch for a viewport, and the archive
+/// is recording every address the page listed, having already said above that it does not model
+/// that choice. It buys no safety either way, since a page that wants a request made writes a
+/// descriptor that is valid.
+///
+/// Lazy rather than collected, so an attribute holding more candidates than the archive will
+/// keep costs the ceiling above rather than a vector the size of the attribute.
+fn srcset_urls(srcset: &str) -> impl Iterator<Item = &str> {
     let bytes = srcset.as_bytes();
-    let mut urls = Vec::new();
     let mut position = 0;
 
-    while position < bytes.len() {
-        // Whitespace and commas are skipped together, so an empty candidate between two
-        // separators disappears rather than becoming an empty address.
-        while position < bytes.len()
-            && (bytes[position].is_ascii_whitespace() || bytes[position] == b',')
-        {
-            position += 1;
-        }
-        let start = position;
-        while position < bytes.len() && !bytes[position].is_ascii_whitespace() {
-            position += 1;
-        }
-        if start == position {
-            break;
-        }
-
-        let token = &srcset[start..position];
-        let url = token.trim_end_matches(',');
-        if !url.is_empty() {
-            urls.push(url);
-        }
-        // A URL that kept its last character ran to whitespace rather than to a separator, so
-        // a descriptor follows and reaches to the next comma. A descriptor may hold one inside
-        // parentheses, which is why the nesting is tracked rather than the character alone.
-        if url.len() == token.len() {
-            let mut depth = 0_usize;
-            while position < bytes.len() {
-                match bytes[position] {
-                    b'(' => depth += 1,
-                    b')' => depth = depth.saturating_sub(1),
-                    b',' if depth == 0 => {
-                        position += 1;
-                        break;
-                    }
-                    _ => {}
-                }
+    std::iter::from_fn(move || {
+        loop {
+            // Whitespace and commas are skipped together, so an empty candidate between two
+            // separators disappears rather than becoming an empty address.
+            while position < bytes.len()
+                && (bytes[position].is_ascii_whitespace() || bytes[position] == b',')
+            {
                 position += 1;
             }
-        }
-    }
+            let start = position;
+            while position < bytes.len() && !bytes[position].is_ascii_whitespace() {
+                position += 1;
+            }
+            if start == position {
+                return None;
+            }
 
-    urls
+            let token = &srcset[start..position];
+            let url = token.trim_end_matches(',');
+            // A URL that kept its last character ran to whitespace rather than to a separator,
+            // so a descriptor follows and reaches to the next comma. A descriptor may hold one
+            // inside parentheses, and being inside them is a state rather than a depth: a
+            // second opening parenthesis is content there, so counting it would hide the comma
+            // that ends the candidate and swallow the next one.
+            if url.len() == token.len() {
+                let mut inside_parentheses = false;
+                while position < bytes.len() {
+                    match bytes[position] {
+                        b'(' => inside_parentheses = true,
+                        b')' => inside_parentheses = false,
+                        b',' if !inside_parentheses => {
+                            position += 1;
+                            break;
+                        }
+                        _ => {}
+                    }
+                    position += 1;
+                }
+            }
+            if !url.is_empty() {
+                return Some(url);
+            }
+        }
+    })
 }
 
 /// Appends what fits and reports whether the ceiling was reached. Characters are appended

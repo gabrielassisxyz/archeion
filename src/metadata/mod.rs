@@ -540,6 +540,32 @@ mod tests {
         );
     }
 
+    /// Without whitespace there is no separator, so the whole run of characters is one address
+    /// and the comma inside it belongs to it. This is the case that decides the rule: a parser
+    /// that reads two candidates here is the one that fabricates fragments on a real page.
+    #[test]
+    fn a_candidate_with_no_whitespace_is_one_address_and_not_two() {
+        let page = extract_html(r#"<img srcset="/a.png,b.png">"#);
+        let urls: Vec<&str> = page.assets.iter().map(|asset| asset.url.as_str()).collect();
+
+        assert_eq!(urls, ["https://example.com/a.png,b.png"]);
+    }
+
+    /// A descriptor may hold a comma inside parentheses, and being inside them is a state
+    /// rather than a depth. Counting the second opening parenthesis would hide the comma that
+    /// ends the candidate, and the next candidate would be swallowed as part of the first
+    /// descriptor rather than recorded.
+    #[test]
+    fn a_second_parenthesis_in_a_descriptor_does_not_swallow_the_next_candidate() {
+        let page = extract_html(r#"<img srcset="/one.png foo(() , /two.png 2x">"#);
+        let urls: Vec<&str> = page.assets.iter().map(|asset| asset.url.as_str()).collect();
+
+        assert_eq!(
+            urls,
+            ["https://example.com/one.png", "https://example.com/two.png"]
+        );
+    }
+
     #[test]
     fn the_address_a_page_claims_for_itself_is_recorded_and_nothing_more() {
         let page = extract_html(r#"<link rel="canonical" href="/posts/one?utm_source=x">"#);

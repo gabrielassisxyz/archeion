@@ -259,6 +259,15 @@ pub enum CrawlError {
 /// caller keeps a backstop for an engine that ignores the field, but it fires a good margin
 /// after the budget, precisely so that handover is never the thing it cuts short.
 pub trait CrawlEngine {
+    /// Whether this engine will dial the seed at all, asked before anything happens.
+    ///
+    /// A crawl screens its own seed and refuses the same ones, so this answers a question
+    /// that would be answered anyway. What it is for is the caller with something to commit
+    /// before the crawl starts: an archive brought into existence for a run that was never
+    /// going to fetch anything is a directory nobody asked for, sitting on the exact path
+    /// that was typed wrong.
+    fn check_seed(&self, seed: &Seed) -> Result<(), CrawlError>;
+
     fn crawl(
         &self,
         seed: &Seed,

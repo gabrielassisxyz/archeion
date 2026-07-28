@@ -51,6 +51,11 @@ const USER_AGENT: &str = concat!(
 /// buys: a partial record that says it is partial, rather than no run at all.
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
+/// The smallest ceiling the engine will honour. It raises anything between one byte and this
+/// to this, silently, so a caller asking for less would be told a number no run applies. It
+/// is published for the callers that have to refuse such a request rather than pass it on.
+pub const SMALLEST_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
 /// The engine reads its byte ceiling from here and from nowhere else on the plain HTTP
 /// path: both of its configurable byte limits are browser-only.
 const RESPONSE_BYTE_CEILING: &str = "SPIDER_MAX_SIZE_BYTES";
@@ -61,6 +66,10 @@ const MAX_REDIRECTS: usize = 7;
 pub struct SpiderEngine;
 
 impl CrawlEngine for SpiderEngine {
+    fn check_seed(&self, seed: &Seed) -> Result<(), CrawlError> {
+        usable_seed_url(seed).map(|_url| ())
+    }
+
     fn crawl(
         &self,
         seed: &Seed,
@@ -179,6 +188,11 @@ fn response_byte_ceiling(already_settled: bool) -> Option<String> {
 /// of the engine rather than a choice made here. A caller for which that is a lie, one
 /// process running two seeds that want different ceilings, cannot have what it is asking
 /// for and should not be calling this.
+///
+/// A number under `SMALLEST_MAX_RESPONSE_BYTES` is not the number that will be applied: the
+/// engine raises it to that floor without saying so. Refusing such a request belongs to the
+/// caller, which is the only place that knows how to tell somebody, so what is passed here
+/// is written down as it arrives rather than quietly corrected twice.
 ///
 /// # Safety
 ///

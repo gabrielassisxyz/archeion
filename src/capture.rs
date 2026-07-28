@@ -448,6 +448,12 @@ mod tests {
     }
 
     impl CrawlEngine for ScriptedCrawlEngine {
+        /// This engine dials nothing, so there is no seed it has a reason to refuse. What a
+        /// real one refuses is checked where that rule lives, in `spider_engine`.
+        fn check_seed(&self, _seed: &Seed) -> Result<(), CrawlError> {
+            Ok(())
+        }
+
         fn crawl(
             &self,
             _seed: &Seed,

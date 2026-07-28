@@ -15,6 +15,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Output};
 use std::thread;
+use std::time::Duration;
 
 use archeion::CanonicalUrl;
 use archeion::storage::Archive;
@@ -156,6 +157,35 @@ fn a_seed_pointed_inside_a_network_is_refused_before_anything_is_fetched() {
          169.254.169.254 is inside a network rather than on the web\n"
     );
     assert_eq!(stdout_of(&output), "");
+    // Opening an archive is what creates one, so a seed screened afterwards would leave an
+    // empty collection on a path the run never had a reason to touch, and the line that
+    // announces a new archive would not have been printed to say so.
+    assert!(
+        !archive_path.exists(),
+        "a run that fetched nothing left an archive behind"
+    );
+}
+
+/// The refusal above has to come from the seed and not from the archive, or a run refused for
+/// its seed while pointed at a valid collection would still be reported as something else.
+#[test]
+fn a_refused_seed_is_refused_even_when_the_archive_is_fine() {
+    let dir = TempDir::new().expect("temp dir");
+    Archive::open(dir.path()).expect("the archive is created up front");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(dir.path())
+        .arg("file:///etc/passwd")
+        .output()
+        .expect("the binary runs");
+
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("file is not a scheme this archive fetches"),
+        "{}",
+        stderr_of(&output)
+    );
 }
 
 #[test]
@@ -215,17 +245,18 @@ fn the_run_reports_itself_as_one_json_object() {
     assert_eq!(report["failed_fetches"], serde_json::json!([]));
 }
 
-/// A port nothing is listening on, which is a fetch that reached no server without a socket
-/// ever being served. The archive path is handed in so the same run can answer two questions.
+/// A fetch that reaches no server, without a socket ever being opened for it.
+///
+/// The address is port 1 rather than an ephemeral port this test bound and released. That
+/// dance leaves a window in which anything on the machine, including the other tests in this
+/// file, can take the port back and answer, and the failure it produces then looks like the
+/// warning being wrong rather than like a port being reused. Port 1 needs privileges nothing
+/// in this suite has, so nothing can move into it.
 fn capture_from_a_closed_port(archive: &std::path::Path) -> Output {
-    let closed = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
-    let port = closed.local_addr().expect("the bound address").port();
-    drop(closed);
-
     archeion()
         .arg("capture")
         .arg(archive)
-        .arg(format!("http://127.0.0.1:{port}/index.html"))
+        .arg("http://127.0.0.1:1/index.html")
         .args(["--max-retries", "0", "--deadline", "30s"])
         .arg("--allow-private-addresses")
         .output()
@@ -244,7 +275,11 @@ impl Site {
         let port = listener.local_addr().expect("the bound address").port();
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let _ = answer(stream);
+                // One thread per connection, because the client keeps a pool of them: a
+                // server that answered them in turn would hold every later request behind
+                // whichever connection was opened first and left idle, and the run would
+                // then produce nothing until its deadline rather than fail.
+                thread::spawn(move || answer(stream));
             }
         });
         Self { port }
@@ -256,6 +291,9 @@ impl Site {
 }
 
 fn answer(mut stream: TcpStream) -> std::io::Result<()> {
+    // A connection that goes quiet mid-request gives up its thread instead of holding it for
+    // as long as the client feels like keeping it open.
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;

@@ -30,9 +30,11 @@ Every option is one field of the seed the library crawls with, spelled the same,
 
 A span carries its unit: `250ms`, `30s`, `5m`, `1h`. A bare number would have to mean seconds on the deadline and milliseconds on the delay, and a run whose budget was read in the wrong unit is either over before it starts or never over at all.
 
-`--max-pages`, `--max-depth` and `--concurrency` refuse a zero. The engine underneath reads a zero as no limit at all, so a run asking for the smallest possible crawl would get an unbounded one instead. A crawl that really should take everything says so with a large number, and the only unbounded thing that can be asked for by name is the wall clock, with `--deadline none`.
+A zero is refused everywhere it would not mean zero, which is everywhere except `--delay`. On `--max-pages`, `--max-depth` and `--concurrency` the engine underneath reads it as no limit at all, so a run asking for the smallest possible crawl would get an unbounded one. On `--deadline` and `--request-timeout` it is the opposite mistake: a budget nothing can finish inside, so every URL is reported as a server that answered nothing, which is what a site being down looks like and leaves with the code that says the web misbehaved. `--delay` keeps zero because a wait of none is a wait, and it is the library's own default.
 
-The archive is created when the path holds no archive yet, since `capture` is the only verb that writes and a first collection has to start somewhere. It says so on the line above the report, because a path typed wrong is otherwise a new empty archive nobody was told about.
+A crawl that really should take everything says so with a large number. The one unbounded thing that can be asked for by name is the wall clock, with `--deadline none`.
+
+The archive is created when the path holds no archive yet, since `capture` is the only verb that writes and a first collection has to start somewhere. It says so on the line above the report, because a path typed wrong is otherwise a new empty archive nobody was told about. The seed is screened before that happens: a run the engine will not dial leaves no directory behind on the path it was pointed at.
 
 The per-host extraction rules that sit in the archive are read at the start of the run. A rule file that cannot be used is a warning and not a refusal: it costs the extractions it would have improved, and the response is the part that cannot be fetched again. [`readability.md`](readability.md) has the file and its directives.
 
@@ -45,6 +47,8 @@ That flag is the one that decides whether the archive can be talked into reading
 ### The response byte ceiling
 
 `--max-response-bytes` is settled for the whole process before anything is fetched, because the engine reads the ceiling from an environment variable on its first fetch and keeps that value for the rest of its life. One run is one process here, so per-run and process-wide are the same thing, and the flag does not promise anything the engine cannot hold.
+
+It refuses anything under a mebibyte, which is the smallest ceiling the engine honours: below that it raises the number to that floor and says nothing, so a smaller value accepted here would be a ceiling the tool reports and no run applies.
 
 The flag wins over `SPIDER_MAX_SIZE_BYTES` already in the environment, which is the escape hatch below it: a variable set there stands when the flag is absent, including a zero meaning no ceiling at all, which the flag itself will not accept.
 

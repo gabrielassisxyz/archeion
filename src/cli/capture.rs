@@ -12,7 +12,10 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use archeion::capture::{CaptureError, CaptureRun, capture_seed};
-use archeion::crawl::{CrawlStop, DEFAULT_MAX_RESPONSE_BYTES, Seed, SpiderEngine};
+use archeion::crawl::{
+    CrawlEngine, CrawlStop, DEFAULT_MAX_RESPONSE_BYTES, SMALLEST_MAX_RESPONSE_BYTES, Seed,
+    SpiderEngine,
+};
 use archeion::readability::SiteRules;
 use archeion::storage::{Archive, StorageError};
 use serde::Serialize;
@@ -39,13 +42,16 @@ pub struct CaptureArgs {
           value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     concurrency: usize,
     /// How long to wait between requests, which slows the crawl rather than bounding it.
+    /// Zero is the only span here that means what it says: no wait.
     #[arg(long, value_name = "SPAN", default_value_t = Span(defaults().delay))]
     delay: Span,
     /// The wall clock the whole run gets, or `none` for a run that is deliberately unbounded.
-    #[arg(long, value_name = "SPAN", default_value_t = Deadline(defaults().deadline))]
+    #[arg(long, value_name = "SPAN", default_value_t = Deadline(defaults().deadline),
+          value_parser = a_span_a_run_can_live_inside::<Deadline>)]
     deadline: Deadline,
     /// How long one request may take before it counts as no response at all.
-    #[arg(long, value_name = "SPAN", default_value_t = Span(defaults().request_timeout))]
+    #[arg(long, value_name = "SPAN", default_value_t = Span(defaults().request_timeout),
+          value_parser = a_span_a_run_can_live_inside::<Span>)]
     request_timeout: Span,
     /// How many times a request that failed in a way worth repeating is repeated.
     #[arg(long, value_name = "N", default_value_t = defaults().max_retries)]
@@ -53,7 +59,8 @@ pub struct CaptureArgs {
     /// Ceiling on the body of one response, in bytes. It is settled for the whole process
     /// before anything is fetched, because that is the only channel the engine offers.
     #[arg(long, value_name = "BYTES", help = response_ceiling_help(),
-          value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+          value_parser = clap::builder::RangedU64ValueParser::<usize>::new()
+              .range(SMALLEST_MAX_RESPONSE_BYTES as u64..))]
     max_response_bytes: Option<usize>,
     /// Let the run reach loopback, private ranges, link-local addresses and the names a
     /// cloud metadata service answers on. Off, so a URL cannot talk the archive into
@@ -80,6 +87,51 @@ fn defaults() -> Seed {
 
 fn response_ceiling_help() -> String {
     format!("Ceiling on the body of one response, in bytes [default: {DEFAULT_MAX_RESPONSE_BYTES}]")
+}
+
+/// A budget that a run has to be able to happen inside, which is every span here except the
+/// politeness delay.
+///
+/// Zero is refused rather than obeyed, for the reason the page and depth limits refuse it,
+/// arrived at from the other direction. There it means no limit and a run asking for the
+/// smallest crawl gets an unbounded one; here it is a limit nothing can fit in, so every
+/// request expires before it is sent. The run then reports a page count of zero and a list
+/// of URLs that answered nothing, which is what a site being down looks like, and leaves
+/// with the code that says the web misbehaved. Being told the flag is impossible is the only
+/// answer that is not a lie about the site.
+fn a_span_a_run_can_live_inside<T>(text: &str) -> Result<T, String>
+where
+    T: FromStr<Err = String> + Budget,
+{
+    let span: T = text.parse()?;
+    if span.is_zero() {
+        return Err(format!(
+            "{text} is a budget no request can finish inside, so every one of them would \
+             be reported as a server that answered nothing"
+        ));
+    }
+    Ok(span)
+}
+
+/// Whether a span leaves a run any room at all. It is a trait rather than two functions
+/// because the deadline carries the extra answer of having no budget on purpose, which is
+/// not the same thing as a budget of nothing.
+trait Budget {
+    fn is_zero(&self) -> bool;
+}
+
+impl Budget for Span {
+    fn is_zero(&self) -> bool {
+        self.0.is_zero()
+    }
+}
+
+impl Budget for Deadline {
+    /// `none` is a run that asked for no ceiling, which is a decision rather than a budget
+    /// of nothing, so it passes.
+    fn is_zero(&self) -> bool {
+        self.0.is_some_and(|budget| budget.is_zero())
+    }
 }
 
 /// A span of time as the command line spells it: `250ms`, `30s`, `5m`, `1h`.
@@ -167,6 +219,12 @@ impl Display for Deadline {
 
 pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
     let seed = seed_of(&args);
+    // Before the archive, because opening one creates it. A seed the engine will not dial is
+    // a run that was never going to fetch anything, and creating a directory for it leaves
+    // an empty archive on the path that was typed wrong, which is exactly the case the line
+    // announcing a new archive exists to make visible.
+    let engine = SpiderEngine;
+    engine.check_seed(&seed)?;
     let (archive, created) = open_or_create(&args.archive)?;
     // A rule file that cannot be used costs the extractions it would have improved and not
     // the capture, so it is a warning here rather than a reason to refuse the run: the
@@ -175,7 +233,7 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
     let (rules, unused_rules) = SiteRules::read(&archive.extraction_rules_path());
     warn(unused_rules.iter().map(ToString::to_string));
 
-    let (run, failure) = match capture_seed(&SpiderEngine, &archive, &seed, &rules) {
+    let (run, failure) = match capture_seed(&engine, &archive, &seed, &rules) {
         Ok(run) => (run, None),
         // The report is the point of carrying the run inside the error: the archive holds
         // whatever was written before the disk refused, and a caller told only that a write
@@ -492,11 +550,6 @@ mod tests {
         assert!(seed.allow_private_addresses);
     }
 
-    #[test]
-    fn a_run_can_ask_to_be_unbounded_and_has_to_say_so() {
-        assert_eq!(seed_of(&parse(&["--deadline", "none"])).deadline, None);
-    }
-
     /// The engine reads a zero as no limit at all, so a command line that passed one through
     /// would answer a request for the smallest possible crawl with an unbounded one.
     #[test]
@@ -546,13 +599,50 @@ mod tests {
         );
     }
 
+    /// The other direction of the same mistake. A budget of zero is a limit no request can
+    /// finish inside, so every URL would be reported as a server that answered nothing, which
+    /// is indistinguishable from the site being down and leaves with a code saying so.
+    #[test]
+    fn a_budget_no_request_could_finish_inside_is_refused() {
+        for flag in ["--deadline", "--request-timeout"] {
+            let message = refuse(&[flag, "0s"]);
+            assert!(
+                message.contains("no request can finish inside"),
+                "{flag} 0s was refused with: {message}"
+            );
+        }
+    }
+
+    /// The politeness delay is the one span where zero is the ordinary answer: it is a wait
+    /// between requests rather than a budget one has to fit in, and the library's own default
+    /// is exactly that.
+    #[test]
+    fn a_delay_of_zero_is_the_default_and_stays_accepted() {
+        assert_eq!(seed_of(&parse(&["--delay", "0s"])).delay, Duration::ZERO);
+    }
+
+    /// A run that asked for no deadline is making a decision, not asking for a budget of
+    /// nothing, so the guard above has to let it through.
+    #[test]
+    fn a_run_with_no_deadline_is_not_mistaken_for_one_with_an_empty_budget() {
+        assert_eq!(seed_of(&parse(&["--deadline", "none"])).deadline, None);
+    }
+
+    /// The engine raises anything under a megabyte to a megabyte without saying so, so a
+    /// smaller number accepted here would be a ceiling the flag reports and no run applies.
     #[test]
     fn the_response_ceiling_is_the_run_s_to_choose_and_absent_by_default() {
         assert_eq!(parse(&[]).response_byte_ceiling(), None);
         assert_eq!(
-            parse(&["--max-response-bytes", "4096"]).response_byte_ceiling(),
-            Some(4096)
+            parse(&["--max-response-bytes", "4194304"]).response_byte_ceiling(),
+            Some(4 * 1024 * 1024)
         );
-        assert!(refuse(&["--max-response-bytes", "0"]).contains("not in 1.."));
+        for below in ["0", "4096", &(SMALLEST_MAX_RESPONSE_BYTES - 1).to_string()] {
+            let message = refuse(&["--max-response-bytes", below]);
+            assert!(
+                message.contains(&format!("not in {SMALLEST_MAX_RESPONSE_BYTES}..")),
+                "{below} was refused with: {message}"
+            );
+        }
     }
 }

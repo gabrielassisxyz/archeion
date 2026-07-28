@@ -129,18 +129,24 @@ pub fn extract(
     let matched = rules.for_url(source.final_url);
     let narrowed = match matched {
         Some(matched) => document::narrow(&document, matched.rule),
-        None => document::Narrowed::ToWhatIsLeftOfThePage,
+        None => document::Narrowed::Untouched,
     };
     if narrowed == document::Narrowed::NotAnArticleHere {
         return Ok(Extraction::Nothing);
     }
-    // A rule that named the article answered the question the probe below asks, so the probe is
-    // skipped rather than allowed to overrule it. The sliver rule needs no such exception: the
-    // page it measures against is now the article, so it cannot fire.
+    // A rule that named where the article is answered two questions this function otherwise
+    // guesses at: whether the page is an article, and whether what came out of it is a sliver of
+    // something else. Both guesses were calibrated against a handful of sites, and neither
+    // overrules an operator who looked at this host's markup and said where its prose lives.
     let told_where_the_article_is = narrowed == document::Narrowed::ToTheArticleTheRuleNamed;
-    let applied = matched.map_or(ExtractionRules::Heuristic, |matched| {
-        ExtractionRules::Site(matched.host.to_owned())
-    });
+    // Named after what happened to this page rather than after what the host declared. A rule
+    // written for a site's articles leaves its listings and its index pages untouched, and those
+    // extractions are the heuristic's: saying otherwise would take the majority of a host's
+    // records out of the calibration `rules` exists to make possible.
+    let applied = match (matched, narrowed == document::Narrowed::Untouched) {
+        (Some(matched), false) => ExtractionRules::Site(matched.host.to_owned()),
+        _ => ExtractionRules::Heuristic,
+    };
     // After the rule and not before it, so that both sides of the sliver rule below count the
     // same document. A rule that narrowed the page to the article says the operator already
     // answered the question the sliver rule asks, and the record names the rule that answered it
@@ -183,7 +189,7 @@ pub fn extract(
         page_chars,
     };
 
-    if share.is_a_sliver() {
+    if !told_where_the_article_is && share.is_a_sliver() {
         return Ok(Extraction::Refused(RefusedExtraction {
             extractor_version: EXTRACTOR_VERSION,
             rules: applied,
@@ -525,7 +531,7 @@ mod tests {
         let refused = extract_with(
             &front_page(),
             Some("The Slow Kitchen"),
-            &rules_for_example(r#"{"strip": ["nothing-here"]}"#),
+            &rules_for_example(r#"{"strip": ["header"]}"#),
         );
 
         let Extraction::Refused(refused) = refused else {
@@ -585,6 +591,77 @@ mod tests {
             .share
             .expect("a version 2 record measures its share");
         assert_eq!(share.article_chars, share.page_chars, "{share:?}");
+    }
+
+    /// The sliver rule is skipped and not merely outrun. Narrowing makes the page the article,
+    /// so the comparison looks settled, and it is not: `article_chars` is what the scorer kept
+    /// and `page_chars` is what it was handed, and the scorer takes blocks out of the very
+    /// container a rule named. What is left is then a sliver of a document the rule itself
+    /// assembled, and the page the rule exists to rescue is refused.
+    #[test]
+    fn a_page_the_rule_named_is_not_refused_for_what_the_scorer_dropped_out_of_it() {
+        let page = format!(
+            "<html><body><div class=\"story\">\
+             <p>The element went in this morning and the first loaf came out an hour ago.</p>\
+             <form>{}</form></div></body></html>",
+            "<button>Sign up for the daily newsletter and never miss another story about bread \
+             or ovens</button>"
+                .repeat(5)
+        );
+
+        let extracted = extract_with(
+            &page,
+            Some("The oven is fixed"),
+            &rules_for_example(r#"{"body": ["div.story"]}"#),
+        );
+
+        let Extraction::Article(article) = extracted else {
+            panic!("the page the rule named was not kept: {extracted:?}");
+        };
+        assert!(
+            article
+                .markdown
+                .contains("The element went in this morning")
+        );
+        // The comparison the rule overruled, asserted so that a page that stopped exercising it
+        // fails here rather than passing as if the skip were still doing something.
+        let share = article.record.share.expect("a record measures its share");
+        assert!(share.is_a_sliver(), "{share:?}");
+    }
+
+    /// A page with no body is a `<frameset>`, and a host that said where its articles are has
+    /// answered for it. Passing it to the scorer instead would be the heuristic taking over on a
+    /// page the rule was written to speak for, which is the fallback the rule switches off.
+    #[test]
+    fn a_page_with_no_body_at_all_is_answered_by_the_rule_and_not_by_the_scorer() {
+        let frameset = "<html><frameset><frame src=\"a.html\"></frameset></html>";
+
+        assert_eq!(
+            extract_with(
+                frameset,
+                None,
+                &rules_for_example(r#"{"body": ["div.story"]}"#)
+            ),
+            Extraction::Nothing
+        );
+    }
+
+    /// A host whose rule is written for its articles also serves listings and index pages the
+    /// rule never touches, and those extractions are the heuristic's. Recording them as made
+    /// under a rule would take the majority of a host's records out of the calibration the field
+    /// exists to make possible.
+    #[test]
+    fn a_rule_that_matched_nothing_on_a_page_is_not_recorded_as_having_made_it() {
+        let article = extract_with(
+            &article_page(""),
+            Some("t"),
+            &rules_for_example(r#"{"strip": ["aside.promo"]}"#),
+        );
+
+        let Extraction::Article(article) = article else {
+            panic!("expected an article, got {article:?}");
+        };
+        assert_eq!(article.record.rules, ExtractionRules::Heuristic);
     }
 
     /// A rule that names where the article is says something about every page of the host, and

@@ -1,9 +1,11 @@
 {
-  "why": "The other page shape of the same site, and the reason a body rule says what a page is rather than only where its prose sits. A listing whose entries carry the opening paragraph of each post is several hundred words of genuine prose, so the sliver rule keeps it and the archive gains a listing filed beside the articles. The rule that names the post's own element answers this page too, because a page that does not have one is not a post.",
+  "why": "The other page shape of the same site, and the reason a body rule says what a page is rather than only where its prose sits. A listing whose entries carry the opening paragraph of each post is several hundred words of genuine prose, so the sliver rule keeps it and the archive gains a listing filed beside the articles. The rule that names the post's own element answers this page too, because a page that does not have one is not a post. What this case pins is the answer and not the selector: any body selector absent from this page produces it, and the topic page the selector was written against is deliberately not in the corpus, for the reason in docs/readability.md. So a green suite here is not evidence that div.topic-full-text is where that site puts its posts.",
   "outcome": "nothing",
   "title": "Topics in ~comp",
   "rules": {
     "why": "a topic page nests the replies inside the same element as the post, so the post has to be named directly",
-    "body": ["div.topic-full-text"]
+    "body": [
+      "div.topic-full-text"
+    ]
   }
 }

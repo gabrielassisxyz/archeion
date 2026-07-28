@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
+use std::io::Read as _;
 use std::path::Path;
 
 use dom_query::Matcher;
@@ -19,8 +20,8 @@ use crate::canonical_url::CanonicalUrl;
 /// How large a rule file may be.
 ///
 /// A rule is a host, a sentence and a handful of selectors, so this holds thousands of them. It
-/// is here because the file sits at a path anything on this machine can write to, and the ceiling
-/// costs one `stat` while its absence costs whatever the largest file on the disk is.
+/// is here because the file sits at a path anything on this machine can write to, and without it
+/// the read is as long as whatever is at that path, which need not even be a file with an end.
 const MAX_RULES_BYTES: u64 = 256 * 1024;
 
 /// A rule the extractor did not use, and why.
@@ -108,27 +109,40 @@ impl SiteRules {
             )
         };
 
-        // On the link rather than through it, and before the file is opened, on the same terms as
-        // an item record in `storage::walk`: this is a path outside the program's own writes, and
-        // by the time `/dev/zero` is being read the choice not to read it has been made.
-        let shape = match fs::symlink_metadata(path) {
-            Ok(shape) => shape,
+        // Opened once and then asked what it is, rather than asked about the path and opened
+        // afterwards. This is a path outside the program's own writes, so between two calls it
+        // can become a different file: a `stat` that says "a small regular file" and a read that
+        // follows a symbolic link to `/dev/zero` are describing two different things, and only
+        // the handle already open is the one being read.
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return (Self::default(), Vec::new());
             }
             Err(error) => return unused(format!("could not be read: {error}")),
         };
+        let shape = match file.metadata() {
+            Ok(shape) => shape,
+            Err(error) => return unused(format!("could not be read: {error}")),
+        };
         if !shape.is_file() {
             return unused("a rule file is a regular file, and this is not one".to_owned());
         }
-        if shape.len() > MAX_RULES_BYTES {
-            return unused(format!(
-                "is {} bytes, over the {MAX_RULES_BYTES} byte ceiling for a rule file",
-                shape.len()
-            ));
-        }
-        match fs::read_to_string(path) {
-            Ok(declared) => Self::parse(&declared, &origin),
+
+        // The ceiling is enforced on the read and not on the size the handle reported, because a
+        // file being appended to answers one number and yields another, and a character device
+        // answers zero and yields forever. One byte past it is read on purpose: a file that fills
+        // the ceiling exactly is admitted, and anything longer is refused without being held.
+        let mut declared = String::new();
+        let read = file
+            .take(MAX_RULES_BYTES + 1)
+            .read_to_string(&mut declared)
+            .map(|_| declared.len() as u64);
+        match read {
+            Ok(length) if length > MAX_RULES_BYTES => unused(format!(
+                "is over the {MAX_RULES_BYTES} byte ceiling for a rule file"
+            )),
+            Ok(_) => Self::parse(&declared, &origin),
             Err(error) => unused(format!("could not be read: {error}")),
         }
     }
@@ -304,16 +318,25 @@ mod tests {
         assert_eq!(matched.rule.strip, ["blockquote.ad"]);
     }
 
-    /// The ceiling is on the file rather than on what parsing it would cost, so it is checked
-    /// before the bytes are read rather than after.
+    /// The ceiling is where the constant says it is, and it bounds the read rather than a size
+    /// something else reported. A file that fills it exactly is a rule file that happens to be
+    /// large; one byte more is refused with only that byte held.
     #[test]
-    fn a_rule_file_past_the_ceiling_is_refused_before_it_is_read() {
+    fn the_rule_file_ceiling_is_where_the_constant_says_it_is() {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join("extraction-rules.json");
-        fs::write(&path, "x".repeat(MAX_RULES_BYTES as usize + 1)).expect("the file is written");
+        let padding = |length: usize| {
+            let rule = r#"{"hosts": {"example.com": {"why": "PAD", "strip": [".ad"]}}}"#;
+            rule.replace("PAD", &"x".repeat(length - rule.len() + "PAD".len()))
+        };
 
+        fs::write(&path, padding(MAX_RULES_BYTES as usize)).expect("the file is written");
         let (rules, unused) = SiteRules::read(&path);
+        assert!(unused.is_empty(), "{unused:?}");
+        assert!(rules.for_url("https://example.com/a").is_some());
 
+        fs::write(&path, padding(MAX_RULES_BYTES as usize + 1)).expect("the file is written");
+        let (rules, unused) = SiteRules::read(&path);
         assert!(rules.is_empty());
         assert_eq!(unused.len(), 1, "{unused:?}");
         assert!(unused[0].reason.contains("ceiling"), "{unused:?}");

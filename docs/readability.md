@@ -144,12 +144,16 @@ For `body`, the first selector that matches anything wins, and what it matched b
 
 The subtree is moved inside the tree it is already in. Nothing is serialized and parsed again, which matters because the ceilings above have already been paid by the time a rule runs, and a second parse would be a second chance to pay them.
 
-Two guesses give way to a rule that named the article, and both are guesses this file argues for elsewhere:
+Two guesses give way to a rule that named the article, and both are guesses this file argues for elsewhere. Both are **skipped** rather than left to be outrun:
 
-- **The readability probe is skipped.** It weighs a document; a `body` rule leaves behind a document that is only the article; a short post is then refused for being what the rule cut it down to. The forum topic above is the shape that showed it, at 210 characters after narrowing.
-- **The sliver rule cannot fire.** `page_chars` is counted after the rule rather than before, so the page it measures against is the article, and the share is one. That is deliberate and it is why `rules` is on the record: a share measured under a rule is not comparable with one measured on a whole page, and the calibration these numbers exist for has to be able to leave those rows out.
+- **The readability probe.** It weighs a document; a `body` rule leaves behind a document that is only the article; a short post is then refused for being what the rule cut it down to. The forum topic above is the shape that showed it, at 210 characters after narrowing.
+- **The sliver rule.** Narrowing looks like it settles the comparison, since `page_chars` is counted after the rule and the article is now the page. It does not. `article_chars` is what the scorer kept and `page_chars` is what it was handed, and the scorer takes blocks out of the very container the rule named: a form, a link-dense table, anything `clean_conditionally` decides is not prose. What is left is then a sliver of a document the rule itself assembled, and the page the rule exists to rescue is refused. A short post above a five-button signup form reaches 59 against 399.
 
-A `strip` says nothing about where the article is, so it changes neither.
+`share` is still recorded under a rule, and `rules` on the record is what keeps it usable: a share measured on a document a rule narrowed is not comparable with one measured on a whole page, and the calibration these numbers exist for has to be able to leave those rows out.
+
+A `strip` says nothing about where the article is, so it changes neither, and a rule whose selectors all missed changes nothing at all: that page records `heuristic`. A host's rule is written for its articles, and the same host serves listings and index pages the rule never touches, so marking those as extracted under a rule would take the majority of a host's records out of the calibration just described.
+
+A rule reaches only inside `<body>`. Everything else a selector can name is either meaningless, as an article that is the whole page, or destructive: a `strip` on `html` leaves the scorer no tree, and a `body` of `*` reparents the `<head>` into the document body, after which the page has no head and its title text starts counting as text the page said. A page with no body at all is a `<frameset>`, which has no article in it; a host that named where its articles are has therefore already answered for it, and a host that only named furniture has nothing there to take out.
 
 ### A broken rule file costs extractions, never a capture
 
@@ -275,13 +279,15 @@ There is no field naming the rule that refused it. One rule refuses here and its
 
 The excerpt is the one field here a page controls the length of, and the reader of these records refuses a file over 64 KiB. A page serving an enormous description can therefore write a refusal that will not read back, which is reported by path rather than silently skipped. The article record has carried the same hazard since before this rule, and bounding both is its own change.
 
-`rules` names what produced the extraction: `heuristic` when nothing was said about the host, and `site:<host>` when something was. It stays one string across both, because every reader that filters on it compares it to a string and turning it into an object for the second case would break all of them for nothing. A value this extractor cannot account for is refused rather than read as `heuristic`, which would claim a page was read with nothing said about it.
+`rules` names what produced this extraction: `heuristic` when nothing was said about the host or when what was said matched nothing on this page, and `site:<host>` when a rule actually reached it. It stays one string across both, because every reader that filters on it compares it to a string and turning it into an object for the second case would break all of them for nothing. A value this extractor cannot account for is refused rather than read as `heuristic`, which would claim a page was read with nothing said about it.
 
 `byline` is what the algorithm found in the page's own markup and is not the resolved author in the metadata record: the two disagree often, and collapsing them would hide which one to look at when an attribution comes out wrong. `word_count` counts the prose and not the heading, which is a title the metadata record already holds; it stays a rough figure for sorting and filtering, which is why it is not what the sliver rule weighs. `truncated` is absent when nothing was cut, which is the ordinary case.
 
 `markdown_sha256` is the address of the document beside it, and it is what makes the pair safe to rewrite. Ordering alone is enough only the first time: writing over an existing pair and stopping between the two files leaves new prose beside an old record, both present, both parsing, and every field describing something that is no longer there. A reader that finds the two disagreeing reports no article, because the response the article was derived from is still in the archive and the pass that re-extracts will simply redo it.
 
 `extractor_version` is bumped when the meaning of a field or a rule that fills one changes, not when a field is added, on the same terms as the metadata record. It is 2 for the sliver rule: `share` arriving beside the counts would not have been enough on its own, but a page can now produce prose and still not be stored as an article, so the absence of a record beside a capture stopped meaning what it meant at 1.
+
+The rules layer did not bump it, and the argument cuts close enough to be worth writing down. Two things about a version 2 record could be said to have changed: `page_chars` is the document the scorer was handed rather than the page, and a capture can now have no article because a host's `body` rule found nothing. Neither reaches a record already on disk. An extractor with no rule file does exactly what version 2 did, and every record written under a rule says so in `rules`, so nothing already written has to be reinterpreted; bumping would tell every reader otherwise. What changed for the pages with no record is the operator's own file, and it is in the archive beside them.
 
 ## What was deliberately left out
 

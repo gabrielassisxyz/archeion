@@ -309,7 +309,7 @@ impl ArticleState {
             Self::NotArticle(non_article) => {
                 non_article.extractor_version < readability::EXTRACTOR_VERSION
             }
-            Self::Missing => is_html(capture),
+            Self::Missing => reads_as_prose(capture),
         }
     }
 
@@ -325,11 +325,28 @@ impl ArticleState {
     }
 }
 
+/// Whether a capture is markup, which is what the metadata extractor reads and nothing else.
 fn is_html(capture: &Capture) -> bool {
     capture.media_type.as_deref().is_some_and(|media_type| {
         media_type.eq_ignore_ascii_case("text/html")
             || media_type.eq_ignore_ascii_case("application/xhtml+xml")
     })
+}
+
+/// Whether a capture holds prose, which is a wider question than the one above and the reason
+/// the two are not one function.
+///
+/// It is what decides whether no article beside a capture means the extractor has not answered
+/// yet. A response served as Markdown is prose the extractor now reads, so every one already in
+/// an archive is stale to this pass, which is what makes the change retroactive over captures
+/// taken before it. Widening `is_html` instead would send the metadata extractor after a
+/// document that has no tags to read, on every pass, forever.
+fn reads_as_prose(capture: &Capture) -> bool {
+    is_html(capture)
+        || capture.media_type.as_deref().is_some_and(|media_type| {
+            media_type.eq_ignore_ascii_case("text/markdown")
+                || media_type.eq_ignore_ascii_case("text/x-markdown")
+        })
 }
 
 fn content_type_of(headers: &[crate::storage::Header]) -> Option<&str> {

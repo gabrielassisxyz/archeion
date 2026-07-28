@@ -93,6 +93,17 @@ fn html_capture(url: &CanonicalUrl, body: &str) -> NewCapture {
     }
 }
 
+fn markdown_capture(url: &CanonicalUrl, body: &str) -> NewCapture {
+    NewCapture {
+        media_type: Some("text/markdown".to_owned()),
+        response_headers: vec![Header {
+            name: "content-type".to_owned(),
+            value: "text/markdown; charset=utf-8".to_owned(),
+        }],
+        ..html_capture(url, body)
+    }
+}
+
 fn article_record(version: u32, rules: ExtractionRules) -> ArticleRecord {
     ArticleRecord {
         extractor_version: version,
@@ -124,6 +135,101 @@ fn article_page(extra: &str) -> String {
         "<html><head><title>A page</title></head><body><article>{extra}{}</article></body></html>",
         "<p>Bread is mostly patience, and the dough will tell you when it is ready.</p>".repeat(8)
     )
+}
+
+/// What makes the served document retroactive. A capture stored as Markdown before the
+/// extractor could read one has no article beside it, and that absence is what a repass has to
+/// recognise as an answer nobody has given yet rather than as a response with nothing in it.
+///
+/// It is also the whole retroactive path: nothing is fetched, the stored response is untouched,
+/// and its hash is the same afterwards.
+#[test]
+fn a_response_stored_as_markdown_before_it_could_be_read_becomes_an_article() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/posts/one.md").expect("valid URL");
+    let capture = archive
+        .write_capture(markdown_capture(
+            &url,
+            "# The oven is fixed\n\nThe element went in this morning.\n",
+        ))
+        .expect("capture is written");
+    let body_hash = capture.body.sha256.clone();
+    let engine = ScriptedEngine::new(Vec::new());
+
+    let run = repass_archive(
+        &engine,
+        &archive,
+        &SiteRules::default(),
+        RepassOptions::default(),
+    )
+    .expect("repass succeeds");
+
+    assert_eq!(run.articles_written, 1);
+    assert_eq!(engine.fetched(), Vec::<String>::new());
+    let article = archive
+        .read_article(&url, &capture.id)
+        .expect("article read succeeds")
+        .expect("an article was written");
+    assert_eq!(article.record.rules, ExtractionRules::Served);
+    assert!(
+        article
+            .markdown
+            .contains("The element went in this morning")
+    );
+    assert_eq!(
+        archive
+            .read_capture(&url, &capture.id)
+            .expect("capture reads")
+            .body
+            .sha256,
+        body_hash
+    );
+
+    // The second pass has nothing left to do, which is what says the answer was recorded rather
+    // than merely produced.
+    let again = repass_archive(
+        &engine,
+        &archive,
+        &SiteRules::default(),
+        RepassOptions::default(),
+    )
+    .expect("repass succeeds");
+    assert_eq!(again.articles_written, 0);
+    assert_eq!(again.derived_unchanged, 1);
+}
+
+/// The metadata extractor reads tags, and a Markdown document has none. Sending it after one
+/// anyway would report the same unreadable page on every pass forever, so the two questions
+/// stay two predicates.
+#[test]
+fn a_markdown_capture_is_never_sent_to_the_metadata_extractor() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/posts/one.md").expect("valid URL");
+    let capture = archive
+        .write_capture(markdown_capture(
+            &url,
+            "# A post\n\nProse enough to keep.\n",
+        ))
+        .expect("capture is written");
+
+    let run = repass_archive(
+        &ScriptedEngine::new(Vec::new()),
+        &archive,
+        &SiteRules::default(),
+        RepassOptions::default(),
+    )
+    .expect("repass succeeds");
+
+    assert_eq!(run.metadata_written, 0);
+    assert_eq!(run.unreadable_pages, Vec::new());
+    assert!(
+        archive
+            .read_metadata(&url, &capture.id)
+            .expect("metadata read succeeds")
+            .is_none()
+    );
 }
 
 #[test]

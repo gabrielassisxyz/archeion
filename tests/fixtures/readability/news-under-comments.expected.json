@@ -1,0 +1,15 @@
+{
+  "why": "The same article as news-with-furniture.html, under the sidebar of related stories and the comment section a real news site carries. Its share of the page is 0.23, under the threshold, so only the floor keeps it. This is the case that says why the floor cannot simply be raised until it does the work alone: an article's share falls as far as its furniture goes, and a comment section has no bound.",
+  "outcome": "article",
+  "title": "City council votes to keep the night buses",
+  "must_contain": [
+    "reversing a proposal that would have cut seven of them",
+    "counts a nurse going to a night shift"
+  ],
+  "must_not_contain": [
+    "Accept all cookies",
+    "Comment number 1",
+    "Council approves the cycle lane"
+  ],
+  "word_count": { "min": 180, "max": 320 }
+}

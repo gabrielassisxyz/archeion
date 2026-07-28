@@ -1,6 +1,6 @@
 {
   "why": "Documentation, where the furniture is larger than on a blog and the content that must survive is not only prose: code blocks and a table carry the answer the page exists to give.",
-  "is_article": true,
+  "outcome": "article",
   "title": "Configuring retries",
   "must_contain": [
     "retries a request when the failure looks transient",

@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 
 /// The extractor that produced a record. Bumped when the meaning of a field or a rule that
 /// fills one changes, not when a field is added, on the same terms as the metadata record.
-pub const EXTRACTOR_VERSION: u32 = 1;
+///
+/// 2 is the sliver rule: a page can now produce prose and still be refused as an article, so
+/// the absence of a record beside a capture stopped meaning what it meant at 1.
+pub const EXTRACTOR_VERSION: u32 = 2;
 
 /// What decided where the article was in the page.
 ///
@@ -36,8 +39,18 @@ pub struct ArticleRecord {
     pub extractor_version: u32,
     pub rules: ExtractionRules,
     /// Split on whitespace, so it is a rough figure for sorting and filtering rather than a
-    /// measurement. It is wrong for languages that do not put spaces between words.
+    /// measurement. It is wrong for languages that do not put spaces between words, which is
+    /// why it is not what the sliver rule weighs.
     pub word_count: usize,
+    /// What the sliver rule measured on this page, recorded for the articles it kept and not
+    /// only for the pages it refused, on the same terms as `cost` below. A file per refusal
+    /// says the rule is firing; only the shares that real articles reach can say whether the
+    /// rule is about to start firing on them.
+    ///
+    /// Absent on records written before the rule existed, which is not the same as a page that
+    /// measured nothing. A record must not answer a question the extractor that wrote it was
+    /// never asked.
+    pub share: Option<ProseShare>,
     pub excerpt: Option<String>,
     /// The attribution the page's own markup carried, which is deliberately not the resolved
     /// author in the metadata record. The two disagree often, and collapsing them would hide
@@ -47,6 +60,22 @@ pub struct ArticleRecord {
     pub truncated: Vec<ArticleBound>,
     /// What this page cost to admit, against the ceilings that admitted it.
     pub cost: AdmissionCost,
+}
+
+/// How much of a page's text the article taken out of it holds.
+///
+/// The two counts and not the ratio between them. A ratio is a division somebody already did,
+/// at a precision they chose, and the calibration these exist for is a question about the
+/// distribution of both sides. Characters and not words, because the rule that reads them has
+/// to mean the same thing in a language that does not separate words with spaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProseShare {
+    /// The extracted article's own text, without the Markdown that will be written around it.
+    pub article_chars: usize,
+    /// The page's text with the bodies of scripts, styles and templates left out, and the rest
+    /// left in: navigation, banners, and every block the scorer discarded. It is not what a
+    /// reader would have seen, since a page can hide text with CSS and this never resolves it.
+    pub page_chars: usize,
 }
 
 /// What one page measured against the ceilings it had to pass.
@@ -73,4 +102,40 @@ pub struct Article {
     /// A standalone Markdown document: the title as an `#` heading, then the prose.
     pub markdown: String,
     pub record: ArticleRecord,
+}
+
+/// What extraction made of one capture.
+///
+/// The two ways of not producing an article are separate answers because only one of them has
+/// anything to say. A page that is not markup, or whose markup holds nothing the scorer would
+/// call prose, is most of the web and is passed over in silence. A page that did produce prose
+/// and was then refused is a disagreement between the algorithm and the rule below it, and
+/// that disagreement is the only material either number can ever be corrected against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Extraction {
+    Article(Article),
+    Refused(RefusedExtraction),
+    Nothing,
+}
+
+/// Prose that came out of a page and was not stored as an article.
+///
+/// This is not the sibling of `UnreadableArticle`, which is a page refused for what reading it
+/// would cost and belongs to the run rather than to the archive. This one is an ordinary
+/// reading of an ordinary page, kept because the rule that refused it is holding two numbers
+/// that were chosen against a handful of sites and have to answer for themselves later.
+///
+/// The prose itself is deliberately not in here. It is derivable from the stored response at
+/// any time, and writing it out is the claim this refusal exists to avoid making.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedExtraction {
+    pub extractor_version: u32,
+    pub rules: ExtractionRules,
+    /// The two measurements the rule compared, and nothing named as the reason beside them.
+    /// One rule refuses here, its inputs are these, and a reader can see the comparison it
+    /// made. A second rule is what makes naming them worth a field, and it will arrive with
+    /// its own version bump.
+    pub share: ProseShare,
+    /// What the prose said, so that reviewing the decision does not require re-deriving it.
+    pub excerpt: Option<String>,
 }

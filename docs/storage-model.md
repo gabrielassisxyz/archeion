@@ -27,6 +27,7 @@ An asset arrives at the capture already stored, as a record, rather than as byte
   items/<host>/<item-id>/captures/<capture-id>.metadata.json  what was read out of that fetch
   items/<host>/<item-id>/captures/<capture-id>.article.md     its prose, if it had any
   items/<host>/<item-id>/captures/<capture-id>.article.json   what is known about that prose
+  items/<host>/<item-id>/captures/<capture-id>.article-refused.json  prose that was not kept as one
 ```
 
 A real archive holding a single capture of one page, with one stylesheet as its asset:
@@ -131,6 +132,8 @@ Records are JSON, pretty printed. The format costs some bytes against the raw bo
 Beside each capture there may be a `<capture-id>.metadata.json`, holding what was read out of that response: its title, its author, its date, the tags behind them, its outbound links and the subresources it referenced. [`metadata-extraction.md`](metadata-extraction.md) has the fields and the rules.
 
 Beside a capture that turned out to be an article there is also a `<capture-id>.article.md`, its prose with the navigation, sidebars and banners taken out, and a `<capture-id>.article.json` describing it. Most captures have neither, because most of the web is not an article. [`readability.md`](readability.md) has the rules and the ceilings.
+
+A capture that produced prose the extractor then refused to call an article gets a `<capture-id>.article-refused.json` in place of that pair: the measurements the refusal was made on, so the rule that made it can be checked against real pages later. It is one file and not a pair on purpose, since the document beside it is the claim the refusal exists to avoid making, and it stays derivable from the stored response. Only pages the extractor turned down are written here, never the many that simply held no prose.
 
 They are separate files because they have different lifetimes from the capture. The capture record is what the archive observed and is the part that cannot be recovered; these are readings of it, and a better extractor is expected to replace every one of them without touching a single recorded file. A capture with no derived file beside it is an ordinary state: the response may not be a page at all, or nothing has read it yet.
 

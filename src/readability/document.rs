@@ -111,6 +111,54 @@ pub(super) fn build(html: &str) -> Result<(Document, Measured), TooExpensive> {
     ))
 }
 
+/// The subtrees whose text is not the page's prose. A page carrying a few kilobytes of inline
+/// JSON-LD or a framework's serialized state would otherwise count them as text it holds, and
+/// the article inside it would look like a sliver of a much larger document.
+const NOT_PROSE: [&str; 4] = ["script", "style", "noscript", "template"];
+
+/// How much text the whole page holds, as the denominator of the sliver rule in `mod.rs`.
+///
+/// Counted here because this is the last moment the tree exists in one piece, before the
+/// scorer takes it and decides which part of it is the article.
+///
+/// It is a walk and not the difference between two selections. Differencing looks equivalent
+/// and is not: an element in `NOT_PROSE` may contain another, since a document parsed with
+/// scripting disabled keeps the contents of `<noscript>` as real elements, and a selection
+/// sums each match's whole subtree. The inner text would then be subtracted twice and the
+/// denominator could reach zero, which answers "keep" and hands the page being judged a way
+/// to switch the rule off.
+///
+/// Characters and not words, because words are whitespace-separated only in some languages:
+/// counting them would score a Chinese or Japanese article at its paragraph count while
+/// scoring the furniture around it, whose tokens are separated by the markup's own
+/// whitespace, exactly as it scores an English page. Whitespace itself is not counted, so
+/// that indented markup does not read as more text than the same page minified.
+pub(super) fn page_text_chars(document: &Document) -> usize {
+    let Some(body) = document.select("body").nodes().first().cloned() else {
+        return 0;
+    };
+    let mut total = 0;
+    let mut pending = vec![body];
+    while let Some(node) = pending.pop() {
+        if node.is_text() {
+            total += visible_chars(&node.text());
+            continue;
+        }
+        let skipped = node
+            .node_name()
+            .is_some_and(|name| NOT_PROSE.contains(&name.as_ref()));
+        if !skipped {
+            pending.extend(node.children());
+        }
+    }
+    total
+}
+
+/// Text as it would be read, which is what both sides of the sliver rule are counted in.
+pub(super) fn visible_chars(text: &str) -> usize {
+    text.chars().filter(|c| !c.is_whitespace()).count()
+}
+
 /// Whether any element in the tree sits deeper than `ceiling`.
 ///
 /// It answers the question rather than measuring the depth so that it can stop at the first
@@ -134,6 +182,65 @@ fn nests_deeper_than(document: &Document, ceiling: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn page_chars(html: &str) -> usize {
+        let (document, _) = build(html).expect("well within every ceiling");
+        page_text_chars(&document)
+    }
+
+    /// The denominator is what a reader would have seen, so what a page carries for machines
+    /// does not count as the page saying something. A framework's serialized state is easily
+    /// larger than the article beside it, and counting it would make every article on such a
+    /// page look like a sliver of a much larger document.
+    #[test]
+    fn what_a_page_carries_for_machines_is_not_the_page_saying_something() {
+        let prose = "<p>Bread is patience.</p>";
+        assert_eq!(page_chars(prose), 16);
+        assert_eq!(
+            page_chars(&format!(
+                "{prose}<script>var state = {{ a: 1, b: 2, c: 3 }};</script>\
+                 <style>.article {{ color: rebeccapurple }}</style>"
+            )),
+            16
+        );
+    }
+
+    /// The regression that made this a walk rather than the difference between two selections.
+    /// A document parsed with scripting disabled keeps what is inside `<noscript>` as real
+    /// elements, so a `<style>` in one is matched twice by a selection that sums whole
+    /// subtrees: once on its own and once inside the `<noscript>`. Differencing then subtracts
+    /// it twice, and a page carrying enough of it drives the count to zero.
+    ///
+    /// Zero is the answer that keeps an extraction whatever its size, so the page being judged
+    /// would have been handed a way to switch the rule off and be archived as an article again.
+    #[test]
+    fn a_style_inside_a_noscript_is_not_subtracted_twice() {
+        let padding = ".rule { color: rebeccapurple; background: white }".repeat(20);
+        let counted = page_chars(&format!(
+            "<p>Bread is patience.</p><noscript><style>{padding}</style></noscript>"
+        ));
+
+        assert_eq!(counted, 16);
+    }
+
+    /// A document with no body is not a document whose text was measured. It answers zero, and
+    /// zero has to mean "keep" wherever the rule reads it.
+    #[test]
+    fn a_document_with_no_body_measures_nothing() {
+        let (document, _) =
+            build("<frameset><frame src=\"a.html\"></frameset>").expect("within every ceiling");
+        assert_eq!(page_text_chars(&document), 0);
+    }
+
+    /// Whitespace is not text. Markup indented by its author would otherwise hold more of it
+    /// than the same page minified, and the share would depend on how the page was formatted.
+    #[test]
+    fn how_a_page_is_indented_does_not_change_how_much_it_says() {
+        assert_eq!(
+            page_chars("<div><p>Bread is patience.</p></div>"),
+            page_chars("<div>\n    <p>\n        Bread is patience.\n    </p>\n</div>")
+        );
+    }
 
     fn nested(depth: usize) -> String {
         format!(

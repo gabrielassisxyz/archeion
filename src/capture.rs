@@ -14,7 +14,7 @@ use crate::crawl::{
     points_inside_a_network,
 };
 use crate::metadata::{self, PageMetadata, PageSource, ReferencedAsset, UnreadablePage};
-use crate::readability::{self, Article, UnreadableArticle};
+use crate::readability::{self, Extraction, UnreadableArticle};
 use crate::storage::{Archive, Header, NewCapture, StorageError};
 
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +66,10 @@ pub struct CaptureRun {
     /// correct: most of the web is navigation, and a page that is not an article is not a
     /// failure of anything.
     pub articles_extracted: usize,
+    /// Pages that produced prose the extractor then refused to call an article. Counted here
+    /// and written beside the capture: the count says whether the rule is firing at all, and
+    /// only the files it leaves can say whether it fired on something it should have kept.
+    pub extractions_refused: usize,
     /// Pages whose prose was refused because reading it would have cost too much. Reported
     /// rather than counted, for the same reason as the pages above: the response is stored
     /// whole and the URL is what someone needs in order to go and look at it.
@@ -244,9 +248,14 @@ fn capture_page(
         return ControlFlow::Break(());
     }
 
-    if let Some(article) = prose
-        && let Err(error) = archive.write_article(&canonical, &capture.id, &article)
-    {
+    let stored_prose = match &prose {
+        Extraction::Article(article) => archive.write_article(&canonical, &capture.id, article),
+        Extraction::Refused(refused) => {
+            archive.write_refused_extraction(&canonical, &capture.id, refused)
+        }
+        Extraction::Nothing => Ok(()),
+    };
+    if let Err(error) = stored_prose {
         *write_failure = Some(error);
         return ControlFlow::Break(());
     }
@@ -265,7 +274,7 @@ fn read_prose(
     page: &PageResponse,
     metadata: Option<&PageMetadata>,
     run: &mut CaptureRun,
-) -> Option<Article> {
+) -> Extraction {
     let title = metadata
         .and_then(|metadata| metadata.title.as_ref())
         .map(|title| title.value.as_str());
@@ -277,14 +286,18 @@ fn read_prose(
         },
         title,
     ) {
-        Ok(Some(article)) => {
+        Ok(Extraction::Article(article)) => {
             run.articles_extracted += 1;
-            Some(article)
+            Extraction::Article(article)
         }
-        Ok(None) => None,
+        Ok(Extraction::Refused(refused)) => {
+            run.extractions_refused += 1;
+            Extraction::Refused(refused)
+        }
+        Ok(Extraction::Nothing) => Extraction::Nothing,
         Err(refused) => {
             run.unreadable_articles.push(refused);
-            None
+            Extraction::Nothing
         }
     }
 }
@@ -536,6 +549,64 @@ mod tests {
         assert!(article.markdown.contains("Bread is mostly patience"));
         assert!(!article.markdown.contains("Subscribe to our newsletter"));
         assert!(article.record.word_count > 0);
+    }
+
+    /// A page refused for being a sliver of itself leaves a record and no article, which is
+    /// the difference between the two ways of not being one: the capture below is passed over
+    /// in silence, and this one goes into a queue somebody is expected to read.
+    #[test]
+    fn a_front_page_refused_as_an_article_is_recorded_beside_its_capture() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/",
+            200,
+            &format!(
+                r#"<html><head><title>The Slow Kitchen</title></head>
+                   <body><header><h1>The Slow Kitchen</h1><p>Notes on bread, patience and the
+                   things that take longer than the recipe says they will.</p></header><main>
+                   <p>This is where I write down what I have learned about baking at home, one
+                   loaf at a time. Everything here is written slowly and revised often, so
+                   nothing is ever quite finished, and most of it is wrong in some way I have
+                   not noticed yet. If you came here for a recipe you can follow in an
+                   afternoon, the archive below is not going to help you very much, and I would
+                   rather say so at the top than have you find it out four paragraphs down.</p>
+                   <ul>{}</ul></main><footer><p>Written by hand, published from a laptop on a
+                   kitchen table. There is no newsletter, no tracking and no comment section,
+                   which suits everyone involved rather well.</p></footer></body></html>"#,
+                r#"<li><a href="/p">Keeping a sourdough starter alive through a cold winter</a></li>"#
+                    .repeat(12)
+            ),
+        )]);
+
+        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.articles_extracted, 0);
+        assert_eq!(run.extractions_refused, 1);
+        let url = CanonicalUrl::parse("https://example.com/").expect("valid url");
+        let captures = archive.list_captures(&url).expect("captures are listed");
+        let refused = archive
+            .read_refused_extraction(&url, &captures[0])
+            .expect("the refusal is stored")
+            .expect("a refused page has a record");
+
+        // The record describes the prose that was refused, which is what makes the file worth
+        // keeping. Repeating the comparison the rule already made to reach this arm would
+        // assert nothing.
+        assert!(
+            refused
+                .excerpt
+                .as_deref()
+                .is_some_and(|excerpt| excerpt.contains("Written by hand")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            archive
+                .read_article(&url, &captures[0])
+                .expect("no prose is not an error"),
+            None
+        );
     }
 
     /// Most of what a crawl answers is navigation. A capture with no prose in it is the

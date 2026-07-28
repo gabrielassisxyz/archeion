@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use archeion::metadata::PageSource;
-use archeion::readability::{self, Article};
+use archeion::readability::{self, Article, Extraction};
 use serde::Deserialize;
 
 /// Unknown fields are refused rather than ignored. A mistyped assertion that parses is worse
@@ -25,7 +25,7 @@ struct Expectation {
     /// Why this case is in the corpus. Read by a person, not by the test.
     #[allow(dead_code)]
     why: String,
-    is_article: bool,
+    outcome: Outcome,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
@@ -38,11 +38,60 @@ struct Expectation {
     word_count: Option<WordCount>,
 }
 
+/// What the extractor has to make of a page. The two ways of producing no article are
+/// separate cases here because they leave different things behind: a page passed over in
+/// silence leaves nothing, and a page refused leaves a record beside its capture for a later
+/// review to answer. A fixture that only declared "not an article" would keep passing if a
+/// refusal quietly turned into silence, and the review queue would empty without anyone
+/// noticing.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Outcome {
+    Article,
+    Refused,
+    Nothing,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WordCount {
     min: usize,
     max: usize,
+}
+
+/// A case that produces no article checks none of the fields that describe one, so declaring
+/// them there is writing an assertion that will never run. It reads as coverage in a file
+/// somebody will trust, which is the same reason unknown fields are refused above rather than
+/// ignored. `title` is exempt: it is handed to the extractor rather than asserted, and a page
+/// is refused or passed over with the title its metadata resolved like any other.
+#[test]
+fn no_expectation_declares_an_assertion_its_outcome_will_never_check() {
+    let unchecked: Vec<String> = corpus()
+        .into_iter()
+        .filter_map(|page| {
+            let name = file_stem(&page);
+            let expected = expectation_for(&page, &name);
+            if expected.outcome == Outcome::Article {
+                return None;
+            }
+            let declared = [
+                (!expected.must_contain.is_empty(), "must_contain"),
+                (!expected.must_not_contain.is_empty(), "must_not_contain"),
+                (expected.heading_levels.is_some(), "heading_levels"),
+                (expected.word_count.is_some(), "word_count"),
+            ];
+            let names: Vec<&str> = declared
+                .into_iter()
+                .filter_map(|(present, name)| present.then_some(name))
+                .collect();
+            (!names.is_empty()).then(|| format!("{name}: {}", names.join(", ")))
+        })
+        .collect();
+
+    assert!(
+        unchecked.is_empty(),
+        "expectations declaring assertions nothing will check: {unchecked:?}"
+    );
 }
 
 /// Every expectation file has a page. The corpus is keyed on the markup, so an expectation
@@ -78,22 +127,21 @@ fn every_page_in_the_corpus_extracts_within_its_declared_bounds() {
     assert!(!cases.is_empty(), "the corpus directory has no pages in it");
 
     for page in cases {
-        let name = page
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .expect("a fixture has a readable name")
-            .to_owned();
+        let name = file_stem(&page);
         let expected = expectation_for(&page, &name);
         let extracted = extract(&page, &name, expected.title.as_deref());
 
-        match (expected.is_article, extracted) {
-            (false, Some(article)) => panic!(
-                "{name} is not an article, but one was extracted:\n{}",
+        match (&expected.outcome, extracted) {
+            (Outcome::Article, Extraction::Article(article)) => check(&name, &expected, &article),
+            (Outcome::Refused, Extraction::Refused(_)) => {}
+            (Outcome::Nothing, Extraction::Nothing) => {}
+            (expected, Extraction::Article(article)) => panic!(
+                "{name} is declared {expected:?}, and an article was extracted:\n{}",
                 article.markdown
             ),
-            (false, None) => {}
-            (true, None) => panic!("{name} is an article, and nothing was extracted"),
-            (true, Some(article)) => check(&name, &expected, &article),
+            (expected, other) => {
+                panic!("{name} is declared {expected:?}, and extraction answered {other:?}")
+            }
         }
     }
 }
@@ -151,7 +199,7 @@ fn heading_levels(markdown: &str) -> Vec<usize> {
     levels
 }
 
-fn extract(page: &Path, name: &str, title: Option<&str>) -> Option<Article> {
+fn extract(page: &Path, name: &str, title: Option<&str>) -> Extraction {
     let body = fs::read(page).unwrap_or_else(|error| panic!("reading {name}: {error}"));
     readability::extract(
         PageSource {
@@ -164,6 +212,13 @@ fn extract(page: &Path, name: &str, title: Option<&str>) -> Option<Article> {
         title,
     )
     .unwrap_or_else(|error| panic!("{name} was refused: {error}"))
+}
+
+fn file_stem(page: &Path) -> String {
+    page.file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("a fixture has a readable name")
+        .to_owned()
 }
 
 fn expectation_for(page: &Path, name: &str) -> Expectation {

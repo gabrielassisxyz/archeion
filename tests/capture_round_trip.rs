@@ -4,7 +4,9 @@
 
 use archeion::CanonicalUrl;
 use archeion::metadata::{self, PageMetadata, PageSource};
-use archeion::readability::{self, AdmissionCost, Article, ArticleRecord, ExtractionRules};
+use archeion::readability::{
+    self, AdmissionCost, Article, ArticleRecord, ExtractionRules, ProseShare, RefusedExtraction,
+};
 use archeion::storage::{
     Archive, AssetMiss, ContentHash, Header, ItemId, MissedAsset, NewAsset, NewCapture,
     StorageError,
@@ -176,6 +178,10 @@ fn an_article_is_stored_as_a_document_and_read_back_whole() {
             extractor_version: readability::EXTRACTOR_VERSION,
             rules: ExtractionRules::Heuristic,
             word_count: 5,
+            share: Some(ProseShare {
+                article_chars: 240,
+                page_chars: 300,
+            }),
             excerpt: Some("Bread is mostly patience.".to_owned()),
             byline: None,
             truncated: Vec::new(),
@@ -215,6 +221,132 @@ fn an_article_is_stored_as_a_document_and_read_back_whole() {
     );
 }
 
+/// An archive filled by an older build has to keep reading. Every record this project writes
+/// gains fields over time, and the one thing a reader may never do is refuse a whole item
+/// because a field it expects was added after that item was written: the response is still
+/// there, the prose beside it is still correct, and only a measurement nobody took is missing.
+///
+/// The record here is written as bytes rather than through the current struct on purpose. A
+/// test that builds the record in Rust always writes today's fields, so it would keep passing
+/// through exactly the change that breaks every archive on disk.
+#[test]
+fn an_article_record_written_before_the_sliver_rule_still_reads() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+    let capture = archive
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
+        .expect("capture is stored");
+    let markdown = "# How to bake bread\n\nBread is mostly patience.";
+    let captures_dir = dir
+        .path()
+        .join("items")
+        .join("example.com")
+        .join(ItemId::of(&url).as_str())
+        .join("captures");
+
+    std::fs::write(
+        captures_dir.join(format!("{}.article.md", capture.id)),
+        markdown,
+    )
+    .expect("the document is written");
+    std::fs::write(
+        captures_dir.join(format!("{}.article.json", capture.id)),
+        format!(
+            r#"{{
+  "markdown_sha256": "{}",
+  "extractor_version": 1,
+  "rules": "heuristic",
+  "word_count": 5,
+  "excerpt": "Bread is mostly patience.",
+  "byline": null,
+  "cost": {{ "document_bytes": 4096, "peak_open_elements": 12 }}
+}}"#,
+            ContentHash::of(markdown.as_bytes())
+        ),
+    )
+    .expect("the record is written");
+
+    let article = archive
+        .read_article(&url, &capture.id)
+        .expect("a record from the previous extractor reads")
+        .expect("the article is there");
+
+    assert_eq!(article.markdown, markdown);
+    assert_eq!(article.record.extractor_version, 1);
+    assert_eq!(article.record.word_count, 5);
+    // Absent, and not zero. Nothing measured this page's text, and a record that answered
+    // "no characters" would be a claim the extractor that wrote it never made.
+    assert_eq!(article.record.share, None);
+}
+
+/// A refusal is one file and not a pair, and it stands where the article record would have
+/// been. The whole point of it is that the document beside it was never written: what a later
+/// review needs is the measurement that refused the page, and the prose is derivable from the
+/// stored response whenever that review wants to look at it.
+#[test]
+fn a_refused_extraction_is_stored_where_the_article_record_would_have_been() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/").expect("valid url");
+    let capture = archive
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
+        .expect("capture is stored");
+    let refused = RefusedExtraction {
+        extractor_version: readability::EXTRACTOR_VERSION,
+        rules: ExtractionRules::Heuristic,
+        share: ProseShare {
+            article_chars: 137,
+            page_chars: 1188,
+        },
+        excerpt: Some("Written by hand, published from a laptop.".to_owned()),
+    };
+
+    archive
+        .write_refused_extraction(&url, &capture.id, &refused)
+        .expect("the refusal is stored");
+
+    let captures_dir = dir
+        .path()
+        .join("items")
+        .join("example.com")
+        .join(ItemId::of(&url).as_str())
+        .join("captures");
+    assert!(
+        captures_dir
+            .join(format!("{}.article-refused.json", capture.id))
+            .is_file()
+    );
+    assert!(
+        !captures_dir
+            .join(format!("{}.article.md", capture.id))
+            .exists(),
+        "a refusal must not leave the document it refused to write"
+    );
+    assert_eq!(
+        archive
+            .read_refused_extraction(&url, &capture.id)
+            .expect("the refusal reads back"),
+        Some(refused)
+    );
+    assert_eq!(
+        archive
+            .read_article(&url, &capture.id)
+            .expect("reading an article is not an error"),
+        None
+    );
+}
+
 /// The failure ordering alone does not catch: writing over a pair that is already there. The
 /// new document lands, the process dies before the record, and both files exist and parse,
 /// with every field of the old record describing prose that is no longer on disk. Only the
@@ -239,6 +371,10 @@ fn an_article_described_by_a_record_from_a_previous_extraction_reads_as_absent()
             extractor_version: readability::EXTRACTOR_VERSION,
             rules: ExtractionRules::Heuristic,
             word_count: 3,
+            share: Some(ProseShare {
+                article_chars: 240,
+                page_chars: 300,
+            }),
             excerpt: None,
             byline: None,
             truncated: Vec::new(),
@@ -298,6 +434,10 @@ fn an_article_whose_document_never_landed_reads_as_absent() {
                     extractor_version: readability::EXTRACTOR_VERSION,
                     rules: ExtractionRules::Heuristic,
                     word_count: 2,
+                    share: Some(ProseShare {
+                        article_chars: 240,
+                        page_chars: 300,
+                    }),
                     excerpt: None,
                     byline: None,
                     truncated: Vec::new(),
@@ -348,6 +488,10 @@ fn an_article_document_that_is_not_a_regular_file_is_refused_before_it_is_read()
             extractor_version: readability::EXTRACTOR_VERSION,
             rules: ExtractionRules::Heuristic,
             word_count: 5,
+            share: Some(ProseShare {
+                article_chars: 240,
+                page_chars: 300,
+            }),
             excerpt: Some("Bread is mostly patience.".to_owned()),
             byline: None,
             truncated: Vec::new(),

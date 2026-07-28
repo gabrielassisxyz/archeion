@@ -4,7 +4,7 @@ use std::process::Command;
 
 use archeion::CanonicalUrl;
 use archeion::metadata::{Attributed, MetadataSource, PageMetadata, PublicationDate};
-use archeion::readability::{AdmissionCost, Article, ArticleRecord, ExtractionRules};
+use archeion::readability::{AdmissionCost, Article, ArticleRecord, ExtractionRules, ProseShare};
 use archeion::storage::{Archive, Asset, ContentHash, Header, ItemId, NewAsset, NewCapture};
 use jiff::Timestamp;
 use tempfile::TempDir;
@@ -43,6 +43,10 @@ fn article(markdown: &str, word_count: usize, excerpt: Option<&str>) -> Article 
             extractor_version: archeion::readability::EXTRACTOR_VERSION,
             rules: ExtractionRules::Heuristic,
             word_count,
+            share: Some(ProseShare {
+                article_chars: 240,
+                page_chars: 300,
+            }),
             excerpt: excerpt.map(str::to_owned),
             byline: None,
             truncated: Vec::new(),

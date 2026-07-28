@@ -566,6 +566,87 @@ mod tests {
         );
     }
 
+    /// An attribute value is markup, not text: a page's generator escapes an apostrophe
+    /// inside a double quoted attribute as `&#x27;`, and the character is what every reader
+    /// after this one expects, a heading among them, not the reference that spells it.
+    #[test]
+    fn an_attribute_written_with_a_character_reference_stores_the_character() {
+        let page = extract_html(
+            r#"<meta property="og:title" content="Good Thinking Isn&#x27;t Efficient">"#,
+        );
+        assert_eq!(
+            value_of(page.title),
+            Some((
+                "Good Thinking Isn't Efficient".to_owned(),
+                MetadataSource::OpenGraph
+            ))
+        );
+    }
+
+    /// A share link commonly spells its own query separator as `&amp;`, the specification's
+    /// own escaping and not a mistake. Requested as written, the query would hold a parameter
+    /// named `amp;utm_medium` rather than `utm_medium`, and the same address spelled the two
+    /// ways would be filed as two links rather than recognised as one.
+    #[test]
+    fn an_href_whose_query_separator_is_an_entity_resolves_to_the_address_the_page_meant() {
+        let page = extract_html(
+            r#"<a href="/p/post?utm_source=substack&amp;utm_medium=email&amp;action=share">x</a>
+               <a href="/p/post?utm_source=substack&utm_medium=email&action=share">x</a>"#,
+        );
+        assert_eq!(page.links.len(), 1);
+        assert_eq!(
+            page.links[0].url,
+            "https://example.com/p/post?utm_source=substack&utm_medium=email&action=share"
+        );
+    }
+
+    /// A comma inside a URL stays inside it however the page spelled it, because a candidate
+    /// runs to whitespace rather than to the next comma. That is what makes decoding the
+    /// attribute first safe, and it is the property the transformation network URLs depend on.
+    #[test]
+    fn a_srcset_candidate_holding_an_encoded_comma_is_not_split_on_it() {
+        let page = extract_html(r#"<img srcset="/img?x=1&#44;2 1x, /other.png 2x">"#);
+        let urls: Vec<&str> = page.assets.iter().map(|asset| asset.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://example.com/img?x=1,2",
+                "https://example.com/other.png",
+            ]
+        );
+    }
+
+    /// The other direction, and the one that decides the order of the two steps. A page may
+    /// write the separator itself as a reference, and a browser sees the candidates it
+    /// separates because the tag is tokenized before the candidate grammar runs. Splitting
+    /// first would read the whole tail as one candidate's descriptor and lose every candidate
+    /// after the first.
+    #[test]
+    fn a_srcset_separator_written_as_a_reference_still_separates() {
+        let page = extract_html(r#"<img srcset="/a.png 1x&#44; /b.png 2x">"#);
+        let urls: Vec<&str> = page.assets.iter().map(|asset| asset.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            ["https://example.com/a.png", "https://example.com/b.png"]
+        );
+    }
+
+    /// An ampersand written as `&amp;` never holds the raw bytes the splitter treats as a
+    /// separator either way, so decoding it must leave the boundary between candidates where
+    /// the page put it.
+    #[test]
+    fn a_srcset_candidate_with_an_ampersand_reference_decodes_without_moving_the_split() {
+        let page = extract_html(r#"<img srcset="/img?a=1&amp;b=2 1x, /img?a=3&amp;b=4 2x">"#);
+        let urls: Vec<&str> = page.assets.iter().map(|asset| asset.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://example.com/img?a=1&b=2",
+                "https://example.com/img?a=3&b=4",
+            ]
+        );
+    }
+
     #[test]
     fn the_address_a_page_claims_for_itself_is_recorded_and_nothing_more() {
         let page = extract_html(r#"<link rel="canonical" href="/posts/one?utm_source=x">"#);
@@ -728,6 +809,35 @@ mod tests {
             page.description.expect("a description").value.len(),
             4 * 1024
         );
+    }
+
+    /// A ceiling compares the value a reader would see, not a page's choice of how verbosely
+    /// to spell it: `&amp;` costs five raw bytes and decodes to one. A field spelled almost
+    /// entirely in references can run well past the raw ceiling while leaving a reader with a
+    /// value nowhere near it, and reading the ceiling off the wrong string would drop content
+    /// this one never needed to.
+    #[test]
+    fn a_value_long_only_in_its_raw_spelling_is_not_bounded() {
+        let content = "&amp;".repeat(1000); // 5000 raw bytes, 1000 decoded.
+        let page = extract_html(&format!(
+            r#"<meta property="og:description" content="{content}">"#
+        ));
+
+        assert_eq!(page.meta[0].content, "&".repeat(1000));
+        assert!(page.truncated.is_empty());
+    }
+
+    /// A value that is still over the ceiling once decoded is bounded exactly as an
+    /// unescaped one is, and the record still says so.
+    #[test]
+    fn a_value_that_still_exceeds_the_ceiling_once_decoded_is_bounded() {
+        let content = "&#65;".repeat(5000); // 25000 raw bytes, 5000 decoded.
+        let page = extract_html(&format!(
+            r#"<meta property="og:description" content="{content}">"#
+        ));
+
+        assert_eq!(page.meta[0].content, "A".repeat(4 * 1024));
+        assert_eq!(page.truncated, [Bound::MetaContent]);
     }
 
     /// Malformed markup a template that ran twice produces, and a hostile page can produce

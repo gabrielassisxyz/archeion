@@ -5,9 +5,11 @@
 //! lets the parser be replaced without touching the precedence between OpenGraph and
 //! schema.org, and the ceilings are what make an adversarial page cost a bounded amount.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 
+use html_escape::decode_html_entities;
 use lol_html::errors::RewritingError;
 use lol_html::{HtmlRewriter, MemorySettings, Settings, element, text};
 
@@ -77,7 +79,7 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
                     element!("html", |el| {
                         let mut scanner = scanner.borrow_mut();
                         if scanner.page.language.is_none() {
-                            scanner.page.language = el.get_attribute("lang");
+                            scanner.page.language = el.get_attribute("lang").map(decode_attribute);
                         }
                         Ok(())
                     }),
@@ -109,8 +111,9 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
                     element!("meta", |el| {
                         scanner.borrow_mut().see_meta(
                             el.get_attribute("name")
-                                .or_else(|| el.get_attribute("property")),
-                            el.get_attribute("content"),
+                                .or_else(|| el.get_attribute("property"))
+                                .map(decode_attribute),
+                            el.get_attribute("content").map(decode_attribute),
                         );
                         Ok(())
                     }),
@@ -118,25 +121,27 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
                         let mut scanner = scanner.borrow_mut();
                         // The first one wins, which is what a browser does with the second.
                         if scanner.page.base_href.is_none() {
-                            scanner.page.base_href = el.get_attribute("href");
+                            scanner.page.base_href = el.get_attribute("href").map(decode_attribute);
                         }
                         Ok(())
                     }),
                     element!("link[href]", |el| {
-                        scanner
-                            .borrow_mut()
-                            .see_link_tag(el.get_attribute("rel"), el.get_attribute("href"));
+                        scanner.borrow_mut().see_link_tag(
+                            el.get_attribute("rel").map(decode_attribute),
+                            el.get_attribute("href").map(decode_attribute),
+                        );
                         Ok(())
                     }),
                     element!("a[href]", |el| {
-                        scanner
-                            .borrow_mut()
-                            .see_anchor(el.get_attribute("href"), el.get_attribute("rel"));
+                        scanner.borrow_mut().see_anchor(
+                            el.get_attribute("href").map(decode_attribute),
+                            el.get_attribute("rel").map(decode_attribute),
+                        );
                         Ok(())
                     }),
                     element!("script", |el| {
                         let mut scanner = scanner.borrow_mut();
-                        if let Some(src) = el.get_attribute("src") {
+                        if let Some(src) = el.get_attribute("src").map(decode_attribute) {
                             scanner.see_asset(src, AssetKind::Script);
                         }
                         // Compared here rather than in the selector because the attribute is
@@ -144,6 +149,7 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
                         // attribute match is case sensitive.
                         scanner.inside_json_ld = el
                             .get_attribute("type")
+                            .map(decode_attribute)
                             .is_some_and(|kind| kind.trim().eq_ignore_ascii_case(JSON_LD_TYPE));
                         Ok(())
                     }),
@@ -155,7 +161,7 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
                     }),
                     element!("img", |el| {
                         let mut scanner = scanner.borrow_mut();
-                        if let Some(src) = el.get_attribute("src") {
+                        if let Some(src) = el.get_attribute("src").map(decode_attribute) {
                             scanner.see_asset(src, AssetKind::Image);
                         }
                         scanner.see_srcset(el.get_attribute("srcset"));
@@ -167,7 +173,7 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
                     // `srcset`, the media form carries `src`.
                     element!("source", |el| {
                         let mut scanner = scanner.borrow_mut();
-                        if let Some(src) = el.get_attribute("src") {
+                        if let Some(src) = el.get_attribute("src").map(decode_attribute) {
                             scanner.see_asset(src, AssetKind::Media);
                         }
                         scanner.see_srcset(el.get_attribute("srcset"));
@@ -175,16 +181,16 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
                     }),
                     element!("video", |el| {
                         let mut scanner = scanner.borrow_mut();
-                        if let Some(src) = el.get_attribute("src") {
+                        if let Some(src) = el.get_attribute("src").map(decode_attribute) {
                             scanner.see_asset(src, AssetKind::Media);
                         }
-                        if let Some(poster) = el.get_attribute("poster") {
+                        if let Some(poster) = el.get_attribute("poster").map(decode_attribute) {
                             scanner.see_asset(poster, AssetKind::Image);
                         }
                         Ok(())
                     }),
                     element!("audio[src]", |el| {
-                        if let Some(src) = el.get_attribute("src") {
+                        if let Some(src) = el.get_attribute("src").map(decode_attribute) {
                             scanner.borrow_mut().see_asset(src, AssetKind::Media);
                         }
                         Ok(())
@@ -354,10 +360,21 @@ impl Scanner {
     /// optional descriptor. Every candidate is the same image at another size, so all of
     /// them are recorded: which one a reader would have been served depends on a viewport
     /// the archive does not have.
+    ///
+    /// The attribute is decoded before the candidates are split, which is the order a browser
+    /// reads it in: references are resolved while the tag is tokenized, and the candidate
+    /// grammar runs on what that produced. Splitting first would make `&#44;` mean something
+    /// no browser reads it as, since a page writing a comma that way is writing the separator
+    /// and the candidates after it would be swallowed as one descriptor.
+    ///
+    /// Nothing is lost by decoding first, because `srcset_urls` does not split on the comma:
+    /// a URL runs to whitespace, so a comma inside one stays inside it whether the page spelled
+    /// it raw or as a reference.
     fn see_srcset(&mut self, srcset: Option<String>) {
         let Some(srcset) = srcset else {
             return;
         };
+        let srcset = decode_attribute(srcset);
         for url in srcset_urls(&srcset) {
             self.see_asset(url.to_owned(), AssetKind::Image);
         }
@@ -446,6 +463,23 @@ fn srcset_urls(srcset: &str) -> impl Iterator<Item = &str> {
             }
         }
     })
+}
+
+/// An attribute value as the parser hands it back still carries whatever character
+/// references the page wrote: `get_attribute` decodes the byte encoding of the document, not
+/// its markup. Everything downstream, the title, a URL, a description, expects the character
+/// the page meant rather than the reference that spells it, so this is the one place that
+/// turns `&#x27;` and `&amp;` into `'` and `&` before anything else looks at the string.
+///
+/// It also has to run before every ceiling below, not after: no named or numeric reference in
+/// `html_escape`'s tables decodes to more bytes than it took to write, so calling this first
+/// is what makes a ceiling measure the value a reader would see rather than a page's choice of
+/// how verbosely to spell it.
+fn decode_attribute(value: String) -> String {
+    match decode_html_entities(&value) {
+        Cow::Borrowed(_) => value,
+        Cow::Owned(decoded) => decoded,
+    }
 }
 
 /// Appends what fits and reports whether the ceiling was reached. Characters are appended

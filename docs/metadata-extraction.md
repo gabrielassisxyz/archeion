@@ -23,6 +23,8 @@ Three states are all ordinary, and none is an error:
 
 `extractor_version` is bumped when the meaning of a field changes or a rule that fills one changes, not when a field is added. An added field is simply absent from older records, which already reads correctly as "that extractor did not look for it".
 
+Version 2 reads an attribute as the markup it is rather than as text, so a character reference in one becomes the character it stands for. The streaming parser hands an attribute's bytes back as the page wrote them, and treating that as final text stored a title holding `&#x27;` where the page meant an apostrophe, and an address holding `&amp;` between query parameters, where the parameter after it then read as a name no page wrote. Every field filled from an attribute can therefore differ between the two versions, which is why a record written by version 1 is stale rather than merely thinner.
+
 Adding this file to an archive is a compatible change and does not move the format version. A reader of format 1 that does not know about it walks past it, and `list_captures` still sees captures: the suffix makes the file stem no longer the shape of a capture id.
 
 ## What is read
@@ -105,4 +107,4 @@ Decoding is a separate step from parsing on purpose. It keeps the rule auditable
 - **Frames.** An `<iframe>` names a document, not a subresource. Whether to capture one is a decision about the scope of a crawl.
 - **Telling inert content from live content.** What a `<template>` holds is recorded like anything else, even though the page never loads it until something clones it. That is deliberate: a template is markup the page ships and its script commonly instantiates, so an archive that skipped it would lose assets a restored page needs. Over-recording costs a fetch; under-recording is permanent.
 - **`preload` and `alternate` links.** The first names bytes the page may never use, the second names a different document.
-- **Re-extraction over an existing archive.** The record carries the version that would drive it, and the pass itself waits for a second extractor version to exist.
+- **Re-extraction over an existing archive.** The record carries the version that drives it, and `repass` re-reads every capture whose record was written by an older one.

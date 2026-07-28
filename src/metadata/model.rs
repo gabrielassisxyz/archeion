@@ -13,7 +13,14 @@ use serde::{Deserialize, Serialize};
 /// It is bumped when the meaning of a field changes or a rule that fills one changes, not
 /// when a field is added: an added field is absent from older records, which already reads
 /// correctly as "this extractor did not look for it".
-pub const EXTRACTOR_VERSION: u32 = 1;
+///
+/// Version 2 reads an attribute as the markup it is rather than as text, so a character
+/// reference in one becomes the character it stands for. Every field filled from an attribute
+/// can differ: a title keeps an apostrophe instead of the six characters spelling it, and an
+/// address keeps the ampersand between its query parameters instead of an entity that made the
+/// parameter after it read as a different name. Records written by version 1 did not merely
+/// miss information, they said something else, so a pass over the archive has to redo them.
+pub const EXTRACTOR_VERSION: u32 = 2;
 
 /// Where a resolved value came from. Kept beside the value because the precedence rules are
 /// judgement calls: without this, a title that came out wrong gives nothing to look at.

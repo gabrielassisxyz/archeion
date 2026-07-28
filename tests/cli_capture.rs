@@ -29,6 +29,24 @@ const STYLESHEET: &[u8] = b"body { color: rebeccapurple }";
 const MARKDOWN_INDEX: &str = r#"<html><head><title>An index</title></head>
     <body><ul><li><a href="/post.md">the post</a></li></ul></body></html>"#;
 const POST_MARKDOWN: &[u8] = b"# The oven is fixed\n\nThe element went in this morning.\n";
+/// Two links one hop from the seed, one and two path segments deep, plus a third link two
+/// hops away through the deeper of the two. A depth budget counting path segments instead
+/// of hops takes the first sibling and refuses the second at the same distance; one that
+/// counts hops takes both and still stops before the page two hops out.
+/// The post is linked with a fragment on purpose. The engine drops one before it queues a
+/// link, so the page comes back identified without it, and a depth map keyed on the
+/// characters the page wrote would fail to place the page it just queued itself.
+const DEPTH_INDEX: &str = r#"<html><head><title>Section</title></head>
+    <body><ul>
+        <li><a href="/shallow">shallow</a></li>
+        <li><a href="/p/deep-post#top">a post</a></li>
+    </ul></body></html>"#;
+const SHALLOW_PAGE: &str =
+    "<html><head><title>Shallow</title></head><body>nothing further</body></html>";
+const DEEP_POST_PAGE: &str = r#"<html><head><title>A post</title></head>
+    <body><a href="/p/nested/too-deep">further in</a></body></html>"#;
+const TOO_DEEP_PAGE: &str =
+    "<html><head><title>Too deep</title></head><body>two hops from the seed</body></html>";
 
 fn article_page() -> String {
     format!(
@@ -157,6 +175,68 @@ fn a_post_the_site_serves_as_markdown_is_archived_as_the_article_it_already_is()
     assert_eq!(
         article.record.rules,
         archeion::readability::ExtractionRules::Served
+    );
+}
+
+/// `--max-depth` bounds hops from the seed, not path segments of the URL: a sibling two
+/// segments deep is taken at the same distance as one segment deep, and a page genuinely
+/// two hops out is still refused. Measured on a real site this looked like a publication
+/// with section pages and no posts, because every post lived one path segment deeper than
+/// its section.
+#[test]
+fn a_max_depth_of_one_takes_every_link_one_hop_from_the_seed_and_no_further() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let site = Site::start();
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(site.url("/depth-index.html"))
+        .args([
+            "--max-pages",
+            "10",
+            "--max-depth",
+            "1",
+            // More than one in flight: a page with two sibling links crawled at
+            // concurrency one loses one of them to a pre-existing scheduling defect
+            // in the engine that has nothing to do with depth, and would make this
+            // test flaky for a reason it is not the one asserting on.
+            "--concurrency",
+            "4",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stdout_of(&output).contains("archived 3 capture(s)"),
+        "{}",
+        stdout_of(&output)
+    );
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    for path in ["/shallow", "/p/deep-post"] {
+        let url = CanonicalUrl::parse(&site.url(path)).expect("valid url");
+        assert!(
+            !archive
+                .list_captures(&url)
+                .expect("captures are listed")
+                .is_empty(),
+            "{path} is one hop from the seed and was not archived at a depth of one"
+        );
+    }
+
+    let too_deep = CanonicalUrl::parse(&site.url("/p/nested/too-deep")).expect("valid url");
+    assert!(
+        archive
+            .list_captures(&too_deep)
+            .expect("captures are listed")
+            .is_empty(),
+        "a page two hops from the seed was archived at a depth of one"
     );
 }
 
@@ -384,6 +464,22 @@ fn answer(mut stream: TcpStream) -> std::io::Result<()> {
             MARKDOWN_INDEX.as_bytes(),
         ),
         "/post.md" => ("200 OK", "text/markdown; charset=utf-8", POST_MARKDOWN),
+        "/depth-index.html" => ("200 OK", "text/html; charset=utf-8", DEPTH_INDEX.as_bytes()),
+        "/shallow" => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            SHALLOW_PAGE.as_bytes(),
+        ),
+        "/p/deep-post" => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            DEEP_POST_PAGE.as_bytes(),
+        ),
+        "/p/nested/too-deep" => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            TOO_DEEP_PAGE.as_bytes(),
+        ),
         _ => ("404 Not Found", "text/plain", b"not here"),
     };
     let head = format!(

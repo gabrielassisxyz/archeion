@@ -9,9 +9,10 @@
 //! is confined to this file. `docs/crawl-boundary.md` has the reasoning and what a second
 //! adapter would have to provide.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::ops::ControlFlow;
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use jiff::Timestamp;
@@ -341,7 +342,15 @@ fn configured_website(start: &str, seed: &Seed) -> Website {
     let mut website = Website::new(start);
     website
         .with_limit(seed.max_pages)
-        .with_depth(seed.max_depth)
+        // The engine's own depth budget counts path segments of the candidate URL, which
+        // is a different question from distance in hops: a chain of one-segment URLs
+        // passes it at any length, and a two-segment sibling of the seed fails it at hop
+        // one. Zero turns that budget off, and `hop_depth_guard` below is what actually
+        // answers to `--max-depth`, fed by the links `with_return_page_links` puts on
+        // every page this callback sees.
+        .with_depth(0)
+        .with_return_page_links(true)
+        .with_on_should_crawl_callback_closure(Some(hop_depth_guard(start, seed.max_depth)))
         .with_concurrency_limit(Some(fetch_concurrency(seed)))
         .with_delay(u64::try_from(seed.delay.as_millis()).unwrap_or(u64::MAX))
         // A ceiling on one request, not on the crawl. It reaches the HTTP client, so a
@@ -373,6 +382,100 @@ fn configured_website(start: &str, seed: &Seed) -> Website {
         .with_ignore_sitemap(true)
         .with_user_agent(Some(USER_AGENT));
     website
+}
+
+/// Answers, for a page the engine just fetched, whether the crawl should follow that
+/// page's own links, by tracking how many hops each discovered link is from the seed.
+///
+/// The engine calls this once per fetched page, after it has already gathered that
+/// page's links onto `page.page_links` and before deciding whether to queue them, so a
+/// link can only be dequeued once this recorded its depth as the page it was found on
+/// plus one. That makes the seed the only page ever missing from the map, which is why
+/// it is seeded here at zero.
+///
+/// A page this cannot place is read as the seed, which fails open: its links are followed
+/// as if it were one hop from the start. That is the deliberate direction. A page reaching
+/// the fallback is one whose spelling this failed to match, and the two ways to be wrong
+/// are not equal for an archive: failing open costs a crawl some pages it did not need,
+/// bounded anyway by the page limit and the deadline, while failing closed would silently
+/// return less of a site than the run found, which is the outcome this project treats as
+/// an actual failure rather than as the web misbehaving.
+///
+/// What keeps the fallback rare is `depth_key`, because the engine does not queue a URL
+/// under the characters the page wrote.
+///
+/// Pages arrive through concurrent tasks, so the same link is found on two pages at once
+/// and the shorter distance wins whichever order they arrive in. It is still not
+/// guaranteed to be the shortest distance from the seed: nothing here controls the order
+/// the engine dequeues, so a page reachable in two hops and in four can be fetched under
+/// the longer one before the shorter is ever recorded. The error only ever refuses pages
+/// rather than admitting them, and correcting it means owning the frontier, which is a
+/// different piece of work.
+///
+/// A poisoned lock, which would only mean some other call to this closure panicked mid
+/// update, is recovered from rather than allowed to fail every page for the rest of the
+/// run.
+fn hop_depth_guard(
+    seed_url: &str,
+    max_depth: usize,
+) -> impl Fn(&Page) -> bool + Send + Sync + 'static {
+    let seed_host = Url::parse(seed_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned));
+    let depths: Arc<Mutex<HashMap<String, usize>>> =
+        Arc::new(Mutex::new(HashMap::from([(depth_key(seed_url), 0)])));
+    move |page: &Page| {
+        let mut depths = depths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let depth = depths.get(&depth_key(page.get_url())).copied().unwrap_or(0);
+        if depth >= max_depth {
+            // Nothing found here can be expanded, so recording it would only be a page's
+            // chance to spend this crawl's memory on addresses the crawl will never visit.
+            return false;
+        }
+        // `page_links` holds hrefs as the page wrote them, which is relative as often as
+        // not, while every page later arrives here identified by its absolute URL: without
+        // resolving against this page's own address first, a relative link never matches
+        // the key its own fetch looks it up under.
+        let base = Url::parse(page.get_url()).ok();
+        if let Some(links) = page.page_links.as_ref() {
+            for link in links.iter() {
+                let Some(resolved) = base.as_ref().and_then(|base| base.join(link.as_ref()).ok())
+                else {
+                    continue;
+                };
+                // A crawl never leaves the host it was pointed at, so a link that does is
+                // one this will never be asked about. Keeping it would let one page of
+                // outbound links cost the whole run's memory.
+                if resolved.host_str() != seed_host.as_deref() {
+                    continue;
+                }
+                depths
+                    .entry(depth_key(resolved.as_str()))
+                    .and_modify(|known| *known = (*known).min(depth + 1))
+                    .or_insert(depth + 1);
+            }
+        }
+        true
+    }
+}
+
+/// How a URL is spelled in the depth map.
+///
+/// The engine drops a fragment before queueing a link, so an address discovered as
+/// `/a#section` is fetched as `/a` and would look up nothing under the spelling it was
+/// stored with. Everything else is left exactly as it arrived: this is a key for matching
+/// one crawl's own URLs against each other, not the archive's canonical form, and the two
+/// answer different questions.
+fn depth_key(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(mut parsed) => {
+            parsed.set_fragment(None);
+            parsed.to_string()
+        }
+        Err(_) => url.to_owned(),
+    }
 }
 
 fn page_event(page: Page) -> PageEvent {

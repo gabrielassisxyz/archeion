@@ -3,7 +3,14 @@
 //! The one file that knows which HTML-to-Markdown converter this project uses. Nothing here
 //! decides what the article is; it has already been decided by the time this runs.
 
+use htmd::{
+    Element, HtmlToMarkdown,
+    element_handler::{HandlerResult, Handlers},
+};
+use url::Url;
+
 use super::model::ArticleBound;
+use super::readable_markdown::{only_a_description, readable_destination};
 
 /// How much Markdown one article may contribute.
 ///
@@ -31,9 +38,11 @@ pub(super) struct Prose {
 pub(super) fn render(
     article_html: &str,
     title: Option<&str>,
+    final_url: Option<&str>,
     truncated: &mut Vec<ArticleBound>,
 ) -> Result<Prose, String> {
-    let body = htmd::convert(article_html)
+    let body = converter(final_url)
+        .convert(article_html)
         .map_err(|error| error.to_string())?
         .trim()
         .to_owned();
@@ -46,6 +55,115 @@ pub(super) fn render(
         truncated.push(ArticleBound::Markdown);
     }
     Ok(Prose { document, body })
+}
+
+fn converter(final_url: Option<&str>) -> HtmlToMarkdown {
+    let base = final_url.and_then(|url| Url::parse(url).ok());
+    let anchor_base = base.clone();
+    HtmlToMarkdown::builder()
+        .add_handler(
+            vec!["a"],
+            move |handlers: &dyn Handlers, element: Element| {
+                anchor(handlers, element, anchor_base.as_ref())
+            },
+        )
+        .add_handler(
+            vec!["img"],
+            move |_handlers: &dyn Handlers, element: Element| image(element, base.as_ref()),
+        )
+        .build()
+}
+
+fn anchor(handlers: &dyn Handlers, element: Element, base: Option<&Url>) -> Option<HandlerResult> {
+    let href = attr(&element, "href");
+    let Some(destination) = href
+        .as_deref()
+        .and_then(|href| readable_destination(href, base))
+    else {
+        return Some(handlers.walk_children(element.node));
+    };
+    let content = handlers.walk_children(element.node).content;
+    Some(inline_link(&content, &destination, link_title(&element)).into())
+}
+
+fn image(element: Element, base: Option<&Url>) -> Option<HandlerResult> {
+    let destination = attr(&element, "src")
+        .or_else(|| attr(&element, "href"))
+        .and_then(|destination| readable_destination(&destination, base));
+    let description = attr(&element, "alt")
+        .map(|alt| only_a_description(&alt))
+        .unwrap_or_default();
+    match destination {
+        Some(destination) => Some(
+            inline_image(
+                &description,
+                &destination,
+                attr(&element, "title").as_deref(),
+            )
+            .into(),
+        ),
+        None if description.is_empty() => Some(String::new().into()),
+        None => Some(markdown_text(&description).into()),
+    }
+}
+
+fn attr(element: &Element<'_>, name: &str) -> Option<String> {
+    element
+        .attrs
+        .iter()
+        .find(|attr| attr.name.local.as_ref() == name)
+        .map(|attr| attr.value.to_string())
+}
+
+fn inline_link(content: &str, destination: &str, title: Option<String>) -> String {
+    let destination = markdown_destination(destination);
+    match title {
+        Some(title) => format!("[{content}]({destination} \"{title}\")"),
+        None => format!("[{content}]({destination})"),
+    }
+}
+
+fn inline_image(description: &str, destination: &str, title: Option<&str>) -> String {
+    let destination = markdown_destination(destination);
+    let title = title
+        .map(only_a_description)
+        .filter(|title| !title.is_empty())
+        .map(|title| format!(" \"{}\"", title.replace('"', "\\\"")))
+        .unwrap_or_default();
+    format!("![{description}]({destination}{title})")
+}
+
+fn markdown_destination(destination: &str) -> String {
+    let mut escaped = String::with_capacity(destination.len() + 2);
+    let has_spaces = destination.contains(' ');
+    if has_spaces {
+        escaped.push('<');
+    }
+    for ch in destination.chars() {
+        match ch {
+            '(' => escaped.push_str("\\("),
+            ')' => escaped.push_str("\\)"),
+            _ => escaped.push(ch),
+        }
+    }
+    if has_spaces {
+        escaped.push('>');
+    }
+    escaped
+}
+
+fn link_title(element: &Element<'_>) -> Option<String> {
+    let title = attr(element, "title")?;
+    let title = only_a_description(&title).replace('"', "\\\"");
+    (!title.is_empty()).then_some(title)
+}
+
+fn markdown_text(text: &str) -> String {
+    let as_markup = format!("<span>{}</span>", escape_html_text(text));
+    htmd::convert(&as_markup)
+        .unwrap_or_else(|_| text.to_owned())
+        .trim()
+        .to_owned()
 }
 
 /// The title as a Markdown heading, or nothing when there is no title left after normalizing.
@@ -104,7 +222,13 @@ mod tests {
     use super::*;
 
     fn rendered(article_html: &str, title: Option<&str>) -> Prose {
-        render(article_html, title, &mut Vec::new()).expect("converts")
+        render(
+            article_html,
+            title,
+            Some("https://example.com/posts/one"),
+            &mut Vec::new(),
+        )
+        .expect("converts")
     }
 
     #[test]
@@ -113,6 +237,7 @@ mod tests {
         let prose = render(
             "<p>Bread is patience.</p>",
             Some("  How to bake  "),
+            Some("https://example.com/posts/one"),
             &mut truncated,
         )
         .expect("converts");
@@ -224,6 +349,117 @@ mod tests {
     }
 
     #[test]
+    fn an_html_image_description_cannot_write_document_structure_or_a_destination() {
+        for (src, alt) in [
+            (
+                "https://example.com/p.png",
+                "x&#10;# Injected heading&#10;y",
+            ),
+            ("https://example.com/p.png", "a](javascript:alert(1))"),
+            ("javascript:alert(1)", "# Injected heading"),
+        ] {
+            let prose = rendered(&format!(r#"<p><img src="{src}" alt="{alt}"></p>"#), None);
+
+            assert!(
+                !prose
+                    .document
+                    .lines()
+                    .any(|line| line == "# Injected heading"),
+                "{}",
+                prose.document
+            );
+            assert!(
+                !prose.document.contains("](javascript"),
+                "{}",
+                prose.document
+            );
+        }
+    }
+
+    #[test]
+    fn an_html_destination_that_exists_to_run_loses_its_link_and_keeps_its_text() {
+        for destination in [
+            "javascript:alert(1)",
+            "JaVaScRiPt:alert(1)",
+            "vbscript:msgbox(1)",
+            "data:text/html,<script>alert(1)</script>",
+        ] {
+            let prose = rendered(
+                &format!(r#"<p>Start <a href="{destination}">click</a> now.</p>"#),
+                None,
+            );
+
+            assert!(
+                prose.document.contains("click"),
+                "the text went with the link for {destination}: {}",
+                prose.document
+            );
+            assert!(
+                !prose.document.contains("]("),
+                "{destination} survived as a link: {}",
+                prose.document
+            );
+        }
+    }
+
+    #[test]
+    fn an_html_readable_destination_survives_under_the_archive_policy() {
+        for (destination, expected) in [
+            ("#intro", "[click](#intro)"),
+            ("../two?a=1#s", "[click](https://example.com/two?a=1#s)"),
+            (
+                "mailto:reader@example.com",
+                "[click](mailto:reader@example.com)",
+            ),
+        ] {
+            let prose = rendered(
+                &format!(r#"<p>Start <a href="{destination}">click</a> now.</p>"#),
+                None,
+            );
+
+            assert!(
+                prose.document.contains(expected),
+                "{destination} was not kept as {expected}: {}",
+                prose.document
+            );
+        }
+    }
+
+    #[test]
+    fn an_html_link_title_cannot_write_structure_or_a_destination() {
+        let prose = rendered(
+            r##"<p><a href="#intro " title="x\&quot; ) [y](javascript:alert(1)">click</a></p>"##,
+            None,
+        );
+
+        assert!(
+            prose.document.contains("[click](#intro "),
+            "{}",
+            prose.document
+        );
+        assert!(
+            !prose.document.contains("](javascript"),
+            "{}",
+            prose.document
+        );
+        assert!(
+            !prose.document.lines().any(|line| line.starts_with('#')),
+            "{}",
+            prose.document
+        );
+    }
+
+    #[test]
+    fn an_html_fragment_with_whitespace_loses_its_link_and_keeps_its_text() {
+        let prose = rendered(
+            r#"<p><a href="&#10;#top&#10;# Injected heading">click</a></p>"#,
+            None,
+        );
+
+        assert_eq!(prose.document, "click");
+    }
+
+    #[test]
     fn structure_survives_the_conversion() {
         let prose = rendered(
             "<h2>Ingredients</h2><ul><li>flour</li><li>water</li></ul>\
@@ -243,6 +479,7 @@ mod tests {
         let prose = render(
             &format!("<p>{}</p>", "word ".repeat(MAX_MARKDOWN_BYTES / 2)),
             None,
+            Some("https://example.com/posts/one"),
             &mut truncated,
         )
         .expect("converts");
@@ -264,6 +501,7 @@ mod tests {
         let prose = render(
             &format!("<p>xx{}</p>", "€".repeat(MAX_MARKDOWN_BYTES)),
             None,
+            Some("https://example.com/posts/one"),
             &mut truncated,
         )
         .expect("converts");

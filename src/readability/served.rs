@@ -22,14 +22,7 @@ use super::model::{
     AdmissionCost, Article, ArticleRecord, EXTRACTOR_VERSION, Extraction, ExtractionRules,
     NonArticle, ProseShare,
 };
-
-/// The schemes an archived document may still point at.
-///
-/// The list is short because a link destination is the one thing in a served document that a
-/// reader may act on, and it is written by whoever wrote the document. `mailto` is here because
-/// it is ordinary in prose and inert; everything absent, `data` and `vbscript` and `javascript`
-/// among them, is a destination that exists to run rather than to be read.
-const READABLE_SCHEMES: [&str; 3] = ["http", "https", "mailto"];
+use super::readable_markdown::{only_a_description, readable_destination};
 
 /// Reads a response that arrived as Markdown.
 ///
@@ -67,7 +60,7 @@ pub(super) fn read(document: &str, final_url: &str) -> Result<Extraction, String
     // extractor produces nothing for a response that is not markup, so the only title that
     // could be prepended here is one nobody has: what it would add is a second heading above
     // the document's own.
-    let prose = markdown::render(&rendered.markup, None, &mut truncated)?;
+    let prose = markdown::render(&rendered.markup, None, None, &mut truncated)?;
     if prose.document.trim().is_empty() {
         // A response that is Markdown and holds no prose is a page the extractor read and
         // declined, which is the same answer as an HTML page that is not an article, and it is
@@ -213,7 +206,7 @@ fn render(document: &str, final_url: &str) -> Rendered {
                     links.push(true);
                     vec![Event::Start(Tag::Link {
                         link_type,
-                        dest_url,
+                        dest_url: CowStr::from(dest_url),
                         title,
                         id,
                     })]
@@ -261,7 +254,7 @@ impl ImageBeingRead {
     fn new(destination: &str, title: &str, base: Option<&Url>) -> Self {
         Self {
             depth: 1,
-            destination: readable_destination(destination, base),
+            destination: readable_destination(destination, base).map(CowStr::from),
             title: only_a_description(title),
             description: String::new(),
         }
@@ -317,47 +310,6 @@ impl ImageBeingRead {
             None => vec![description],
         }
     }
-}
-
-/// An image's description, reduced to something that can only be a description.
-///
-/// It is written into `![...](...)` by a converter that escapes almost nothing there, so four
-/// things have to leave: `]` ends the description early and hands the rest of the line to a
-/// destination nothing here screened, `[` opens another, a trailing `\` escapes the `]` that
-/// would have ended it, and a line break ends the line the whole construct sits on and lets a
-/// description write the document's own structure. That last one is exactly what collapsing
-/// whitespace in the title was for, and a description is the same kind of string: page
-/// controlled, not prose, and with one job that survives being flattened.
-fn only_a_description(text: &str) -> String {
-    text.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace(['[', ']', '\\'], "")
-}
-
-/// A destination worth keeping, spelled absolutely, or nothing when the link has to go.
-///
-/// A dropped link loses the link and keeps its text, which is what the HTML path does with the
-/// one scheme its library happens to catch. Resolving against the address the document was
-/// served from is the other half: the HTML path stores absolute destinations, and export
-/// matches notes to each other by comparing them.
-fn readable_destination<'a>(destination: &str, base: Option<&Url>) -> Option<CowStr<'a>> {
-    let destination = destination.trim();
-    // A fragment addresses this document, so there is nothing to resolve and nothing a scheme
-    // could hide in. The HTML path leaves them alone too.
-    if destination.starts_with('#') {
-        return Some(CowStr::from(destination.to_owned()));
-    }
-    let absolute = match Url::parse(destination) {
-        Ok(absolute) => absolute,
-        // A relative destination carries no scheme to judge, so it is resolved and judged after.
-        // Anything the parser refuses outright is a destination no reader could follow either.
-        Err(url::ParseError::RelativeUrlWithoutBase) => base?.join(destination).ok()?,
-        Err(_) => return None,
-    };
-    READABLE_SCHEMES
-        .contains(&absolute.scheme())
-        .then(|| CowStr::from(absolute.to_string()))
 }
 
 /// Which CommonMark extensions are read, and why only these two.

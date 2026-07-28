@@ -16,7 +16,12 @@ use serde::{Deserialize, Serialize};
 /// is answered where absences are answered, by what a repass counts as a media type worth
 /// re-reading, and answering it there re-reads the handful of captures it applies to instead of
 /// rewriting every article record in the archive to carry a larger number.
-pub const EXTRACTOR_VERSION: u32 = 2;
+///
+/// 3 is the HTML article string policy: links now keep only readable destinations, and image
+/// descriptions are reduced to descriptions before they reach Markdown. Existing records may
+/// already hold headings or destinations injected through page attributes, so they need to be
+/// stale and rebuilt from the stored response.
+pub const EXTRACTOR_VERSION: u32 = 3;
 
 /// How the prose in a record was obtained.
 ///

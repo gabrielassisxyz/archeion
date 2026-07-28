@@ -12,6 +12,7 @@ mod document;
 mod markdown;
 mod markup_scan;
 mod model;
+mod readable_markdown;
 mod rules;
 mod served;
 
@@ -220,7 +221,13 @@ pub fn extract(
             truncated,
         }));
     }
-    let prose = markdown::render(&article.content, title, &mut truncated).map_err(&refused)?;
+    let prose = markdown::render(
+        &article.content,
+        title,
+        Some(source.final_url),
+        &mut truncated,
+    )
+    .map_err(&refused)?;
     Ok(Extraction::Article(Article {
         record: ArticleRecord {
             extractor_version: EXTRACTOR_VERSION,

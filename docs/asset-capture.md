@@ -20,7 +20,9 @@ A later repass may ask again for subresources the capture already recorded as mi
 
 Every kind extraction reports: images, stylesheets, scripts, media and icons.
 
-The kind does not decide. Size does, which is what keeps a film out of a capture by default without a rule about films, and what lets an unusual page keep an unusual subresource as long as it is small. A page that embeds a video is recorded as having referenced it, and the record says the file was over the ceiling and by how much.
+The kind does not decide whether a subresource is fetchable at all. Size does, which is what keeps a film out of a capture by default without a rule about films, and what lets an unusual page keep an unusual subresource as long as it is small. A page that embeds a video is recorded as having referenced it, and the record says the file was over the ceiling and by how much.
+
+The kind does decide the order the references are asked for in, because the count ceiling below is spent in that order and a page's own order is not it: a modern site lists its script bundles before its photographs, and the budget was buying the build output and leaving the images to a later pass. Images and embedded audio or video are asked for first, since they are content the prose itself points a reader at; a stylesheet next, since it is written for the one page rather than shared across a whole site; an icon after that, generic and near-zero information about the page it sat on; and a script last, because it is minified, named by a content hash and useless later without the page environment this archive does not replay. Ordering never changes how many references are dealt with, only which ones are, and within one kind the page's own order survives, so a page fetched twice, unchanged, spends its budget the same way both times.
 
 ## The bounds
 

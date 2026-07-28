@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use crate::capture::media_type_of;
 use crate::crawl::{CrawlEngine, PageEvent, PageResponse, Seed, points_inside_a_network};
-use crate::metadata::ReferencedAsset;
+use crate::metadata::{AssetKind, ReferencedAsset};
 use crate::storage::{Archive, Asset, AssetMiss, MissedAsset, NewAsset, StorageError};
 
 /// The most references one capture deals with, which is also the most subresources it holds.
@@ -163,7 +163,14 @@ impl<'a> AssetCapture<'a> {
         self.fetches
     }
 
-    /// Acquires what one page referenced, in the order the page referenced it.
+    /// Acquires what one page referenced.
+    ///
+    /// The budget is spent in `fetch_priority` order rather than the page's own, so a page
+    /// that lists its script bundle before its photographs still has the photographs asked
+    /// for first. What the record then lists is back in the order the page referenced them,
+    /// because that ordering is a property of the page, not of the budget: a page that fits
+    /// inside every ceiling reads exactly as it would have without this rule, and only a
+    /// page that spills past a ceiling can tell the two orders apart.
     ///
     /// A failed write ends the run, like any other, and is the only error here: everything
     /// else that can go wrong is one subresource the capture will not have, which the record
@@ -172,14 +179,22 @@ impl<'a> AssetCapture<'a> {
         &mut self,
         referenced: &[ReferencedAsset],
     ) -> Result<CapturedAssets, StorageError> {
-        let mut captured = CapturedAssets::default();
+        let mut fetch_order: Vec<usize> = (0..referenced.len()).collect();
+        // Stable on purpose: two references of the same kind keep the order the page named
+        // them in, so a page fetched twice, unchanged, spends its budget the same way both
+        // times and stores the same set.
+        fetch_order.sort_by_key(|&index| fetch_priority(referenced[index].kind));
+
+        let mut outcomes: Vec<Option<Learned>> = vec![None; referenced.len()];
+        let mut dealt_with = 0usize;
         let mut bytes_spent = 0u64;
         let mut silences = 0usize;
 
-        for reference in referenced {
-            let dealt_with = captured.stored.len() + captured.missed.len();
+        for index in fetch_order {
+            let reference = &referenced[index];
             if let Some(reason) = no_room_for_another(dealt_with, bytes_spent) {
-                captured.missed.push(missed(&reference.url, reason));
+                outcomes[index] = Some(Learned::Missed(reason));
+                dealt_with += 1;
                 continue;
             }
             let learned = match self.known.get(&reference.url) {
@@ -204,7 +219,13 @@ impl<'a> AssetCapture<'a> {
                     asked.learned
                 }
             };
-            match learned {
+            outcomes[index] = Some(learned);
+            dealt_with += 1;
+        }
+
+        let mut captured = CapturedAssets::default();
+        for (reference, outcome) in referenced.iter().zip(outcomes) {
+            match outcome.expect("fetch_order visits every index exactly once") {
                 Learned::Stored(asset) => captured.stored.push(asset),
                 Learned::Missed(reason) => captured.missed.push(missed(&reference.url, reason)),
             }
@@ -304,6 +325,32 @@ pub(crate) fn retryable_miss(reason: &AssetMiss) -> bool {
     }
 }
 
+/// Where one kind sits in the fetch order. Lower goes first, and the ranking is by what an
+/// archive of prose loses if the kind never arrives, not by how a browser would render the
+/// page.
+///
+/// An image is asked for first: it is content the prose itself points a reader at, and a
+/// page's photographs are what an archive of writing is least willing to be without.
+/// Embedded audio or video is asked for next, on the same reasoning; it is ranked below an
+/// image only because a page carries far more of the one than the other, so spending the
+/// budget on images first stores more of what is likely to still fit inside it. A stylesheet
+/// comes next: not prose, but written for this one page rather than shared across a whole
+/// site, so it is still evidence about the page it was fetched with. An icon follows a
+/// stylesheet: a site's favicon, generic, reused on every page of the site, and telling a
+/// reader almost nothing about the one page it happened to be seen on. A script is asked for
+/// last, on purpose, because it is the kind this ordering exists for: a modern site's script
+/// bundle is minified, named by a content hash and useless later without the page
+/// environment this archive does not replay.
+fn fetch_priority(kind: AssetKind) -> u8 {
+    match kind {
+        AssetKind::Image => 0,
+        AssetKind::Media => 1,
+        AssetKind::Stylesheet => 2,
+        AssetKind::Icon => 3,
+        AssetKind::Script => 4,
+    }
+}
+
 /// Whether one more reference can be dealt with at all, given what this capture already did.
 ///
 /// Both ceilings are checked before anything is asked for, which is what keeps a page that
@@ -338,7 +385,311 @@ fn new_asset(response: PageResponse) -> NewAsset {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::ops::ControlFlow;
+
+    use tempfile::TempDir;
+
     use super::*;
+    use crate::crawl::{CrawlError, CrawlOutcome, FetchFailure};
+    use crate::storage::Header;
+
+    /// A crawl engine that answers a written-down set of subresource URLs and nothing else,
+    /// so `of_page` is driven without a network. `of_page` reaches only `fetch`: `crawl` and
+    /// `check_seed` are never called from inside an asset pass, and are implemented here only
+    /// because the trait requires them.
+    struct ScriptedEngine {
+        subresources: HashMap<String, PageEvent>,
+        fetched: RefCell<Vec<String>>,
+    }
+
+    impl ScriptedEngine {
+        fn serving(subresources: Vec<PageEvent>) -> Self {
+            let mut by_url = HashMap::new();
+            for event in subresources {
+                let url = match &event {
+                    PageEvent::Response(response) => response.requested_url.clone(),
+                    PageEvent::NoResponse(failure) => failure.url.clone(),
+                };
+                by_url.insert(url, event);
+            }
+            Self {
+                subresources: by_url,
+                fetched: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CrawlEngine for ScriptedEngine {
+        fn check_seed(&self, _seed: &Seed) -> Result<(), CrawlError> {
+            Ok(())
+        }
+
+        fn crawl(
+            &self,
+            _seed: &Seed,
+            _on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
+        ) -> Result<CrawlOutcome, CrawlError> {
+            Ok(CrawlOutcome::default())
+        }
+
+        fn fetch(&self, url: &str, _seed: &Seed) -> PageEvent {
+            self.fetched.borrow_mut().push(url.to_owned());
+            self.subresources.get(url).cloned().unwrap_or_else(|| {
+                PageEvent::NoResponse(FetchFailure {
+                    url: url.to_owned(),
+                    reason: "this fake has no response for the URL".to_owned(),
+                })
+            })
+        }
+    }
+
+    fn archive_in(dir: &TempDir) -> Archive {
+        Archive::open(dir.path()).expect("archive opens in an empty directory")
+    }
+
+    fn referenced(url: &str, kind: AssetKind) -> ReferencedAsset {
+        ReferencedAsset {
+            url: url.to_owned(),
+            kind,
+        }
+    }
+
+    /// A stored 200 whose body is a given number of bytes, for the ceiling that counts them.
+    fn response_of_size(url: &str, bytes: usize) -> PageEvent {
+        let PageEvent::Response(mut response) = stored_response(url) else {
+            unreachable!("stored_response answers with a response");
+        };
+        response.body = vec![b'x'; bytes];
+        PageEvent::Response(response)
+    }
+
+    /// A stored 200 for one subresource URL. The body is the URL's own bytes, which is
+    /// enough to tell two subresources apart without a body worth naming.
+    fn stored_response(url: &str) -> PageEvent {
+        PageEvent::Response(PageResponse {
+            requested_url: url.to_owned(),
+            final_url: url.to_owned(),
+            status: 200,
+            headers: vec![Header {
+                name: "content-type".to_owned(),
+                value: "application/octet-stream".to_owned(),
+            }],
+            body: url.as_bytes().to_vec(),
+            body_truncated: false,
+            fetched_at: "2026-07-28T00:00:00Z".parse().expect("valid timestamp"),
+        })
+    }
+
+    /// The regression this ordering exists for: a page that lists its script bundles before
+    /// its photographs, with more references than the ceiling holds, used to spend the whole
+    /// budget on the scripts and leave every image to a later pass. Fetch priority puts the
+    /// images first regardless of where the page put them, so they are what survives.
+    #[test]
+    fn scripts_listed_before_images_lose_the_budget_to_the_images() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/");
+
+        let scripts: Vec<String> = (0..MAX_ASSETS_PER_CAPTURE)
+            .map(|i| format!("https://example.com/bundle-{i}.js"))
+            .collect();
+        let images = [
+            "https://example.com/photo-0.jpg".to_owned(),
+            "https://example.com/photo-1.jpg".to_owned(),
+            "https://example.com/photo-2.jpg".to_owned(),
+        ];
+
+        let mut referenced_assets: Vec<ReferencedAsset> = scripts
+            .iter()
+            .map(|url| referenced(url, AssetKind::Script))
+            .collect();
+        referenced_assets.extend(images.iter().map(|url| referenced(url, AssetKind::Image)));
+
+        let all_urls: Vec<&String> = scripts.iter().chain(images.iter()).collect();
+        let engine =
+            ScriptedEngine::serving(all_urls.iter().map(|url| stored_response(url)).collect());
+
+        let mut assets = AssetCapture::new(&engine, &archive, &seed, Instant::now());
+        let captured = assets
+            .of_page(&referenced_assets)
+            .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(captured.stored.len(), MAX_ASSETS_PER_CAPTURE);
+        for image in &images {
+            assert!(
+                captured
+                    .stored
+                    .iter()
+                    .any(|asset| &asset.final_url == image),
+                "{image} should have outranked a script for the budget"
+            );
+        }
+        assert_eq!(captured.missed.len(), 3, "{:?}", captured.missed);
+        for miss in &captured.missed {
+            assert_eq!(miss.reason, AssetMiss::CountCeilingReached);
+            assert!(
+                miss.url.ends_with(".js"),
+                "only a script should have missed the budget: {}",
+                miss.url
+            );
+        }
+        // The same hundred and twenty-eight references are dealt with either way; ordering
+        // decides which ones, not how many.
+        assert_eq!(assets.fetches(), MAX_ASSETS_PER_CAPTURE);
+    }
+
+    /// The set stored, and its order, are both derived only from the page and the answers
+    /// a host gave, so a page fetched twice unchanged agrees with itself both times. That is
+    /// what keeps a capture id, which is built from this order, meaning the same thing on a
+    /// repeat capture that changed nothing.
+    #[test]
+    fn a_page_captured_twice_produces_the_same_stored_set_in_the_same_order() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/");
+
+        let referenced_assets = vec![
+            referenced("https://example.com/app.js", AssetKind::Script),
+            referenced("https://example.com/style.css", AssetKind::Stylesheet),
+            referenced("https://example.com/hero.jpg", AssetKind::Image),
+            referenced("https://example.com/favicon.ico", AssetKind::Icon),
+            referenced("https://example.com/clip.mp3", AssetKind::Media),
+        ];
+        let urls: Vec<&str> = referenced_assets.iter().map(|r| r.url.as_str()).collect();
+
+        let first_engine =
+            ScriptedEngine::serving(urls.iter().map(|url| stored_response(url)).collect());
+        let mut first_pass = AssetCapture::new(&first_engine, &archive, &seed, Instant::now());
+        let first = first_pass
+            .of_page(&referenced_assets)
+            .expect("the first capture");
+
+        let second_engine =
+            ScriptedEngine::serving(urls.iter().map(|url| stored_response(url)).collect());
+        let mut second_pass = AssetCapture::new(&second_engine, &archive, &seed, Instant::now());
+        let second = second_pass
+            .of_page(&referenced_assets)
+            .expect("the second capture");
+
+        assert_eq!(first.stored, second.stored);
+        assert_eq!(first.missed, second.missed);
+    }
+
+    /// A page that fits inside every ceiling is read exactly as it would have been before
+    /// this ordering existed: everything is stored, and it is stored back in the order the
+    /// page named it, not in fetch priority order. Only a page that spills past a ceiling can
+    /// tell the two orders apart.
+    #[test]
+    fn a_page_under_the_ceiling_stores_everything_in_page_order() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/");
+
+        let referenced_assets = vec![
+            referenced("https://example.com/app.js", AssetKind::Script),
+            referenced("https://example.com/style.css", AssetKind::Stylesheet),
+            referenced("https://example.com/hero.jpg", AssetKind::Image),
+            referenced("https://example.com/favicon.ico", AssetKind::Icon),
+            referenced("https://example.com/clip.mp3", AssetKind::Media),
+        ];
+        let urls: Vec<&str> = referenced_assets.iter().map(|r| r.url.as_str()).collect();
+        let engine = ScriptedEngine::serving(urls.iter().map(|url| stored_response(url)).collect());
+
+        let mut assets = AssetCapture::new(&engine, &archive, &seed, Instant::now());
+        let captured = assets
+            .of_page(&referenced_assets)
+            .expect("nothing here should miss");
+
+        assert!(captured.missed.is_empty(), "{:?}", captured.missed);
+        let stored_urls: Vec<&str> = captured
+            .stored
+            .iter()
+            .map(|asset| asset.final_url.as_str())
+            .collect();
+        assert_eq!(
+            stored_urls, urls,
+            "a capture under the ceiling reads exactly as it did before fetch order existed"
+        );
+        assert_eq!(assets.fetches(), referenced_assets.len());
+    }
+
+    /// The byte ceiling is a running sum, so unlike the count it is spent at a rate the
+    /// references themselves set, and ordering therefore decides how many fit rather than only
+    /// which ones. A page whose images alone exhaust the budget leaves nothing for the kinds
+    /// below them, which is the cost of ranking by kind and is worth having a page to point at.
+    ///
+    /// What survives the reordering is the record: the outcomes are still listed in the order
+    /// the page named its references, and a page over a ceiling still answers the same way
+    /// twice.
+    #[test]
+    fn images_large_enough_to_spend_the_byte_budget_leave_none_of_it_for_the_rest() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/");
+
+        // As large as one subresource may be, so that the per asset ceiling admits each answer
+        // and it takes a handful of them to reach the ceiling for the whole capture. Derived
+        // rather than written out, so the arithmetic follows the ceilings if they move.
+        let heavy = usize::try_from(MAX_ASSET_BYTES).expect("fits in usize");
+        let images: Vec<String> = (0..MAX_ASSET_BYTES_PER_CAPTURE / MAX_ASSET_BYTES + 1)
+            .map(|i| format!("https://example.com/photo-{i}.jpg"))
+            .collect();
+
+        let mut referenced_assets = vec![referenced(
+            "https://example.com/style.css",
+            AssetKind::Stylesheet,
+        )];
+        referenced_assets.extend(images.iter().map(|url| referenced(url, AssetKind::Image)));
+        referenced_assets.push(referenced("https://example.com/app.js", AssetKind::Script));
+
+        let mut answers = vec![stored_response("https://example.com/style.css")];
+        answers.extend(images.iter().map(|url| response_of_size(url, heavy)));
+        answers.push(stored_response("https://example.com/app.js"));
+        let engine = ScriptedEngine::serving(answers);
+
+        let mut assets = AssetCapture::new(&engine, &archive, &seed, Instant::now());
+        let captured = assets
+            .of_page(&referenced_assets)
+            .expect("a fake engine and a fresh archive do not fail a write");
+
+        let stored: Vec<&str> = captured
+            .stored
+            .iter()
+            .map(|asset| asset.final_url.as_str())
+            .collect();
+        let expected: Vec<&str> = images
+            .iter()
+            .take(images.len() - 1)
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            stored, expected,
+            "the images outrank the rest until the budget is gone"
+        );
+
+        let missed: Vec<(&str, &AssetMiss)> = captured
+            .missed
+            .iter()
+            .map(|miss| (miss.url.as_str(), &miss.reason))
+            .collect();
+        assert_eq!(
+            missed,
+            [
+                (
+                    "https://example.com/style.css",
+                    &AssetMiss::ByteCeilingReached
+                ),
+                (
+                    images.last().expect("images were built above").as_str(),
+                    &AssetMiss::ByteCeilingReached
+                ),
+                ("https://example.com/app.js", &AssetMiss::ByteCeilingReached),
+            ],
+            "what the images spent is spent for everything below them, and the record still
+             lists what happened in the order the page named it"
+        );
+    }
 
     #[test]
     fn a_capture_that_has_room_refuses_nothing() {
@@ -371,5 +722,15 @@ mod tests {
             no_room_for_another(MAX_ASSETS_PER_CAPTURE, MAX_ASSET_BYTES_PER_CAPTURE),
             Some(AssetMiss::CountCeilingReached)
         );
+    }
+
+    /// The ranking spelled out, so a change to it fails a test that names the reasoning
+    /// rather than one built from two hundred generated URLs.
+    #[test]
+    fn fetch_priority_ranks_content_first_and_script_last() {
+        assert!(fetch_priority(AssetKind::Image) < fetch_priority(AssetKind::Media));
+        assert!(fetch_priority(AssetKind::Media) < fetch_priority(AssetKind::Stylesheet));
+        assert!(fetch_priority(AssetKind::Stylesheet) < fetch_priority(AssetKind::Icon));
+        assert!(fetch_priority(AssetKind::Icon) < fetch_priority(AssetKind::Script));
     }
 }

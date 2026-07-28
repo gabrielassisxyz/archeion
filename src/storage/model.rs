@@ -291,7 +291,10 @@ pub enum AssetMiss {
     /// still works, a stylesheet missing its end does not, and this record has nowhere to say
     /// that the bytes are partial.
     ArrivedShort { byte_len: u64 },
-    /// The capture had already dealt with as many references as one capture may.
+    /// The capture had already dealt with as many references as one capture may. The
+    /// references dealt with first are the ones an archive of prose loses the least without
+    /// missing, so a reference marked with this reason is disproportionately a script: the
+    /// ceiling was reached only after the kinds ranked ahead of it were already asked for.
     CountCeilingReached,
     /// The capture had already spent the bytes one capture may spend on subresources.
     ByteCeilingReached,

@@ -23,6 +23,9 @@ use crate::metadata::PageMetadata;
 use crate::readability::{Article, ArticleRecord, RefusedExtraction};
 
 const MARKER_FILE: &str = "archeion.json";
+/// The one file in an archive that a person writes rather than the program. It is beside the
+/// marker rather than under `items/`, which the walk reads as records and nothing else.
+const EXTRACTION_RULES_FILE: &str = "extraction-rules.json";
 const FORMAT_NAME: &str = "archeion-archive";
 const FORMAT_VERSION: u32 = 1;
 const MAX_ARTICLE_RECORD_BYTES: u64 = 64 * 1024;
@@ -160,6 +163,20 @@ impl Archive {
         }
 
         Ok(Self { root })
+    }
+
+    /// Where this archive's per-host extraction rules are written, whether or not they exist.
+    ///
+    /// They live in the archive rather than in the operator's configuration directory because
+    /// the rules are what a re-pass over these stored responses has to read to produce the same
+    /// articles again. An archive that travels without them extracts differently on the next
+    /// machine and says nothing about why, which is the one thing every derived record here is
+    /// built to avoid.
+    ///
+    /// This answers a path and does not read it: parsing the file belongs to the extractor that
+    /// owns the format, and the store owns only where it sits.
+    pub fn extraction_rules_path(&self) -> PathBuf {
+        self.root.join(EXTRACTION_RULES_FILE)
     }
 
     /// Stores the bytes of one subresource and answers with the record that references them.

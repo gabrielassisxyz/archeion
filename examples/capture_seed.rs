@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use archeion::capture::capture_seed;
 use archeion::crawl::{Seed, SpiderEngine};
+use archeion::readability::SiteRules;
 use archeion::storage::Archive;
 
 fn main() {
@@ -35,6 +36,11 @@ fn main() {
     // which is the half of the execution policy no test can reach.
     seed.deadline = Some(Duration::from_secs(20));
 
-    let run = capture_seed(&SpiderEngine, &archive, &seed).expect("the run completes");
+    let (rules, unused) = SiteRules::read(&archive.extraction_rules_path());
+    for problem in &unused {
+        eprintln!("warning: {problem}");
+    }
+
+    let run = capture_seed(&SpiderEngine, &archive, &seed, &rules).expect("the run completes");
     println!("{run:#?}");
 }

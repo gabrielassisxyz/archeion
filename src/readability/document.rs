@@ -1,12 +1,14 @@
-//! Building the tree the scorer works on, and refusing the ones that would cost too much.
+//! Building the tree the scorer works on, refusing the ones that would cost too much, and
+//! telling it where the article is on the sites it cannot work out.
 //!
-//! This is the file per-host extraction rules will hook into: the document exists here, in
-//! one piece, before anything has scored it, which is the only moment at which "the article
-//! is this subtree" and "these selectors are furniture" can still be said.
+//! The rules hook in here because the document exists in one piece at this point and nothing
+//! has scored it yet, which is the only moment at which "the article is this subtree" and
+//! "these selectors are furniture" can still be said.
 
-use dom_query::{Document, NodeRef};
+use dom_query::{Document, NodeId, NodeRef};
 
 use super::markup_scan::peak_open_elements;
+use super::rules::SiteRule;
 
 /// How deeply markup may nest before the document is refused.
 ///
@@ -111,6 +113,123 @@ pub(super) fn build(html: &str) -> Result<(Document, Measured), TooExpensive> {
     ))
 }
 
+/// What a host's rule made of the page.
+///
+/// Three answers rather than two, because only one of them is a positive statement about where
+/// the prose lives. A caller weighs that statement against its own guesses; the other two leave
+/// every guess exactly where it was.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Narrowed {
+    /// A rule named where the article is and this page has it there. The tree is now that
+    /// subtree, with whatever the rule calls furniture already taken out of it.
+    ToTheArticleTheRuleNamed,
+    /// A rule took furniture out and said nothing about where the article is, so the page is
+    /// still a page and finding the prose in it is still the scorer's job.
+    ToWhatIsLeftOfThePage,
+    /// The rule says where the article is on this host, and this page does not have it there.
+    NotAnArticleHere,
+}
+
+/// Applies a host's rule to the tree, before anything has scored it.
+///
+/// The order is `body` and then `strip`, which is the order the pipeline reads in: narrow to the
+/// article, then take the furniture out of it. It also makes a `strip` selector cheaper to write,
+/// since by the time one runs it only has to describe what is left rather than the whole page.
+///
+/// Nothing is serialized and re-parsed. The subtree is moved inside the tree it is already in, so
+/// a rule costs a walk rather than a second parse of a document that has already passed the
+/// ceilings above.
+pub(super) fn narrow(document: &Document, rule: &SiteRule) -> Narrowed {
+    let Some(body) = body_of(document) else {
+        return Narrowed::ToWhatIsLeftOfThePage;
+    };
+    // The body and what holds it. A selector matching one of these is either meaningless, as an
+    // article that is the whole document, or destructive, as a strip that leaves no tree at all.
+    let page: Vec<NodeId> = std::iter::once(body.id)
+        .chain(body.ancestors(None).into_iter().map(|node| node.id))
+        .collect();
+
+    let named = !rule.body.is_empty();
+    if named {
+        let Some(article) = first_match(document, &rule.body, &page) else {
+            return Narrowed::NotAnArticleHere;
+        };
+        // Detached before the body is emptied, because emptying it first would take the article
+        // down with everything else.
+        for node in &article {
+            node.remove_from_parent();
+        }
+        body.remove_children();
+        for node in &article {
+            body.append_child(node);
+        }
+    }
+
+    for selector in &rule.strip {
+        let Some(furniture) = document.try_select(selector) else {
+            continue;
+        };
+        for node in furniture.nodes() {
+            if page.contains(&node.id) {
+                continue;
+            }
+            node.remove_from_parent();
+        }
+    }
+    if named {
+        Narrowed::ToTheArticleTheRuleNamed
+    } else {
+        Narrowed::ToWhatIsLeftOfThePage
+    }
+}
+
+/// What the first selector that matches anything selected, with any match nested inside another
+/// left out.
+///
+/// First-match and not every-match: a second selector is an alternative spelling of where the
+/// article is, so a site that renamed its container keeps one rule instead of needing one per
+/// spelling. Taking every selector's matches instead would silently glue two unrelated blocks
+/// together on the pages where both happen to exist.
+///
+/// A match inside another match is dropped because both would be moved to the body, which would
+/// pull the inner one out of the outer one and reorder the article. `Vec::contains` is the lookup
+/// because a selector naming where an article lives matches a handful of nodes, not thousands.
+fn first_match<'a>(
+    document: &'a Document,
+    selectors: &[String],
+    page: &[NodeId],
+) -> Option<Vec<NodeRef<'a>>> {
+    for selector in selectors {
+        let Some(selected) = document.try_select(selector) else {
+            continue;
+        };
+        let matched: Vec<NodeRef<'a>> = selected
+            .nodes()
+            .iter()
+            .filter(|node| !page.contains(&node.id))
+            .copied()
+            .collect();
+        let ids: Vec<NodeId> = matched.iter().map(|node| node.id).collect();
+        let outermost: Vec<NodeRef<'a>> = matched
+            .into_iter()
+            .filter(|node| {
+                !node
+                    .ancestors(None)
+                    .iter()
+                    .any(|ancestor| ids.contains(&ancestor.id))
+            })
+            .collect();
+        if !outermost.is_empty() {
+            return Some(outermost);
+        }
+    }
+    None
+}
+
+fn body_of(document: &Document) -> Option<NodeRef<'_>> {
+    document.select("body").nodes().first().copied()
+}
+
 /// The subtrees whose text is not the page's prose. A page carrying a few kilobytes of inline
 /// JSON-LD or a framework's serialized state would otherwise count them as text it holds, and
 /// the article inside it would look like a sliver of a much larger document.
@@ -134,7 +253,7 @@ const NOT_PROSE: [&str; 4] = ["script", "style", "noscript", "template"];
 /// whitespace, exactly as it scores an English page. Whitespace itself is not counted, so
 /// that indented markup does not read as more text than the same page minified.
 pub(super) fn page_text_chars(document: &Document) -> usize {
-    let Some(body) = document.select("body").nodes().first().cloned() else {
+    let Some(body) = body_of(document) else {
         return 0;
     };
     let mut total = 0;
@@ -240,6 +359,123 @@ mod tests {
             page_chars("<div><p>Bread is patience.</p></div>"),
             page_chars("<div>\n    <p>\n        Bread is patience.\n    </p>\n</div>")
         );
+    }
+
+    /// The tree as text, so a test about what a rule kept can say so in the page's own words.
+    fn text_after(html: &str, rule: SiteRule) -> (Narrowed, String) {
+        let (document, _) = build(html).expect("well within every ceiling");
+        let answer = narrow(&document, &rule);
+        (answer, document.select("body").text().trim().to_owned())
+    }
+
+    fn rule(body: &[&str], strip: &[&str]) -> SiteRule {
+        SiteRule {
+            why: None,
+            body: body.iter().map(|s| (*s).to_owned()).collect(),
+            strip: strip.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    const PAGE: &str = "<html><body><nav>Home</nav>\
+         <div class=\"post\"><p>The dough.</p><aside class=\"ad\">Buy this</aside></div>\
+         <footer>Subscribe</footer></body></html>";
+
+    #[test]
+    fn the_article_a_rule_names_becomes_the_document() {
+        let (answer, text) = text_after(PAGE, rule(&["div.post"], &[]));
+
+        assert_eq!(answer, Narrowed::ToTheArticleTheRuleNamed);
+        assert_eq!(text, "The dough.Buy this");
+    }
+
+    #[test]
+    fn what_a_rule_calls_furniture_is_gone_before_anything_scores_it() {
+        let (answer, text) = text_after(PAGE, rule(&[], &["nav", "aside.ad", "footer"]));
+
+        // A strip says nothing about where the article is, so nothing here overrules a guess.
+        assert_eq!(answer, Narrowed::ToWhatIsLeftOfThePage);
+        assert_eq!(text, "The dough.");
+    }
+
+    /// The order the two are applied in, which is the order the pipeline reads in. A strip
+    /// running first would have to describe the whole page, and a selector that matched
+    /// something outside the article would take the article's own furniture with it only by
+    /// accident.
+    #[test]
+    fn the_article_is_taken_out_first_and_swept_afterwards() {
+        let (_, text) = text_after(PAGE, rule(&["div.post"], &["aside.ad", "footer"]));
+
+        assert_eq!(text, "The dough.");
+    }
+
+    /// A rule saying where the article is says something about every page of the host, and the
+    /// pages that do not have it are the listings and the shop fronts the scorer would otherwise
+    /// find enough prose in to file beside the articles.
+    #[test]
+    fn a_page_without_the_article_a_rule_names_is_not_an_article() {
+        let (answer, text) = text_after(PAGE, rule(&["article.story"], &["nav"]));
+
+        assert_eq!(answer, Narrowed::NotAnArticleHere);
+        // Refused before the strip ran, since nothing is being scored.
+        assert!(text.contains("Home"), "{text}");
+    }
+
+    /// One selector is where the article is, and a second is another spelling of the same thing.
+    /// Taking every selector's matches would glue two unrelated blocks together on the pages
+    /// where a site's old and new markup both happen to appear.
+    #[test]
+    fn only_the_first_selector_that_matches_anything_is_used() {
+        let (_, text) = text_after(
+            "<html><body><div class=\"old\">Before</div><div class=\"new\">After</div></body></html>",
+            rule(&["div.missing", "div.new", "div.old"], &[]),
+        );
+
+        assert_eq!(text, "After");
+    }
+
+    /// A selector like `div` matches an article and everything inside it. Moving both would pull
+    /// the inner one out of the outer one, so the article would come back reordered and with its
+    /// own text repeated at the end.
+    #[test]
+    fn a_match_inside_another_match_does_not_get_moved_out_of_it() {
+        let (_, text) = text_after(
+            "<html><body><div><p>One.</p><div><p>Two.</p></div></div></body></html>",
+            rule(&["div"], &[]),
+        );
+
+        assert_eq!(text, "One.Two.");
+    }
+
+    /// A rule is written by a person and read by a parser, and neither is careful. A selector
+    /// that names the page itself is either meaningless, as an article that is the whole
+    /// document, or destructive, as a strip that leaves the scorer no tree at all.
+    #[test]
+    fn a_selector_naming_the_page_itself_is_passed_over() {
+        let (answer, text) = text_after(PAGE, rule(&[], &["html", "body"]));
+        assert_eq!(answer, Narrowed::ToWhatIsLeftOfThePage);
+        assert!(text.contains("The dough."), "{text}");
+
+        let (answer, text) = text_after(PAGE, rule(&["body"], &[]));
+        assert_eq!(answer, Narrowed::NotAnArticleHere, "{text}");
+    }
+
+    /// The tree is moved rather than serialized and parsed again, and this is what says so: the
+    /// depth guard has already run by the time a rule is applied, so a second parse would be a
+    /// second chance for the page to cost what the guard refused.
+    #[test]
+    fn narrowing_a_page_leaves_the_element_it_kept_intact() {
+        let (document, _) = build(
+            "<html><body><div class=\"post\"><p>One.</p><p><em>Two.</em></p></div>\
+                   <footer>Gone</footer></body></html>",
+        )
+        .expect("within every ceiling");
+
+        assert_eq!(
+            narrow(&document, &rule(&["div.post"], &[])),
+            Narrowed::ToTheArticleTheRuleNamed
+        );
+        assert_eq!(document.select("div.post em").text().as_ref(), "Two.");
+        assert_eq!(page_text_chars(&document), "One.Two.".len());
     }
 
     fn nested(depth: usize) -> String {

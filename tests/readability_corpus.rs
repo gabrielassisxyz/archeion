@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use archeion::metadata::PageSource;
-use archeion::readability::{self, Article, Extraction};
+use archeion::readability::{self, Article, Extraction, SiteRules};
 use serde::Deserialize;
 
 /// Unknown fields are refused rather than ignored. A mistyped assertion that parses is worse
@@ -210,6 +210,7 @@ fn extract(page: &Path, name: &str, title: Option<&str>) -> Extraction {
             final_url: &format!("https://{name}.example.com/page"),
         },
         title,
+        &SiteRules::default(),
     )
     .unwrap_or_else(|error| panic!("{name} was refused: {error}"))
 }

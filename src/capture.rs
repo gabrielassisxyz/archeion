@@ -14,7 +14,7 @@ use crate::crawl::{
     points_inside_a_network,
 };
 use crate::metadata::{self, PageMetadata, PageSource, ReferencedAsset, UnreadablePage};
-use crate::readability::{self, Extraction, UnreadableArticle};
+use crate::readability::{self, Extraction, SiteRules, UnreadableArticle};
 use crate::storage::{Archive, Header, NewCapture, StorageError};
 
 #[derive(Debug, thiserror::Error)]
@@ -101,6 +101,7 @@ pub fn capture_seed(
     engine: &dyn CrawlEngine,
     archive: &Archive,
     seed: &Seed,
+    rules: &SiteRules,
 ) -> Result<CaptureRun, CaptureError> {
     let mut run = CaptureRun::default();
     let mut write_failure: Option<StorageError> = None;
@@ -116,6 +117,7 @@ pub fn capture_seed(
             event,
             archive,
             seed,
+            rules,
             &mut assets,
             &mut run,
             &mut write_failure,
@@ -172,6 +174,7 @@ fn capture_page(
     event: PageEvent,
     archive: &Archive,
     seed: &Seed,
+    rules: &SiteRules,
     assets: &mut AssetCapture<'_>,
     run: &mut CaptureRun,
     write_failure: &mut Option<StorageError>,
@@ -213,7 +216,7 @@ fn capture_page(
     // after, because the response is what cannot be recovered: a run cut short then leaves
     // a capture with no reading of it, which a later pass can produce on its own.
     let extracted = read_page(&page, run);
-    let prose = read_prose(&page, extracted.as_ref(), run);
+    let prose = read_prose(&page, extracted.as_ref(), rules, run);
     // The subresources are acquired before the capture is written because the record has to
     // name them, and their bytes are stored before the page's own for the reason every body
     // is stored before every record: a blob nobody references costs disk space, and a record
@@ -273,6 +276,7 @@ fn capture_page(
 fn read_prose(
     page: &PageResponse,
     metadata: Option<&PageMetadata>,
+    rules: &SiteRules,
     run: &mut CaptureRun,
 ) -> Extraction {
     let title = metadata
@@ -285,6 +289,7 @@ fn read_prose(
             final_url: &page.final_url,
         },
         title,
+        rules,
     ) {
         Ok(Extraction::Article(article)) => {
             run.articles_extracted += 1;
@@ -380,6 +385,17 @@ mod tests {
     use super::*;
     use crate::crawl::CrawlOutcome;
     use crate::storage::AssetMiss;
+
+    /// A run over a host nothing has been told about, which is what every test here but the one
+    /// below is about. Where a rule reaches the extraction is `readability`'s subject, and this
+    /// module's is what a run does with what came back.
+    fn capture_with_no_rules(
+        engine: &dyn CrawlEngine,
+        archive: &Archive,
+        seed: &Seed,
+    ) -> Result<CaptureRun, CaptureError> {
+        capture_seed(engine, archive, seed, &SiteRules::default())
+    }
 
     /// A crawl engine that replays a written-down list of page events instead of fetching
     /// anything. It is the whole reason the boundary exists: the pipeline above it is
@@ -495,7 +511,7 @@ mod tests {
                <body><a href="/b">b</a></body></html>"#,
         )]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.captures_written, 1);
@@ -528,7 +544,7 @@ mod tests {
             ),
         )]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.articles_extracted, 1);
@@ -549,6 +565,63 @@ mod tests {
         assert!(article.markdown.contains("Bread is mostly patience"));
         assert!(!article.markdown.contains("Subscribe to our newsletter"));
         assert!(article.record.word_count > 0);
+    }
+
+    /// The rules reach the stored article, which is the only part of them this module owns. A
+    /// run that read a rule file and then handed the extractor nothing would still archive the
+    /// page, still report an article, and be wrong only in the file a person opens.
+    #[test]
+    fn what_a_host_was_told_reaches_the_article_that_is_stored() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/a",
+            200,
+            &format!(
+                r#"<html><head><title>How to bake bread</title></head>
+                   <body><article>{}
+                   <aside class="house-appeal"><p>Every article here is written by a person who
+                   was paid to write it, and a subscription is what pays them. There is a free
+                   trial month if you would rather read a few more before deciding.</p>
+                   </aside></article></body></html>"#,
+                "<p>Bread is mostly patience, and the dough will tell you when it is ready.</p>"
+                    .repeat(8)
+            ),
+        )]);
+        let (rules, unused) = SiteRules::parse(
+            r#"{"hosts": {"example.com": {"strip": ["aside.house-appeal"]}}}"#,
+            "a test",
+        );
+        assert!(unused.is_empty(), "{unused:?}");
+
+        let run = capture_seed(
+            &engine,
+            &archive,
+            &Seed::new("https://example.com/"),
+            &rules,
+        )
+        .expect("the run completes");
+
+        assert_eq!(run.articles_extracted, 1);
+        let url = CanonicalUrl::parse("https://example.com/a").expect("valid url");
+        let captures = archive.list_captures(&url).expect("captures are listed");
+        let article = archive
+            .read_article(&url, &captures[0])
+            .expect("the prose is stored")
+            .expect("an article has prose");
+
+        assert!(article.markdown.contains("Bread is mostly patience"));
+        assert!(
+            !article
+                .markdown
+                .contains("a subscription is what pays them"),
+            "{}",
+            article.markdown
+        );
+        assert_eq!(
+            article.record.rules,
+            crate::readability::ExtractionRules::Site("example.com".to_owned())
+        );
     }
 
     /// A page refused for being a sliver of itself leaves a record and no article, which is
@@ -579,7 +652,7 @@ mod tests {
             ),
         )]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.articles_extracted, 0);
@@ -623,7 +696,7 @@ mod tests {
                <li><a href="/c">three</a></li></ul></body></html>"#,
         )]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.captures_written, 1);
@@ -656,7 +729,7 @@ mod tests {
         }];
         let engine = ScriptedCrawlEngine::new(vec![event]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.captures_written, 1);
@@ -688,7 +761,7 @@ mod tests {
         }];
         let engine = ScriptedCrawlEngine::new(vec![event]);
 
-        capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         let url = CanonicalUrl::parse("https://example.com/a").expect("valid url");
@@ -714,7 +787,7 @@ mod tests {
             page("https://example.com/b", 200, "<html>b</html>"),
         ]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.captures_written, 2);
@@ -738,7 +811,7 @@ mod tests {
         let archive = archive_in(&dir);
         let engine = ScriptedCrawlEngine::new(vec![page("https://example.com/gone", 404, "")]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.captures_written, 1);
@@ -759,7 +832,7 @@ mod tests {
             page("https://example.com/a?utm_source=x", 200, "<html>a</html>"),
         ]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.captures_written, 2);
@@ -782,7 +855,7 @@ mod tests {
             page("https://example.com/b", 200, "<html>b</html>"),
         ]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.captures_written, 1);
@@ -809,7 +882,7 @@ mod tests {
             page("https://example.com/b", 200, "<html>b</html>"),
         ]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.captures_written, 1);
@@ -838,7 +911,7 @@ mod tests {
         let mut seed = Seed::new("http://127.0.0.1/");
         seed.allow_private_addresses = true;
 
-        let run = capture_seed(&engine, &archive, &seed).expect("the run completes");
+        let run = capture_with_no_rules(&engine, &archive, &seed).expect("the run completes");
 
         assert_eq!(run.captures_written, 1);
         assert!(run.pages_inside_a_network.is_empty());
@@ -858,7 +931,7 @@ mod tests {
             page("https://example.com/b", 200, "<html>b</html>"),
         ]);
 
-        let error = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let error = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect_err("the write fails");
 
         assert!(matches!(error, CaptureError::Storage { .. }));
@@ -878,7 +951,7 @@ mod tests {
         std::fs::write(dir.path().join("items"), b"not a directory")
             .expect("the write target is blocked");
 
-        let error = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let error = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect_err("the write fails");
 
         match error {
@@ -902,7 +975,7 @@ mod tests {
             page("https://example.com/b", 200, "<html>b</html>"),
         ]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.captures_written, 1);
@@ -926,7 +999,7 @@ mod tests {
             ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, "<html>a</html>")]);
         engine.outcome.pages_dropped = 3;
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.captures_written, 1);
@@ -948,7 +1021,7 @@ mod tests {
         let mut seed = Seed::new("https://example.com/");
         seed.deadline = Some(Duration::ZERO);
 
-        let run = capture_seed(&engine, &archive, &seed).expect("the run completes");
+        let run = capture_with_no_rules(&engine, &archive, &seed).expect("the run completes");
 
         assert_eq!(engine.pages_offered(), 1);
         assert_eq!(
@@ -965,7 +1038,7 @@ mod tests {
         let engine =
             ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, "<html>a</html>")]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.captures_written, 1);
@@ -1014,7 +1087,7 @@ mod tests {
             ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, "<html>a</html>")]);
         engine.outcome.stopped = CrawlStop::DeadlineReached;
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.stopped, CrawlStop::DeadlineReached);
@@ -1031,7 +1104,7 @@ mod tests {
         response_of(&mut cut_short).body_truncated = true;
         let engine = ScriptedCrawlEngine::new(vec![cut_short]);
 
-        capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         let url = CanonicalUrl::parse("https://example.com/a").expect("valid url");
@@ -1071,7 +1144,7 @@ mod tests {
         response_of(&mut redirected).requested_url = "https://example.com/short-link".to_owned();
         let engine = ScriptedCrawlEngine::new(vec![redirected]);
 
-        capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         let url = CanonicalUrl::parse("https://example.com/final").expect("valid url");
@@ -1120,7 +1193,7 @@ mod tests {
                     subresource("https://example.com/logo.png", "image/png", b"\x89PNG"),
                 ]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.assets_stored, 2);
@@ -1173,7 +1246,7 @@ mod tests {
             b"body{}",
         )]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.captures_written, 2);
@@ -1202,7 +1275,7 @@ mod tests {
             page("https://example.com/b", 200, referencing),
         ]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.captures_written, 2, "the pages are archived regardless");
@@ -1231,7 +1304,7 @@ mod tests {
             ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, STYLED_PAGE)])
                 .serving(vec![cut_short]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.assets_stored, 0, "the logo was never served either");
@@ -1257,7 +1330,7 @@ mod tests {
             ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, STYLED_PAGE)])
                 .serving(vec![redirected]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.captures_written, 1);
@@ -1287,7 +1360,7 @@ mod tests {
         let mut seed = Seed::new("http://127.0.0.1:8000/");
         seed.allow_private_addresses = true;
 
-        let run = capture_seed(&engine, &archive, &seed).expect("the run completes");
+        let run = capture_with_no_rules(&engine, &archive, &seed).expect("the run completes");
 
         assert_eq!(run.assets_stored, 1);
         let capture = only_capture_of(&archive, "http://127.0.0.1:8000/a");
@@ -1314,7 +1387,7 @@ mod tests {
         let mut seed = Seed::new("https://example.com/");
         seed.deadline = Some(Duration::ZERO);
 
-        let run = capture_seed(&engine, &archive, &seed).expect("the run completes");
+        let run = capture_with_no_rules(&engine, &archive, &seed).expect("the run completes");
 
         assert_eq!(run.captures_written, 1);
         assert_eq!(
@@ -1346,7 +1419,7 @@ mod tests {
         }];
         let engine = ScriptedCrawlEngine::new(vec![image]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.captures_written, 1);
@@ -1376,7 +1449,7 @@ mod tests {
         let engine = ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, &markup)])
             .serving(served);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         let capture = only_capture_of(&archive, "https://example.com/a");
@@ -1412,7 +1485,7 @@ mod tests {
                 b"\x89PNG",
             )]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.captures_written, 1);
@@ -1461,7 +1534,7 @@ mod tests {
             subresource("https://example.com/also-here.png", "image/png", b"\x89PNG2"),
         ]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.assets_stored, 2);
@@ -1497,7 +1570,7 @@ mod tests {
             b"\x89PNG",
         )]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.assets_stored, 1);
@@ -1528,7 +1601,7 @@ mod tests {
         let engine = ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, &markup)])
             .serving(served);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.assets_stored, 0);
@@ -1577,7 +1650,7 @@ mod tests {
             r#"<html><link rel="stylesheet" href="http://169.254.169.254/latest/"></html>"#,
         )]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.asset_fetches, 0);
@@ -1602,7 +1675,7 @@ mod tests {
         markup.push_str("</body></html>");
         let engine = ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, &markup)]);
 
-        let run = capture_seed(&engine, &archive, &Seed::new("https://example.com/"))
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
         assert_eq!(run.assets_stored, 0);

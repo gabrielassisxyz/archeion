@@ -12,6 +12,7 @@ mod document;
 mod markdown;
 mod markup_scan;
 mod model;
+mod rules;
 
 use dom_smoothie::{Config, Readability, ReadabilityError};
 
@@ -19,6 +20,7 @@ pub use model::{
     AdmissionCost, Article, ArticleBound, ArticleRecord, EXTRACTOR_VERSION, Extraction,
     ExtractionRules, ProseShare, RefusedExtraction,
 };
+pub use rules::{SiteRule, SiteRules, UnusedRules};
 
 use crate::metadata::PageSource;
 
@@ -106,9 +108,14 @@ pub struct UnreadableArticle {
 ///
 /// `title` comes from the metadata record rather than from this page's markup, for the reason
 /// on `markdown::render`.
+///
+/// `rules` is the escape hatch for the sites the scorer cannot read. It is consulted before the
+/// page is scored and its host is recorded on whatever comes out, so an extraction always says
+/// whether it was worked out or told.
 pub fn extract(
     source: PageSource<'_>,
     title: Option<&str>,
+    rules: &SiteRules,
 ) -> Result<Extraction, UnreadableArticle> {
     let Some(html) = crate::metadata::decoded_html(source) else {
         return Ok(Extraction::Nothing);
@@ -119,6 +126,25 @@ pub fn extract(
     };
 
     let (document, measured) = document::build(&html).map_err(|cost| refused(cost.reason()))?;
+    let matched = rules.for_url(source.final_url);
+    let narrowed = match matched {
+        Some(matched) => document::narrow(&document, matched.rule),
+        None => document::Narrowed::ToWhatIsLeftOfThePage,
+    };
+    if narrowed == document::Narrowed::NotAnArticleHere {
+        return Ok(Extraction::Nothing);
+    }
+    // A rule that named the article answered the question the probe below asks, so the probe is
+    // skipped rather than allowed to overrule it. The sliver rule needs no such exception: the
+    // page it measures against is now the article, so it cannot fire.
+    let told_where_the_article_is = narrowed == document::Narrowed::ToTheArticleTheRuleNamed;
+    let applied = matched.map_or(ExtractionRules::Heuristic, |matched| {
+        ExtractionRules::Site(matched.host.to_owned())
+    });
+    // After the rule and not before it, so that both sides of the sliver rule below count the
+    // same document. A rule that narrowed the page to the article says the operator already
+    // answered the question the sliver rule asks, and the record names the rule that answered it
+    // so a calibration against real pages can leave these rows out.
     let page_chars = document::page_text_chars(&document);
     let mut readability = Readability::with_document(
         document,
@@ -132,7 +158,12 @@ pub fn extract(
 
     // Before `parse`, not after. The probe is cheap and the scoring pass is not, and this is
     // what keeps the archive from filling up with empty records for pages that are navigation.
-    if !readability.is_probably_readable() {
+    //
+    // It is skipped for a page whose article was named, and skipping it is not a shortcut: the
+    // probe weighs a document, a rule leaves behind a document that is only the article, and a
+    // short post is then refused for being what the rule cut it down to. A forum topic of two
+    // paragraphs under a thread of thirty is the shape that showed it.
+    if !told_where_the_article_is && !readability.is_probably_readable() {
         return Ok(Extraction::Nothing);
     }
     let article = match readability.parse() {
@@ -155,7 +186,7 @@ pub fn extract(
     if share.is_a_sliver() {
         return Ok(Extraction::Refused(RefusedExtraction {
             extractor_version: EXTRACTOR_VERSION,
-            rules: ExtractionRules::Heuristic,
+            rules: applied,
             share,
             excerpt,
         }));
@@ -165,7 +196,7 @@ pub fn extract(
     Ok(Extraction::Article(Article {
         record: ArticleRecord {
             extractor_version: EXTRACTOR_VERSION,
-            rules: ExtractionRules::Heuristic,
+            rules: applied,
             // Counted on the prose alone. The heading is a title handed in from the metadata
             // record, so counting it here would report the same words twice across two files.
             word_count: markdown::word_count(&prose.body),
@@ -214,6 +245,10 @@ mod tests {
     }
 
     fn extract_html(html: &str, title: Option<&str>) -> Extraction {
+        extract_with(html, title, &SiteRules::default())
+    }
+
+    fn extract_with(html: &str, title: Option<&str>, rules: &SiteRules) -> Extraction {
         extract(
             PageSource {
                 body: html.as_bytes(),
@@ -221,8 +256,21 @@ mod tests {
                 final_url: "https://example.com/posts/one",
             },
             title,
+            rules,
         )
         .expect("a page this test wrote is readable")
+    }
+
+    /// The rules a test declares for `example.com`, which is the host every page here is served
+    /// from. Parsed rather than constructed, so a test states its rule in the file format an
+    /// operator writes and not in a shape only this module can build.
+    fn rules_for_example(declared: &str) -> SiteRules {
+        let (rules, unused) = SiteRules::parse(
+            &format!("{{\"hosts\": {{\"example.com\": {declared}}}}}"),
+            "a test",
+        );
+        assert!(unused.is_empty(), "{unused:?}");
+        rules
     }
 
     /// For the tests whose subject is the prose rather than the decision about it.
@@ -243,6 +291,7 @@ mod tests {
                     final_url: "https://example.com/logo.png",
                 },
                 None,
+                &SiteRules::default(),
             );
             assert_eq!(extracted, Ok(Extraction::Nothing), "for {content_type:?}");
         }
@@ -432,6 +481,7 @@ mod tests {
                 final_url: "https://example.com/deep",
             },
             None,
+            &SiteRules::default(),
         )
         .expect_err("refused");
 
@@ -440,6 +490,164 @@ mod tests {
             refused.reason.contains("elements open at once"),
             "{refused}"
         );
+    }
+
+    /// What the `rules` field is for. Two extractions of the same shape differ, and a reader a
+    /// year later can tell which one was worked out and which one was told, without which the
+    /// field would only ever hold one value and say nothing.
+    #[test]
+    fn an_extraction_records_the_host_that_was_told() {
+        let page = article_page("<aside class=\"promo\">Subscribe to the newsletter</aside>");
+
+        let alone = article_from(&page, Some("t"));
+        assert_eq!(alone.record.rules, ExtractionRules::Heuristic);
+
+        let told = extract_with(
+            &page,
+            Some("t"),
+            &rules_for_example(r#"{"strip": ["aside.promo"]}"#),
+        );
+        let Extraction::Article(told) = told else {
+            panic!("expected an article, got {told:?}");
+        };
+        assert_eq!(
+            told.record.rules,
+            ExtractionRules::Site("example.com".to_owned())
+        );
+        assert!(!told.markdown.contains("Subscribe"), "{}", told.markdown);
+    }
+
+    /// A refusal carries the rule too. A share measured on a document a rule narrowed is not
+    /// comparable with one measured on a whole page, and the two numbers only stay usable for
+    /// calibration if a reader can tell them apart.
+    #[test]
+    fn a_refusal_names_the_rule_that_was_in_force() {
+        let refused = extract_with(
+            &front_page(),
+            Some("The Slow Kitchen"),
+            &rules_for_example(r#"{"strip": ["nothing-here"]}"#),
+        );
+
+        let Extraction::Refused(refused) = refused else {
+            panic!("a front page was not refused: {refused:?}");
+        };
+        assert_eq!(
+            refused.rules,
+            ExtractionRules::Site("example.com".to_owned())
+        );
+    }
+
+    /// The sliver rule reads the document the scorer was given, so a rule that narrows the page
+    /// to the article answers the question the sliver rule asks. The operator said where the
+    /// prose is; a floor chosen against a handful of sites does not get to overrule that.
+    #[test]
+    fn a_rule_keeps_the_post_the_page_around_it_would_have_won() {
+        let page = format!(
+            "<html><body><div class=\"post\"><p>The element went in this morning and the first \
+             loaf since March came out of it an hour ago. It is not a good loaf. The thermostat \
+             reads twenty degrees low and I have not compensated for it yet, so the crust is \
+             pale and the crumb is tighter than it should be. But the oven works, which it has \
+             not done since the spring.</p></div>\
+             <aside class=\"archive\"><h2>Everything else</h2>{}</aside></body></html>",
+            "<p>Keeping a sourdough starter alive through a long cold winter, and what it costs \
+             you in flour to do it, is a question with more than one honest answer.</p>"
+                .repeat(20)
+        );
+
+        let alone = extract_html(&page, Some("The oven is fixed"));
+        let Extraction::Article(alone) = alone else {
+            panic!("expected an article, got {alone:?}");
+        };
+        assert!(
+            alone.markdown.contains("Keeping a sourdough starter alive"),
+            "the heuristic already got this page right, so the rule below proves nothing:\n{}",
+            alone.markdown
+        );
+
+        let told = extract_with(
+            &page,
+            Some("The oven is fixed"),
+            &rules_for_example(r#"{"body": ["div.post"]}"#),
+        );
+        let Extraction::Article(told) = told else {
+            panic!("the rule did not rescue the post: {told:?}");
+        };
+        assert!(told.markdown.contains("The element went in this morning"));
+        assert!(
+            !told.markdown.contains("Keeping a sourdough starter alive"),
+            "{}",
+            told.markdown
+        );
+        // The share is measured on what the scorer was handed, which the rule narrowed, so the
+        // post is not a sliver of a page it is no longer part of.
+        let share = told
+            .record
+            .share
+            .expect("a version 2 record measures its share");
+        assert_eq!(share.article_chars, share.page_chars, "{share:?}");
+    }
+
+    /// A rule that names where the article is says something about every page of the host, and
+    /// the ones that do not have it are the listings the sliver rule cannot catch, because a
+    /// listing carrying the opening paragraph of each entry is genuine prose.
+    #[test]
+    fn a_page_that_does_not_have_the_article_a_rule_names_is_passed_over() {
+        let extracted = extract_with(
+            &article_page(""),
+            Some("t"),
+            &rules_for_example(r#"{"body": ["article.story"]}"#),
+        );
+
+        assert_eq!(extracted, Extraction::Nothing);
+    }
+
+    /// A rule reaches the host it names and no other, checked through the whole entry point
+    /// rather than only where the lookup happens: a rule that silently applied to every page
+    /// would strip a selector out of sites that never asked for it.
+    #[test]
+    fn a_rule_for_another_host_leaves_this_page_alone() {
+        let (rules, unused) = SiteRules::parse(
+            r#"{"hosts": {"other.example": {"strip": ["p"]}}}"#,
+            "a test",
+        );
+        assert!(unused.is_empty(), "{unused:?}");
+
+        let extracted = extract_with(&article_page(""), Some("t"), &rules);
+        let Extraction::Article(article) = extracted else {
+            panic!("expected an article, got {extracted:?}");
+        };
+        assert_eq!(article.record.rules, ExtractionRules::Heuristic);
+        assert!(article.markdown.contains("Bread is mostly patience"));
+    }
+
+    /// The field stays one string across both variants. Every reader that filters on it compares
+    /// it to a string, `jq` at a prompt included, and turning it into an object for the second
+    /// variant would break all of them.
+    #[test]
+    fn the_rule_a_record_names_survives_a_round_trip_as_one_string() {
+        for (rules, spelled) in [
+            (ExtractionRules::Heuristic, "\"heuristic\""),
+            (
+                ExtractionRules::Site("lwn.net".to_owned()),
+                "\"site:lwn.net\"",
+            ),
+        ] {
+            let written = serde_json::to_string(&rules).expect("a record is writable");
+            assert_eq!(written, spelled);
+            assert_eq!(
+                serde_json::from_str::<ExtractionRules>(&written).expect("readable"),
+                rules
+            );
+        }
+
+        // A record naming rules this extractor cannot account for is refused rather than read as
+        // the heuristic, which would claim the page was read with nothing said about it.
+        for unreadable in ["\"site:\"", "\"\"", "\"site\"", "\"whatever\"", "{}"] {
+            assert!(
+                serde_json::from_str::<ExtractionRules>(unreadable).is_err(),
+                "{unreadable} was read as an extraction rule"
+            );
+        }
     }
 
     #[test]
@@ -455,6 +663,7 @@ mod tests {
                 final_url: "https://example.com/",
             },
             None,
+            &SiteRules::default(),
         )
         .expect("readable");
         let Extraction::Article(article) = extracted else {

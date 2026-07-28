@@ -8,6 +8,7 @@
 pub mod capture;
 pub mod export;
 pub mod list;
+pub mod repass;
 
 use std::io::{self, Write as _};
 

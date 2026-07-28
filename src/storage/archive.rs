@@ -15,12 +15,13 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::model::{
-    Asset, Capture, CaptureId, ContentHash, Item, ItemId, NewAsset, NewCapture, StoredBody,
+    Asset, Capture, CaptureId, ContentHash, Item, ItemId, MissedAsset, NewAsset, NewCapture,
+    StoredBody,
 };
 use super::walk::ArchiveWalk;
 use crate::canonical_url::CanonicalUrl;
 use crate::metadata::PageMetadata;
-use crate::readability::{Article, ArticleRecord, RefusedExtraction};
+use crate::readability::{Article, ArticleRecord, NonArticle, RefusedExtraction};
 
 const MARKER_FILE: &str = "archeion.json";
 /// The one file in an archive that a person writes rather than the program. It is beside the
@@ -30,6 +31,7 @@ const FORMAT_NAME: &str = "archeion-archive";
 const FORMAT_VERSION: u32 = 1;
 const MAX_ARTICLE_RECORD_BYTES: u64 = 64 * 1024;
 const MAX_ARTICLE_MARKDOWN_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_RECOVERED_ASSETS_RECORD_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Serialize, serde::Deserialize)]
 struct FormatMarker {
@@ -49,6 +51,13 @@ struct StoredArticle {
     markdown_sha256: ContentHash,
     #[serde(flatten)]
     record: ArticleRecord,
+}
+
+#[derive(Debug, Default, Serialize, serde::Deserialize)]
+struct RecoveredAssets {
+    assets: Vec<Asset>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    assets_missed: Vec<MissedAsset>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -293,7 +302,9 @@ impl Archive {
                 markdown_sha256: ContentHash::of(article.markdown.as_bytes()),
                 record: article.record.clone(),
             },
-        )
+        )?;
+        self.remove_refused_extraction(url, capture)?;
+        self.remove_non_article(url, capture)
     }
 
     /// Writes what an extraction measured about a page it refused to call an article.
@@ -311,7 +322,9 @@ impl Archive {
         capture: &CaptureId,
         refused: &RefusedExtraction,
     ) -> Result<(), StorageError> {
-        write_json(&self.refused_extraction_path(url, capture), refused)
+        write_json(&self.refused_extraction_path(url, capture), refused)?;
+        self.remove_article_pair(url, capture)?;
+        self.remove_non_article(url, capture)
     }
 
     /// What an extraction refused to call an article, or `None`.
@@ -322,6 +335,31 @@ impl Archive {
     ) -> Result<Option<RefusedExtraction>, StorageError> {
         read_optional_bounded_json(
             &self.refused_extraction_path(url, capture),
+            MAX_ARTICLE_RECORD_BYTES,
+            "larger than an article record can be",
+        )
+    }
+
+    /// Marks a captured page as one the article extractor read and deliberately passed over.
+    pub fn write_non_article(
+        &self,
+        url: &CanonicalUrl,
+        capture: &CaptureId,
+        non_article: &NonArticle,
+    ) -> Result<(), StorageError> {
+        write_json(&self.non_article_path(url, capture), non_article)?;
+        self.remove_article_pair(url, capture)?;
+        self.remove_refused_extraction(url, capture)
+    }
+
+    /// What an extraction decided was not an article, or `None`.
+    pub fn read_non_article(
+        &self,
+        url: &CanonicalUrl,
+        capture: &CaptureId,
+    ) -> Result<Option<NonArticle>, StorageError> {
+        read_optional_bounded_json(
+            &self.non_article_path(url, capture),
             MAX_ARTICLE_RECORD_BYTES,
             "larger than an article record can be",
         )
@@ -388,12 +426,49 @@ impl Archive {
         url: &CanonicalUrl,
         capture: &CaptureId,
     ) -> Result<Capture, StorageError> {
-        read_optional_json(&self.capture_path(url, capture))?.ok_or_else(|| {
-            StorageError::NoSuchCapture {
+        let mut capture_record: Capture = read_optional_json(&self.capture_path(url, capture))?
+            .ok_or_else(|| StorageError::NoSuchCapture {
                 url: url.to_string(),
                 capture: capture.to_string(),
-            }
-        })
+            })?;
+        let recovered = self.read_recovered_assets(url, capture)?;
+        merge_recovered_assets(&mut capture_record, recovered.assets);
+        merge_recovered_misses(&mut capture_record, recovered.assets_missed);
+        Ok(capture_record)
+    }
+
+    /// Adds assets recovered after the original capture without rewriting that capture record.
+    ///
+    /// The capture id names the assets present when the page was filed, so a later fetch of a
+    /// missed subresource cannot honestly be spliced into that record. This sidecar is the
+    /// derived supplement a reader folds in when it wants the best current view of the capture.
+    pub fn add_recovered_assets(
+        &self,
+        url: &CanonicalUrl,
+        capture: &CaptureId,
+        assets: &[Asset],
+        missed: &[MissedAsset],
+    ) -> Result<(), StorageError> {
+        if assets.is_empty() && missed.is_empty() {
+            return Ok(());
+        }
+        let mut recovered = self.read_recovered_assets(url, capture)?;
+        merge_asset_lists(&mut recovered.assets, assets.iter().cloned());
+        merge_miss_lists(&mut recovered.assets_missed, missed.iter().cloned());
+        write_json(&self.recovered_assets_path(url, capture), &recovered)
+    }
+
+    fn read_recovered_assets(
+        &self,
+        url: &CanonicalUrl,
+        capture: &CaptureId,
+    ) -> Result<RecoveredAssets, StorageError> {
+        Ok(read_optional_bounded_json(
+            &self.recovered_assets_path(url, capture),
+            MAX_RECOVERED_ASSETS_RECORD_BYTES,
+            "larger than a recovered assets record can be",
+        )?
+        .unwrap_or_default())
     }
 
     /// Every capture of an item, oldest first, which is the order the ids already sort in.
@@ -529,6 +604,18 @@ impl Archive {
             .join(format!("{capture}.article-refused.json"))
     }
 
+    fn non_article_path(&self, url: &CanonicalUrl, capture: &CaptureId) -> PathBuf {
+        self.item_dir(url)
+            .join("captures")
+            .join(format!("{capture}.article-not-found.json"))
+    }
+
+    fn recovered_assets_path(&self, url: &CanonicalUrl, capture: &CaptureId) -> PathBuf {
+        self.item_dir(url)
+            .join("captures")
+            .join(format!("{capture}.assets-recovered.json"))
+    }
+
     fn body_path(&self, hash: &ContentHash) -> PathBuf {
         let (first, second) = hash.shard();
         self.root
@@ -537,6 +624,86 @@ impl Archive {
             .join(first)
             .join(second)
             .join(hash.as_str())
+    }
+
+    fn remove_article_pair(
+        &self,
+        url: &CanonicalUrl,
+        capture: &CaptureId,
+    ) -> Result<(), StorageError> {
+        remove_optional_file(&self.article_record_path(url, capture))?;
+        remove_optional_file(&self.article_markdown_path(url, capture))
+    }
+
+    fn remove_refused_extraction(
+        &self,
+        url: &CanonicalUrl,
+        capture: &CaptureId,
+    ) -> Result<(), StorageError> {
+        remove_optional_file(&self.refused_extraction_path(url, capture))
+    }
+
+    fn remove_non_article(
+        &self,
+        url: &CanonicalUrl,
+        capture: &CaptureId,
+    ) -> Result<(), StorageError> {
+        remove_optional_file(&self.non_article_path(url, capture))
+    }
+}
+
+fn merge_recovered_assets(capture: &mut Capture, recovered: Vec<Asset>) {
+    merge_asset_lists(&mut capture.assets, recovered);
+    capture.assets_missed.retain(|missed| {
+        !capture
+            .assets
+            .iter()
+            .any(|asset| asset.requested_url == missed.url || asset.final_url == missed.url)
+    });
+}
+
+fn merge_recovered_misses(capture: &mut Capture, recovered: Vec<MissedAsset>) {
+    merge_miss_lists(&mut capture.assets_missed, recovered);
+    capture.assets_missed.retain(|missed| {
+        !capture
+            .assets
+            .iter()
+            .any(|asset| asset.requested_url == missed.url || asset.final_url == missed.url)
+    });
+}
+
+fn merge_asset_lists(known: &mut Vec<Asset>, incoming: impl IntoIterator<Item = Asset>) {
+    for asset in incoming {
+        if !known.iter().any(|known| same_asset(known, &asset)) {
+            known.push(asset);
+        }
+    }
+}
+
+fn merge_miss_lists(known: &mut Vec<MissedAsset>, incoming: impl IntoIterator<Item = MissedAsset>) {
+    for missed in incoming {
+        if let Some(existing) = known.iter_mut().find(|known| known.url == missed.url) {
+            *existing = missed;
+        } else {
+            known.push(missed);
+        }
+    }
+}
+
+fn same_asset(left: &Asset, right: &Asset) -> bool {
+    left.requested_url == right.requested_url
+        && left.final_url == right.final_url
+        && left.body.sha256 == right.body.sha256
+}
+
+fn remove_optional_file(path: &Path) -> Result<(), StorageError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(StorageError::Io {
+            path: path.to_owned(),
+            source,
+        }),
     }
 }
 

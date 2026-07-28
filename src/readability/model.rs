@@ -156,16 +156,27 @@ pub struct Article {
 
 /// What extraction made of one capture.
 ///
-/// The two ways of not producing an article are separate answers because only one of them has
-/// anything to say. A page that is not markup, or whose markup holds nothing the scorer would
-/// call prose, is most of the web and is passed over in silence. A page that did produce prose
-/// and was then refused is a disagreement between the algorithm and the rule below it, and
-/// that disagreement is the only material either number can ever be corrected against.
+/// The three ways of not producing an article are separate answers because each says something
+/// different. A page that is not markup has nothing this extractor reads. A page that is markup
+/// but not an article is worth marking so a later pass does not spend the same parse again. A
+/// page that produced prose and was then refused is a disagreement between the algorithm and the
+/// rule below it, and that disagreement is the material the numbers can be corrected against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Extraction {
     Article(Article),
     Refused(RefusedExtraction),
+    NotArticle(NonArticle),
     Nothing,
+}
+
+/// A page the extractor read and declined to call an article.
+///
+/// This is narrower than `Extraction::Nothing`: a PDF or an image has nothing this extractor
+/// reads, while this record says HTML was read and the answer was deliberately no.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NonArticle {
+    pub extractor_version: u32,
+    pub rules: ExtractionRules,
 }
 
 /// Prose that came out of a page and was not stored as an article.

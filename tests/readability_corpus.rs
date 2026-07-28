@@ -148,7 +148,7 @@ fn every_page_in_the_corpus_extracts_within_its_declared_bounds() {
                 );
             }
             (Outcome::Refused, Extraction::Refused(_)) => {}
-            (Outcome::Nothing, Extraction::Nothing) => {}
+            (Outcome::Nothing, Extraction::NotArticle(_)) => {}
             (expected, Extraction::Article(article)) => panic!(
                 "{name} is declared {expected:?}, and an article was extracted:\n{}",
                 article.markdown
@@ -182,7 +182,7 @@ fn no_rule_in_the_corpus_is_decorative() {
                     violations(&expected, article).is_empty()
                 }
                 (Outcome::Refused, Extraction::Refused(_)) => true,
-                (Outcome::Nothing, Extraction::Nothing) => true,
+                (Outcome::Nothing, Extraction::NotArticle(_)) => true,
                 _ => false,
             };
             held.then(|| format!("{name} declares a rule and extracts the same without it"))

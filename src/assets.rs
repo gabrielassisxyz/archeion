@@ -212,7 +212,6 @@ impl<'a> AssetCapture<'a> {
         Ok(captured)
     }
 
-    /// Fetches one subresource and stores it, or learns why it will not be stored.
     fn ask_for(&mut self, url: &str) -> Result<Asked, StorageError> {
         // Screened before the engine is asked, and not only because the engine refuses these
         // addresses as well. Handing one over means a request that never leaves the machine and
@@ -284,6 +283,24 @@ impl<'a> AssetCapture<'a> {
         self.seed
             .deadline
             .is_some_and(|budget| self.started.elapsed() >= budget)
+    }
+}
+
+/// Whether a missed subresource is one a later pass may ask for again.
+///
+/// A response that never came is not retried blindly: this pass is not a crawl. It spends
+/// bandwidth only when the archive itself stopped asking, hit a ceiling, or had run out of
+/// budget before the URL was tried.
+pub(crate) fn retryable_miss(reason: &AssetMiss) -> bool {
+    match reason {
+        AssetMiss::TooLarge { byte_len } => *byte_len <= MAX_ASSET_BYTES,
+        AssetMiss::CountCeilingReached
+        | AssetMiss::ByteCeilingReached
+        | AssetMiss::DeadlineReached
+        | AssetMiss::NothingWasAnswering => true,
+        AssetMiss::NoResponse { .. }
+        | AssetMiss::ArrivedShort { .. }
+        | AssetMiss::InsideANetwork => false,
     }
 }
 

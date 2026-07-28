@@ -256,6 +256,9 @@ fn capture_page(
         Extraction::Refused(refused) => {
             archive.write_refused_extraction(&canonical, &capture.id, refused)
         }
+        Extraction::NotArticle(non_article) => {
+            archive.write_non_article(&canonical, &capture.id, non_article)
+        }
         Extraction::Nothing => Ok(()),
     };
     if let Err(error) = stored_prose {
@@ -299,6 +302,7 @@ fn read_prose(
             run.extractions_refused += 1;
             Extraction::Refused(refused)
         }
+        Ok(Extraction::NotArticle(non_article)) => Extraction::NotArticle(non_article),
         Ok(Extraction::Nothing) => Extraction::Nothing,
         Err(refused) => {
             run.unreadable_articles.push(refused);

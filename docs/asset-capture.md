@@ -14,6 +14,8 @@ A capture with no reading beside it references nothing and the pass does nothing
 
 It runs before the capture record is written, because the record names what it holds and a capture id is derived from that. The cost is that a process dying mid-pass loses the page whole rather than leaving a record on disk that claims subresources nobody ever fetched. That is the trade taken on purpose.
 
+A later repass may ask again for subresources the capture already recorded as missed by archive policy, such as a count ceiling, a byte ceiling or a deadline. It does not crawl the page again and it does not blindly retry a URL that already got a direct no-response result. Recovered assets and retry results that are still missing are written beside the capture in `<capture-id>.assets-recovered.json`, because rewriting the capture record would make its id stop describing the fields it names.
+
 ## What is fetched
 
 Every kind extraction reports: images, stylesheets, scripts, media and icons.
@@ -73,7 +75,6 @@ Ceilings and deadlines are never remembered. A ceiling one capture reached says 
 - **A connection kept open across a page's subresources.** Each fetch builds its client around the subresource's own host, so a redirect of it is judged against the host it is on rather than against the page that named it. What that costs is a handshake per subresource. Caching a client per host is the obvious fix and is not built.
 - **Subresources named inside a subresource.** A stylesheet that imports another stylesheet, or names a font in a `url()`, is stored as the bytes it is, and nothing reads it to find what it refers to. Only the page's own markup is read. Same for what a script fetches when it runs, which nothing here executes.
 - **Rewriting the page.** The stored markup is exactly what arrived, pointing at the addresses it always pointed at. Turning an archived page plus its subresources back into something a browser renders offline is a replay concern, and replay is not built.
-- **A pass over an existing archive.** Subresources are acquired at capture time only. A capture already on disk with references nobody fetched stays that way. The list is in the derived record, so the pass that fixes it needs no crawl, and it does not exist yet.
 
 ## Testing it
 

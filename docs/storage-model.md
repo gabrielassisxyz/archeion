@@ -29,6 +29,8 @@ An asset arrives at the capture already stored, as a record, rather than as byte
   items/<host>/<item-id>/captures/<capture-id>.article.md     its prose, if it had any
   items/<host>/<item-id>/captures/<capture-id>.article.json   what is known about that prose
   items/<host>/<item-id>/captures/<capture-id>.article-refused.json  prose that was not kept as one
+  items/<host>/<item-id>/captures/<capture-id>.article-not-found.json  a page read and judged not to be an article
+  items/<host>/<item-id>/captures/<capture-id>.assets-recovered.json  subresources fetched after the capture
 ```
 
 A real archive holding a single capture of one page, with one stylesheet as its asset:
@@ -139,6 +141,10 @@ Beside each capture there may be a `<capture-id>.metadata.json`, holding what wa
 Beside a capture that turned out to be an article there is also a `<capture-id>.article.md`, its prose with the navigation, sidebars and banners taken out, and a `<capture-id>.article.json` describing it. Most captures have neither, because most of the web is not an article. [`readability.md`](readability.md) has the rules and the ceilings.
 
 A capture that produced prose the extractor then refused to call an article gets a `<capture-id>.article-refused.json` in place of that pair: the measurements the refusal was made on, so the rule that made it can be checked against real pages later. It is one file and not a pair on purpose, since the document beside it is the claim the refusal exists to avoid making, and it stays derivable from the stored response. Only pages the extractor turned down are written here, never the many that simply held no prose.
+
+A capture whose HTML was read and judged not to be an article gets `<capture-id>.article-not-found.json`. It is a mark rather than a document: the pass has paid the parse and found no article, so a later pass can skip the same work until the extractor version or the host rules make the answer stale. It is not written for responses that were not pages at all, since an image or a PDF has nothing the article extractor reads.
+
+Subresources retried after the original capture are written in `<capture-id>.assets-recovered.json`. The capture record itself is not rewritten, because its id names the assets that were present when the capture was filed. A late asset, or a late answer that the asset is still missing, is a supplement to that record, not a different spelling of it. `Archive::read_capture` folds the sidecar into the returned capture, removes misses covered by recovered assets, and replaces old misses with the latest retry result, while the original capture JSON stays the observation it was.
 
 They are separate files because they have different lifetimes from the capture. The capture record is what the archive observed and is the part that cannot be recovered; these are readings of it, and a better extractor is expected to replace every one of them without touching a single recorded file. A capture with no derived file beside it is an ordinary state: the response may not be a page at all, or nothing has read it yet.
 

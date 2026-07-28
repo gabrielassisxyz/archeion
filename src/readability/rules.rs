@@ -190,6 +190,11 @@ impl SiteRules {
         Some(MatchedRule { host, rule })
     }
 
+    /// Whether this archive has any rule for the page's host.
+    pub fn has_rule_for(&self, url: &str) -> bool {
+        self.for_url(url).is_some()
+    }
+
     /// Whether anything at all was declared, so a caller can skip work it has no rules for.
     pub fn is_empty(&self) -> bool {
         self.hosts.is_empty()

@@ -174,7 +174,7 @@ Two known gaps, neither built:
 
 ## What a hostile page costs
 
-The archive fetches addresses it was pointed at by other pages. Two of the libraries it hands them to have costs that grow faster than the input, so a page a few hundred kilobytes long can be built to cost minutes, and every ceiling here exists because a measurement said so.
+The archive fetches addresses it was pointed at by other pages. Two of the libraries it hands them to have costs that grow faster than the input, so a page a few hundred kilobytes long can be built to cost minutes, and the cost ceilings here exist because a measurement said so. The excerpt ceiling is different: it protects the size of a review clue whose purpose is to identify the refused prose, not to store the page's whole description.
 
 | ceiling | value | what it bounds | where it lands |
 |---|---|---|---|
@@ -182,9 +182,10 @@ The archive fetches addresses it was pointed at by other pages. Two of the libra
 | open elements | 2 048 | the parse | the run report |
 | nesting depth | 256 | the scoring pass | the run report |
 | elements scored | 50 000 | the scoring pass on a wide document | the run report |
+| excerpt kept | 4 KiB | the review clue copied from page-controlled metadata | the stored record |
 | Markdown kept | 1 MiB | the file that gets written | the stored record |
 
-Only the last is recorded in the archive, as `truncated`, because it is the only one where an article still exists to describe. The other four produce no article at all, so what they leave is an entry in the run's report naming the URL and the ceiling. That is the honest state of it: a page refused for cost and a page that simply was not an article look the same on disk.
+Only the last two are recorded in the archive, as `truncated`, because they are the ones where a derived record still exists to describe what was cut. The first four produce no article or refusal record at all, so what they leave is an entry in the run's report naming the URL and the ceiling. That is the honest state of it: a page refused for cost and a page that simply was not an article look the same on disk.
 
 ### Nesting depth, and what the first measurement of it got wrong
 
@@ -277,11 +278,24 @@ A refused page gets a record of its own instead of this pair, holding the same m
 
 There is no field naming the rule that refused it. One rule refuses here and its inputs are the two counts, so the comparison is readable from the record itself; a second rule is what would make naming them worth a field, and it will arrive with its own version bump.
 
-The excerpt is the one field here a page controls the length of, and the reader of these records refuses a file over 64 KiB. A page serving an enormous description can therefore write a refusal that will not read back, which is reported by path rather than silently skipped. The article record has carried the same hazard since before this rule, and bounding both is its own change.
+The excerpt is the one field here a page controls the length of, and the reader of these records refuses a file over 64 KiB. A page serving an enormous description could therefore write a refusal that would not read back, which would be reported by path rather than silently skipped. Both article and refusal records cut the excerpt to 4 KiB before writing. When that happens, `truncated` carries `excerpt`, and the stored value is only a prefix kept for review:
+
+```json
+{
+  "extractor_version": 2,
+  "rules": "heuristic",
+  "share": {
+    "article_chars": 137,
+    "page_chars": 1188
+  },
+  "excerpt": "Written by hand, published from a laptop on a kitchen table.",
+  "truncated": ["excerpt"]
+}
+```
 
 `rules` names what produced this extraction: `heuristic` when nothing was said about the host or when what was said matched nothing on this page, and `site:<host>` when a rule actually reached it. It stays one string across both, because every reader that filters on it compares it to a string and turning it into an object for the second case would break all of them for nothing. A value this extractor cannot account for is refused rather than read as `heuristic`, which would claim a page was read with nothing said about it.
 
-`byline` is what the algorithm found in the page's own markup and is not the resolved author in the metadata record: the two disagree often, and collapsing them would hide which one to look at when an attribution comes out wrong. `word_count` counts the prose and not the heading, which is a title the metadata record already holds; it stays a rough figure for sorting and filtering, which is why it is not what the sliver rule weighs. `truncated` is absent when nothing was cut, which is the ordinary case.
+`byline` is what the algorithm found in the page's own markup and is not the resolved author in the metadata record: the two disagree often, and collapsing them would hide which one to look at when an attribution comes out wrong. `word_count` counts the prose and not the heading, which is a title the metadata record already holds; it stays a rough figure for sorting and filtering, which is why it is not what the sliver rule weighs. `truncated` is absent when nothing was cut, which is the ordinary case. On an article record, `markdown` means the prose file beside the record is a prefix of the article, and `excerpt` means the excerpt field itself is a prefix. On a refusal record, only `excerpt` can appear there.
 
 `markdown_sha256` is the address of the document beside it, and it is what makes the pair safe to rewrite. Ordering alone is enough only the first time: writing over an existing pair and stopping between the two files leaves new prose beside an old record, both present, both parsing, and every field describing something that is no longer there. A reader that finds the two disagreeing reports no article, because the response the article was derived from is still in the archive and the pass that re-extracts will simply redo it.
 

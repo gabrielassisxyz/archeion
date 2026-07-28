@@ -65,10 +65,12 @@ impl<'de> Deserialize<'de> for ExtractionRules {
     }
 }
 
-/// A ceiling the article reached, recorded rather than silently applied.
+/// A ceiling the extraction reached, recorded rather than silently applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArticleBound {
+    /// The excerpt was cut. What is stored is enough for review, not the whole page claim.
+    Excerpt,
     /// The Markdown was cut. What is stored is a prefix of the article, not the article.
     Markdown,
 }
@@ -186,4 +188,6 @@ pub struct RefusedExtraction {
     pub share: ProseShare,
     /// What the prose said, so that reviewing the decision does not require re-deriving it.
     pub excerpt: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub truncated: Vec<ArticleBound>,
 }

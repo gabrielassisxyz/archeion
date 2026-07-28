@@ -310,6 +310,7 @@ fn a_refused_extraction_is_stored_where_the_article_record_would_have_been() {
             page_chars: 1188,
         },
         excerpt: Some("Written by hand, published from a laptop.".to_owned()),
+        truncated: Vec::new(),
     };
 
     archive
@@ -345,6 +346,50 @@ fn a_refused_extraction_is_stored_where_the_article_record_would_have_been() {
             .expect("reading an article is not an error"),
         None
     );
+}
+
+#[test]
+fn a_refusal_written_before_truncation_was_recorded_still_reads() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/").expect("valid url");
+    let capture = archive
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
+        .expect("capture is stored");
+    let captures_dir = dir
+        .path()
+        .join("items")
+        .join("example.com")
+        .join(ItemId::of(&url).as_str())
+        .join("captures");
+    std::fs::write(
+        captures_dir.join(format!("{}.article-refused.json", capture.id)),
+        r#"{
+  "extractor_version": 2,
+  "rules": "heuristic",
+  "share": {
+    "article_chars": 137,
+    "page_chars": 1188
+  },
+  "excerpt": "Written by hand, published from a laptop."
+}"#,
+    )
+    .expect("the older refusal is written");
+
+    let refused = archive
+        .read_refused_extraction(&url, &capture.id)
+        .expect("the older refusal reads")
+        .expect("the refusal is there");
+    assert_eq!(
+        refused.excerpt.as_deref(),
+        Some("Written by hand, published from a laptop.")
+    );
+    assert!(refused.truncated.is_empty());
 }
 
 /// The failure ordering alone does not catch: writing over a pair that is already there. The

@@ -82,6 +82,7 @@ const MAX_ELEMENTS_TO_SCORE: usize = 50_000;
 /// move against that material rather than stay where a first guess put them, on the same terms
 /// as the ceilings above.
 const MIN_ARTICLE_CHARS: usize = 300;
+const MAX_EXCERPT_BYTES: usize = 4 * 1024;
 
 /// The share is a quarter, compared by multiplying out. Integer arithmetic has no rounding to
 /// reason about, and it answers "keep" for a page holding no text rather than dividing by it.
@@ -180,7 +181,8 @@ pub fn extract(
         Err(error) => return Err(refused(error.to_string())),
     };
 
-    let excerpt = non_empty(article.excerpt.as_deref());
+    let mut truncated = Vec::new();
+    let excerpt = bounded_excerpt(article.excerpt.as_deref(), &mut truncated);
     // Measured on the extracted text rather than on the Markdown below, so that both sides of
     // the rule count the same thing. Markdown carries link destinations and list markers that
     // the page never showed a reader, which is enough to put a short article's share above one.
@@ -195,9 +197,9 @@ pub fn extract(
             rules: applied,
             share,
             excerpt,
+            truncated,
         }));
     }
-    let mut truncated = Vec::new();
     let prose = markdown::render(&article.content, title, &mut truncated).map_err(&refused)?;
     Ok(Extraction::Article(Article {
         record: ArticleRecord {
@@ -217,6 +219,16 @@ pub fn extract(
         },
         markdown: prose.document,
     }))
+}
+
+fn bounded_excerpt(excerpt: Option<&str>, truncated: &mut Vec<ArticleBound>) -> Option<String> {
+    let excerpt = non_empty(excerpt)?;
+    if excerpt.len() <= MAX_EXCERPT_BYTES {
+        return Some(excerpt);
+    }
+    let end = markdown::floor_char_boundary(&excerpt, MAX_EXCERPT_BYTES);
+    truncated.push(ArticleBound::Excerpt);
+    Some(excerpt[..end].to_owned())
 }
 
 impl ProseShare {
@@ -384,6 +396,45 @@ mod tests {
         );
         assert_eq!(refused.share.article_chars, 137, "{refused:?}");
         assert!(refused.share.page_chars > 1_000, "{refused:?}");
+    }
+
+    #[test]
+    fn an_article_records_when_its_excerpt_was_cut() {
+        let excerpt = "A".repeat(MAX_EXCERPT_BYTES - 1) + "é beyond the ceiling";
+        let article = article_from(
+            &format!(
+                "<html><head><meta name=\"description\" content=\"{excerpt}\"></head>\
+                 <body><article><h1>How to bake bread</h1>{}</article></body></html>",
+                "<p>Bread is mostly patience, and the dough will tell you when it is ready.</p>"
+                    .repeat(8)
+            ),
+            Some("How to bake bread"),
+        );
+
+        let stored = article.record.excerpt.expect("excerpt");
+        assert_eq!(stored.len(), MAX_EXCERPT_BYTES - 1);
+        assert!(excerpt.starts_with(&stored));
+        assert_eq!(article.record.truncated, [ArticleBound::Excerpt]);
+    }
+
+    #[test]
+    fn a_refusal_records_when_its_excerpt_was_cut() {
+        let excerpt = "A".repeat(MAX_EXCERPT_BYTES - 1) + "é beyond the ceiling";
+        let page = front_page().replacen(
+            "<html>",
+            &format!("<html><head><meta name=\"description\" content=\"{excerpt}\"></head>"),
+            1,
+        );
+
+        let extracted = extract_html(&page, Some("The Slow Kitchen"));
+        let Extraction::Refused(refused) = extracted else {
+            panic!("a front page was not refused: {extracted:?}");
+        };
+
+        let stored = refused.excerpt.expect("excerpt");
+        assert_eq!(stored.len(), MAX_EXCERPT_BYTES - 1);
+        assert!(excerpt.starts_with(&stored));
+        assert_eq!(refused.truncated, [ArticleBound::Excerpt]);
     }
 
     /// The other half of the rule, and the reason it is not a floor on length alone. A note

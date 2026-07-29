@@ -83,13 +83,61 @@ fn anchor(handlers: &dyn Handlers, element: Element, base: Option<&Url>) -> Opti
         return Some(handlers.walk_children(element.node));
     };
     let content = handlers.walk_children(element.node).content;
-    Some(inline_link(&content, &destination, link_title(&element)).into())
+    let inline = inline_content(&content);
+    if inline.is_empty() {
+        return Some(inline_link(&inline, &destination, link_title(&element)).into());
+    }
+    // Whitespace at either edge moves outside the link rather than being dropped with the rest
+    // of the trimming. An anchor padded by the markup around it, which indented HTML produces
+    // constantly, otherwise loses the space that separated it from the word before or after,
+    // and the stored prose reads with two words run together.
+    let leading = if content.starts_with(char::is_whitespace) {
+        " "
+    } else {
+        ""
+    };
+    let trailing = if content.ends_with(char::is_whitespace) {
+        " "
+    } else {
+        ""
+    };
+    let link = inline_link(&inline, &destination, link_title(&element));
+    Some(format!("{leading}{link}{trailing}").into())
+}
+
+/// An anchor's children, reduced to something the inline link spelling can hold.
+///
+/// A link is written `[text](destination)`, which is inline syntax, and an anchor is allowed to
+/// wrap block content: a picture in its own container is the ordinary case and a whole card is
+/// the ambitious one. Emitted as it stands, the block's own blank lines end the paragraph the
+/// `[` opened, so a reader gets a paragraph holding a bare `[`, then the content, then a
+/// paragraph holding `](destination)` as literal characters. The destination is then not a link
+/// to anything, which also costs the export its one mechanism for turning a link between two
+/// archived pages into a path between two notes.
+///
+/// Trimming is what the common case needs, since a container around one image leaves the image
+/// alone once its surrounding blank lines are gone. Anything still spanning lines after that has
+/// no inline spelling at all, so its whitespace is collapsed: the link survives, which loses the
+/// block structure inside it and keeps both the text and the destination. Losing the arrangement
+/// of something that was one link to begin with is the smaller loss.
+///
+/// The condition is one line and not the absence of a blank line, which is a weaker test that
+/// lets through exactly the constructs that do the most damage. A list is spelled with a single
+/// newline between its items, and a list item interrupts a paragraph, so the note gets a bare
+/// opening bracket and then a list the page wrote into it. A fenced code block is worse: it can
+/// interrupt a paragraph too, and its closing fence lands after the destination, so everything in
+/// the note past that link becomes one unterminated code block, taking every later image and
+/// cross-note destination out of the export's reach with it.
+fn inline_content(content: &str) -> String {
+    let trimmed = content.trim();
+    if !trimmed.contains('\n') {
+        return trimmed.to_owned();
+    }
+    trimmed.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn image(element: Element, base: Option<&Url>) -> Option<HandlerResult> {
-    let destination = attr(&element, "src")
-        .or_else(|| attr(&element, "href"))
-        .and_then(|destination| readable_destination(&destination, base));
+    let destination = image_destination(&element, base);
     let description = attr(&element, "alt")
         .map(|alt| only_a_description(&alt))
         .unwrap_or_default();
@@ -105,6 +153,41 @@ fn image(element: Element, base: Option<&Url>) -> Option<HandlerResult> {
         None if description.is_empty() => Some(String::new().into()),
         None => Some(markdown_text(&description).into()),
     }
+}
+
+/// The address worth writing into the note for an image, out of everything the element offers.
+///
+/// A page that lists the same picture at several sizes is offering a choice a browser makes
+/// against a viewport, and an archive has none: what it has is a reader who wants the picture,
+/// so the widest candidate wins. Taking `src` instead is how a note ends up showing a thumbnail
+/// while the archive holds the full size file beside it.
+///
+/// `srcset` is consulted before `src` for a second reason that is not about quality. The
+/// readability layer's own lazy-image repair copies an attribute whose value merely contains an
+/// image extension over one of these two, choosing `srcset` when the value also looks like a
+/// candidate list and `src` otherwise. A platform describing its pictures with a JSON descriptor
+/// in a data attribute lands in the second case: the descriptor names a `.jpeg` inside itself,
+/// replaces `src`, and becomes an address resolved against the page's own path that no server
+/// answers, while the page's own `srcset` is left alone. Preferring `srcset` steps around that,
+/// and does not pretend to survive the case where the repair overwrote `srcset` instead.
+///
+/// A candidate is taken only when it is already absolute, and the whole preference is abandoned
+/// rather than defended when it does not produce a destination the archive keeps. The layer below
+/// absolutizes what it can reach, so a candidate still relative here is one it could not, and
+/// resolving it against the response address would invent an origin the page never named. And a
+/// `srcset` holding nothing usable, an inline placeholder being the ordinary case, must not cost
+/// the picture that `src` was pointing at all along.
+fn image_destination(element: &Element<'_>, base: Option<&Url>) -> Option<String> {
+    if let Some(srcset) = attr(element, "srcset")
+        && let Some(candidate) = crate::srcset::widest(&srcset)
+        && Url::parse(candidate).is_ok()
+        && let Some(destination) = readable_destination(candidate, base)
+    {
+        return Some(destination);
+    }
+    attr(element, "src")
+        .or_else(|| attr(element, "href"))
+        .and_then(|destination| readable_destination(&destination, base))
 }
 
 fn attr(element: &Element<'_>, name: &str) -> Option<String> {
@@ -457,6 +540,198 @@ mod tests {
         );
 
         assert_eq!(prose.document, "click");
+    }
+
+    /// An anchor around a picture in its own container used to produce a paragraph holding a
+    /// bare `[`, then the image, then a paragraph holding `](destination)` as literal text. The
+    /// destination was then not a link to anything, so the export could not turn it into a path
+    /// to the note beside it either.
+    #[test]
+    fn an_anchor_wrapping_an_image_is_one_inline_link() {
+        // Not wrapped in a paragraph: a `<div>` closes an open `<p>`, and the reconstructed
+        // tree would then hold an empty anchor beside the real one, which is a fact about the
+        // fixture rather than about the conversion.
+        let prose = rendered(
+            r#"<a href="https://example.com/two"><div><img src="https://example.com/p.png" alt="a loaf"></div></a>"#,
+            None,
+        );
+
+        assert_eq!(
+            prose.document,
+            "[![a loaf](https://example.com/p.png)](https://example.com/two)"
+        );
+    }
+
+    #[test]
+    fn an_anchor_wrapping_an_image_and_text_keeps_both_inside_the_link() {
+        let prose = rendered(
+            r#"<a href="https://example.com/two"><div><img src="https://example.com/p.png" alt="a loaf"></div><div>Read on</div></a>"#,
+            None,
+        );
+
+        assert_eq!(
+            prose.document,
+            "[![a loaf](https://example.com/p.png) Read on](https://example.com/two)"
+        );
+    }
+
+    /// Content that is genuinely several blocks has no inline spelling, so the arrangement is
+    /// what gives way. What must not happen is the destination surviving as literal characters:
+    /// that is the broken syntax this pair of tests exists to keep out.
+    #[test]
+    fn an_anchor_wrapping_blocks_keeps_the_link_and_loses_the_arrangement() {
+        let prose = rendered(
+            r#"<a href="https://example.com/two"><h2>Bread</h2><p>Is patience.</p></a>"#,
+            None,
+        );
+
+        assert!(!prose.document.contains("\n\n]("), "{}", prose.document);
+        assert!(prose.document.contains("Bread"), "{}", prose.document);
+        assert!(
+            prose.document.contains("Is patience."),
+            "{}",
+            prose.document
+        );
+        assert!(
+            prose.document.ends_with("](https://example.com/two)"),
+            "{}",
+            prose.document
+        );
+    }
+
+    /// A page offering one picture at several widths is offering a choice made against a
+    /// viewport the archive does not have. The reader wants the picture, so the widest wins,
+    /// wherever the page happened to put it and whatever the small default in `src` says.
+    #[test]
+    fn an_image_is_written_at_the_widest_size_the_page_offered() {
+        let prose = rendered(
+            r#"<p><img src="https://example.com/small.png"
+                      srcset="https://example.com/small.png 424w, https://example.com/large.png 1456w"
+                      alt="a loaf"></p>"#,
+            None,
+        );
+
+        assert_eq!(
+            prose.document, "![a loaf](https://example.com/large.png)",
+            "the note should carry the largest rendition the page listed"
+        );
+    }
+
+    #[test]
+    fn an_image_with_no_candidates_keeps_the_address_it_was_given() {
+        let prose = rendered(
+            r#"<p><img src="https://example.com/only.png" alt="a loaf"></p>"#,
+            None,
+        );
+
+        assert_eq!(prose.document, "![a loaf](https://example.com/only.png)");
+    }
+
+    /// The readability layer's lazy-image repair copies an attribute whose value merely holds an
+    /// image extension over `src`, and a platform describing its picture with a JSON descriptor
+    /// in a data attribute trips it: what reached the note was that descriptor, resolved against
+    /// the page's own path into an address no server answers.
+    ///
+    /// The repair lives in a dependency and is not what this pins. The descriptor is written into
+    /// `src` here directly, so what is asserted is the half this file owns, that a usable
+    /// candidate outranks whatever `src` turned out to hold.
+    #[test]
+    fn an_image_whose_source_was_replaced_by_a_descriptor_is_read_from_its_candidates() {
+        let prose = rendered(
+            r#"<p><img src="{&quot;src&quot;:&quot;https://cdn.example/one.jpeg&quot;,&quot;width&quot;:1192}"
+                      srcset="https://cdn.example/small.jpeg 424w, https://cdn.example/large.jpeg 1456w"
+                      alt="a loaf"></p>"#,
+            None,
+        );
+
+        assert_eq!(prose.document, "![a loaf](https://cdn.example/large.jpeg)");
+        assert!(
+            !prose.document.contains("%7B%22src%22"),
+            "the descriptor reached the note: {}",
+            prose.document
+        );
+    }
+
+    /// Content spanning lines is what breaks the inline spelling, and a blank line is only the
+    /// loudest way to span them. A list is joined by single newlines and a list item interrupts a
+    /// paragraph, so the weaker test let a page write a list into the note around a bare opening
+    /// bracket. A fenced code block is worse: its closing fence lands after the destination and
+    /// everything later in the note becomes one unterminated block, which takes every image and
+    /// cross-note destination after it out of the export's reach.
+    #[test]
+    fn an_anchor_wrapping_a_list_or_a_code_block_still_yields_one_line() {
+        for markup in [
+            r#"<a href="https://example.com/two"><ul><li>one</li><li>two</li></ul></a>"#,
+            r#"<a href="https://example.com/two"><pre><code>let x = 1;</code></pre></a>"#,
+            r#"<a href="https://example.com/two"><table><tr><td>one</td></tr></table></a>"#,
+        ] {
+            let prose = rendered(markup, None);
+
+            assert!(
+                !prose.document.contains('\n'),
+                "the link text still spans lines for {markup}: {}",
+                prose.document
+            );
+            assert!(
+                prose.document.ends_with("](https://example.com/two)"),
+                "{}",
+                prose.document
+            );
+        }
+    }
+
+    /// An anchor padded by the markup around it is what indented HTML produces constantly, and
+    /// trimming that padding away rather than moving it outside the link ran the words on either
+    /// side of it together in the stored prose.
+    #[test]
+    fn whitespace_around_an_anchor_survives_outside_the_link() {
+        let prose = rendered(
+            r#"<p>Read <a href="https://example.com/two">the recipe </a>and bake.</p>"#,
+            None,
+        );
+
+        assert_eq!(
+            prose.document,
+            "Read [the recipe](https://example.com/two) and bake."
+        );
+    }
+
+    /// A `srcset` holding nothing the archive keeps must not cost the picture `src` was pointing
+    /// at. An inline placeholder beside a real address is an ordinary lazy-loading spelling, and
+    /// the destination policy refuses it for the same reason it refuses one written in `src`.
+    #[test]
+    fn a_candidate_the_policy_refuses_falls_back_to_the_source_attribute() {
+        let prose = rendered(
+            r#"<p><img src="https://cdn.example/real.jpg"
+                      srcset="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=="
+                      alt="a loaf"></p>"#,
+            None,
+        );
+
+        assert_eq!(prose.document, "![a loaf](https://cdn.example/real.jpg)");
+    }
+
+    /// The layer below absolutizes what it can reach, so a candidate still relative here is one
+    /// it could not, and resolving it against the response address would invent an origin the
+    /// page never named. That is worse than falling back to the address it already resolved.
+    #[test]
+    fn a_relative_candidate_is_left_alone_rather_than_given_the_wrong_origin() {
+        let prose = rendered(
+            r#"<p><img src="https://cdn.example/assets/photo-800.jpg"
+                      srcset="photo-800.jpg 800w,photo-1600.jpg 1600w"
+                      alt="a loaf"></p>"#,
+            None,
+        );
+
+        assert_eq!(
+            prose.document,
+            "![a loaf](https://cdn.example/assets/photo-800.jpg)"
+        );
+        assert!(
+            !prose.document.contains("example.com/posts"),
+            "a candidate was resolved against the response address: {}",
+            prose.document
+        );
     }
 
     #[test]

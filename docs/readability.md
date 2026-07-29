@@ -75,6 +75,22 @@ The HTML path applies this while `href`, `src`, `alt` and `title` are still attr
 
 `EXTRACTOR_VERSION` is 3 for this change. Existing `heuristic` and `site:<host>` records can already contain headings or destinations injected through page attributes, so their Markdown did not merely miss future information. It said something under weaker rules. A repass must therefore treat them as stale and rebuild the derived article from the stored response before replacing it.
 
+### An image is written at the largest size the page offered
+
+A page that lists one picture at several sizes is offering a choice a browser makes against a viewport. An archive has no viewport, and what it has instead is a reader who wants the picture, so the widest candidate of a `srcset` is the address written into the article and `src` is what an image without candidates falls back to. Taking `src` first is how a note ends up naming a thumbnail while the archive holds the full size file beside it.
+
+The preference is abandoned rather than defended. A candidate is used only when it is already absolute, because the layer below absolutizes what it can reach and a candidate still relative afterwards is one it could not, so resolving it here against the response address would invent an origin the page never named. A candidate the destination policy above refuses, an inline placeholder being the ordinary case, falls back to `src` as well: a `srcset` holding nothing usable must not cost the picture that `src` was pointing at all along.
+
+Reading candidates first also steps around a repair in the layer below, which copies an attribute whose value merely contains an image extension over `src` or `srcset`. A platform that describes its pictures with a JSON descriptor in a data attribute has that descriptor land in `src`, where it becomes an address resolved against the page's own path that no server answers. Stepping around it is all this does: where that repair overwrote `srcset` instead, nothing here recovers the original.
+
+### An anchor around a picture is one link
+
+A link is inline syntax and an anchor is allowed to wrap block content, a picture inside its own container being the ordinary way a platform writes a linked image. Emitted as it stands, the block ends the paragraph the opening bracket started, and the note carries a bare `[`, the content, and then `](address)` as literal characters that no CommonMark reader sees as a link. The export finds the destinations it rewrites into paths between notes by reading the Markdown, so a destination spelled that way is one a collection cannot use to link itself together.
+
+An anchor's children are therefore reduced to one line. Trimming is what the common case needs; anything still spanning lines has no inline spelling at all and has its whitespace collapsed, which keeps the text and the destination and loses only the arrangement inside something that was one link to begin with. One line rather than the absence of a blank line, because a list is joined by single newlines and a list item interrupts a paragraph, and a fenced code block interrupts one too and would leave everything after that link inside an unterminated block. Whitespace at either edge moves outside the link rather than being dropped with the rest, or an anchor padded by the markup around it runs two words together.
+
+`EXTRACTOR_VERSION` is 4 for the two rules above. A record written under 3 names a different address for the same image and spells a linked picture as characters that are not a link, so it does not merely miss something added since: an export built from it differs from one built from a rebuild, and a repass has to treat it as stale.
+
 ## What is not an article
 
 Most of the web is not. A listing page, a shop, a homepage and the shell of an application that renders itself in the browser are all captures with prose worth nothing, and writing an empty article record for each would fill the archive with files that say nothing.

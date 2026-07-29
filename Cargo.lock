@@ -122,6 +122,7 @@ dependencies = [
  "jiff",
  "lol_html",
  "pulldown-cmark",
+ "quick-xml",
  "serde",
  "serde_json",
  "sha2",

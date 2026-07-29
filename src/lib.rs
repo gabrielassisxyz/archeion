@@ -6,6 +6,7 @@ pub mod export;
 pub mod metadata;
 pub mod readability;
 pub mod repass;
+pub mod sitemap;
 pub mod storage;
 
 pub use canonical_url::{CanonicalUrl, InvalidCanonicalUrl};

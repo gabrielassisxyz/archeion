@@ -27,6 +27,10 @@ Version 2 reads an attribute as the markup it is rather than as text, so a chara
 
 Version 3 does the same for the text inside a `<title>` element, which version 2 left out: a page whose only title is `Isn&#x27;t Efficient` kept the reference instead of the apostrophe. A page carrying an OpenGraph, Twitter or schema.org title was unaffected either way, since the document title is only ever read as the last resort, but a page relying on it, most of the plain web, had the same field say something else. A record written by version 2 is stale for the same reason a version 1 one was.
 
+Version 4 keeps one candidate of a `srcset`, the widest, where every earlier version kept them all. The subresource list stops being every address a page named and becomes the renditions the archive means to hold, which is a different claim about the same field: a version 3 record naming eight addresses for one photograph is not saying that this extractor would ask for eight. The list is what the asset pass spends its budget from, so a record left unredone keeps sending a repass after renditions of pictures the archive already holds.
+
+That bump has a consequence peculiar to this field, since the list is the one thing here a capture record also names. A capture is an immutable observation of what one run asked for and missed; this record is re-derived under whichever extractor ran last. Across a bump that changes which references are recorded, the two stop naming the same set, and comparing their counts, which both this project's documents invite, stops being sound until every capture has been recaptured rather than repassed.
+
 Adding this file to an archive is a compatible change and does not move the format version. A reader of format 1 that does not know about it walks past it, and `list_captures` still sees captures: the suffix makes the file stem no longer the shape of a capture id.
 
 ## What is read
@@ -36,7 +40,7 @@ Adding this file to an archive is a compatible change and does not move the form
 - **Every `<meta>` tag**, as written.
 - **Every JSON-LD block that parsed**, as written.
 - **Outbound links**, absolute, deduplicated, each with its `rel` and whether it stays on the host.
-- **Referenced subresources**, absolute, deduplicated, each with the role it was referenced in: image, stylesheet, script, media, icon.
+- **Referenced subresources**, absolute, deduplicated, each with the role it was referenced in: image, stylesheet, script, media, icon. One picture is one reference: a `srcset` offering the same picture at several sizes contributes the widest candidate it lists and nothing else.
 
 The raw `<meta>` list and the JSON-LD blocks are kept on top of the resolved fields, and that is deliberate duplication. They are small, they answer "where did that come from" without re-reading the body, and they let a field nobody has thought of yet be recovered from records already written.
 
@@ -78,6 +82,7 @@ Every reference is resolved against `<base href>` when the page has one and agai
 - **Anything that is not http or https is dropped.** A `javascript:`, `mailto:` or `data:` reference names something no capture can fetch, and keeping them would leave every consumer of the list to filter them again.
 - **The fragment is dropped**, for the reason canonicalization drops it: it is resolved by the client against bytes the server already sent, so two links differing only there name one fetch.
 - **The list is deduplicated**, links by address, subresources by address regardless of the role they appeared in, since the same file referenced twice is one fetch.
+- **A `srcset` contributes its widest candidate**, since every candidate is the same picture and an archive has no viewport to choose against. What it has instead is a reader who wants the best quality the page offered, which is what the conversion into a note already names, so the note keeps its picture offline rather than pointing back at a host. Keeping all of them cost a fetch and a copy per size for a picture already held: a publication writing two formats at four widths turned one photograph into eight addresses, four fifths of a collection's bytes, and turned the asset pass's ceiling of a hundred and twenty-eight references into a budget of sixteen photographs a page. The grouping is the attribute and nothing wider. A `<picture>` naming one photograph in two formats still costs two references, because a token stream cannot see that a `<source>` and an `<img>` stand under one parent, and pairing the two by their addresses would read a transformation network's path convention as though a page had promised it.
 
 These are not canonicalized. Canonicalization decides the address an item is filed under, and applying it here would record a page's links as something other than what the page wrote. The rules are applied when a link becomes an item, not before.
 

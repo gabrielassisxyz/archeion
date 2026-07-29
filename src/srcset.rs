@@ -1,10 +1,14 @@
 //! Reading the candidates a `srcset` lists.
 //!
-//! Two parts of this project read the same attribute for different reasons, and both are wrong
-//! in the same expensive way if they split it naively, so the grammar lives here once. Metadata
-//! extraction records every address the page listed; the Markdown conversion picks the one
-//! rendition worth showing a reader. Only the second needs the descriptor, and it is the reason
-//! this yields candidates rather than addresses.
+//! Two parts of this project read the same attribute, and both are wrong in the same expensive
+//! way if they split it naively, so the grammar lives here once. Metadata extraction records
+//! which rendition the archive will hold; the Markdown conversion names which one a note shows.
+//! They ask for the same candidate on purpose, the widest, since a note that names a rendition
+//! the archive did not keep has no picture offline at all.
+//!
+//! The split between the two functions is what keeps that agreement checkable rather than
+//! duplicated: `widest` is the only place the choice is made, and it yields candidates rather
+//! than addresses because the descriptor is what the choice is made on.
 
 /// One entry of a `srcset`: an address and the descriptor that followed it, if any.
 pub(crate) struct Candidate<'a> {
@@ -29,11 +33,12 @@ pub(crate) struct Candidate<'a> {
 /// carries no descriptor, are the separator. This is the specification's own reading, and the
 /// only one under which `a.png,b.png` is the single address a browser requests.
 ///
-/// What is deliberately not done is validating the descriptor. A browser drops a candidate
-/// whose descriptor is malformed, and this keeps it, because the two are answering different
-/// questions: a browser is choosing which one image to fetch for a viewport, and the archive is
-/// recording every address the page listed. It buys no safety either way, since a page that
-/// wants a request made writes a descriptor that is valid.
+/// What is deliberately not done is validating the descriptor. A browser drops a candidate whose
+/// descriptor is malformed, and this keeps it, because a candidate a page wrote badly is still
+/// an address the page offered: dropping it here would leave an attribute whose every descriptor
+/// is unreadable offering nothing at all. How much such a candidate is taken to offer is
+/// `rank_of`'s answer, and it is the same default a browser is left with. It buys no safety
+/// either way, since a page that wants a request made writes a descriptor that is valid.
 ///
 /// Lazy rather than collected, so an attribute holding more candidates than a caller will keep
 /// costs the caller's own ceiling rather than a vector the size of the attribute.
@@ -185,6 +190,17 @@ mod tests {
             .map(|candidate| (candidate.url, candidate.descriptor))
             .collect();
         assert_eq!(separated, [("/a.png", ""), ("/b.png", "")]);
+    }
+
+    /// The separator has three spellings the grammar has to agree on: a comma after
+    /// whitespace, a comma stuck to the end of a URL that carries no descriptor, and a run of
+    /// them around an empty candidate. None of the three may leave an empty address behind.
+    #[test]
+    fn a_candidate_separator_is_read_the_same_however_it_is_spelled() {
+        assert_eq!(
+            urls("/a.png,, /b.png 2x , /c.png"),
+            ["/a.png", "/b.png", "/c.png"]
+        );
     }
 
     #[test]

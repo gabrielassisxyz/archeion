@@ -130,7 +130,7 @@ A capture that did not get everything the page referenced carries one more field
   ]
 ```
 
-The reason is the point of the field. Comparing what the derived record says the page referenced against what the capture holds already shows that something is gone; only this says whether the archive refused it, and therefore whether a different number would have kept the page whole. It stays out of the capture fingerprint, and can only stay out because each asset contributes its address to that fingerprint as well as its bytes: two captures that agree on every asset they hold, address by address, referenced the same subresources and therefore missed the same ones. Hashing a failure would mean hashing a reason string that varies between two attempts at the same failure.
+The reason is the point of the field. Comparing what the derived record says the page referenced against what the capture holds already shows that something is gone, as long as the same extractor wrote both; only this says whether the archive refused it, and therefore whether a different number would have kept the page whole. It stays out of the capture fingerprint, and can only stay out because each asset contributes its address to that fingerprint as well as its bytes: two captures that agree on every asset they hold, address by address, referenced the same subresources and therefore missed the same ones. Hashing a failure would mean hashing a reason string that varies between two attempts at the same failure.
 
 Records are JSON, pretty printed. The format costs some bytes against the raw bodies it sits beside, and buys a file that `diff` and `grep` can work with and that any language will still parse in twenty years.
 

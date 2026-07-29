@@ -4,6 +4,7 @@
 //! itself recorded as missed. The page responses remain authoritative; metadata, articles and
 //! late assets are the derived layer this pass is allowed to replace.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::CanonicalUrl;
@@ -104,23 +105,14 @@ pub fn repass_archive(
                 continue;
             }
             run.captures_seen += 1;
-            if let Err(source) = recover_assets(
+            if let Err(source) = repass_one(
                 archive,
+                rules,
                 &item.canonical_url,
-                &capture_id,
                 &capture,
                 &mut assets,
                 &mut run,
             ) {
-                run.asset_fetches = assets.fetches();
-                return Err(RepassError::Storage {
-                    source,
-                    run: Box::new(run),
-                });
-            }
-            if let Err(source) =
-                repass_capture(archive, rules, &item.canonical_url, &capture, &mut run)
-            {
                 run.asset_fetches = assets.fetches();
                 return Err(RepassError::Storage {
                     source,
@@ -133,15 +125,34 @@ pub fn repass_archive(
     Ok(run)
 }
 
-fn recover_assets(
+/// Everything one capture is owed: the subresources it missed, and the derived records over it.
+///
+/// The metadata record is read here rather than inside either half, because both of them need
+/// it and it is the same record: it says which role each reference was named in, which is what
+/// orders the retries, and it says which extractor wrote it, which is what makes the derived
+/// layer stale.
+fn repass_one(
     archive: &Archive,
-    url: &crate::CanonicalUrl,
-    capture_id: &CaptureId,
+    rules: &SiteRules,
+    url: &CanonicalUrl,
     capture: &Capture,
     assets: &mut AssetCapture<'_>,
     run: &mut RepassRun,
 ) -> Result<(), StorageError> {
-    let mut recovered = Vec::new();
+    let metadata = archive.read_metadata(url, &capture.id)?;
+    recover_assets(archive, url, capture, metadata.as_ref(), assets, run)?;
+    repass_capture(archive, rules, url, capture, metadata, run)
+}
+
+fn recover_assets(
+    archive: &Archive,
+    url: &CanonicalUrl,
+    capture: &Capture,
+    metadata: Option<&PageMetadata>,
+    assets: &mut AssetCapture<'_>,
+    run: &mut RepassRun,
+) -> Result<(), StorageError> {
+    let kinds = kinds_by_url(metadata);
     let mut retryable = Vec::new();
     for missed in &capture.assets_missed {
         if !retryable_miss(&missed.reason) {
@@ -150,14 +161,37 @@ fn recover_assets(
         }
         retryable.push(ReferencedAsset {
             url: missed.url.clone(),
-            kind: AssetKind::Image,
+            // An image when the record does not name the address, which is what every retry
+            // was handed over as until the roles were read back at all. A record re-derived
+            // under a later extractor can name fewer references than the capture missed, a
+            // `srcset`'s narrower renditions being the case in hand, and a lookup that came up
+            // empty is not evidence that a page's picture belongs behind its script bundles.
+            kind: kinds
+                .get(missed.url.as_str())
+                .copied()
+                .unwrap_or(AssetKind::Image),
         });
     }
     let captured = assets.of_page(&retryable)?;
-    recovered.extend(captured.stored);
-    run.assets_recovered += recovered.len();
+    run.assets_recovered += captured.stored.len();
     run.assets_still_missing += captured.missed.len();
-    archive.add_recovered_assets(url, capture_id, &recovered, &captured.missed)
+    archive.add_recovered_assets(url, &capture.id, &captured.stored, &captured.missed)
+}
+
+/// The role each reference was named in, keyed by address.
+///
+/// Built once per capture rather than searched per miss: a page may reference two thousand
+/// addresses and miss hundreds of them, and a scan per miss is that product.
+fn kinds_by_url(metadata: Option<&PageMetadata>) -> HashMap<&str, AssetKind> {
+    metadata
+        .map(|metadata| {
+            metadata
+                .assets
+                .iter()
+                .map(|asset| (asset.url.as_str(), asset.kind))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn repass_capture(
@@ -165,9 +199,9 @@ fn repass_capture(
     rules: &SiteRules,
     url: &CanonicalUrl,
     capture: &Capture,
+    metadata: Option<PageMetadata>,
     run: &mut RepassRun,
 ) -> Result<(), StorageError> {
-    let metadata = archive.read_metadata(url, &capture.id)?;
     let article_state = ArticleState::read(archive, url, &capture.id)?;
     let metadata_stale = metadata
         .as_ref()

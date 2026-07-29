@@ -27,7 +27,14 @@ use serde::{Deserialize, Serialize};
 /// since the document title is only ever read as the last resort, but a page relying on it,
 /// most of the plain web, had the same field say something else. Records written by version 2
 /// have to be redone for the same reason version 1's did.
-pub const EXTRACTOR_VERSION: u32 = 3;
+///
+/// Version 4 keeps one candidate of a `srcset`, the widest, where earlier versions kept every
+/// one. The subresource list stops being every address a page named and becomes the renditions
+/// the archive means to hold, which is a different claim about the same field: a version 3
+/// record naming eight addresses for one photograph is not saying that this extractor would
+/// ask for eight. The list is what the asset pass spends its budget from, so a record left
+/// unredone would keep sending a repass after renditions of pictures the archive already has.
+pub const EXTRACTOR_VERSION: u32 = 4;
 
 /// Where a resolved value came from. Kept beside the value because the precedence rules are
 /// judgement calls: without this, a title that came out wrong gives nothing to look at.

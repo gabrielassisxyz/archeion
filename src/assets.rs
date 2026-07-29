@@ -18,7 +18,7 @@ use crate::crawl::{CrawlEngine, PageEvent, PageResponse, Seed, points_inside_a_n
 use crate::metadata::{AssetKind, ReferencedAsset};
 use crate::storage::{Archive, Asset, AssetMiss, MissedAsset, NewAsset, StorageError};
 
-/// The most references one capture deals with, which is also the most subresources it holds.
+/// The most references one capture asks about.
 ///
 /// A page carries tens of them and the extraction will hand over up to two thousand, which is
 /// a count set to survive a hostile page rather than to be fetched. Beyond a hundred and
@@ -30,6 +30,18 @@ use crate::storage::{Archive, Asset, AssetMiss, MissedAsset, NewAsset, StorageEr
 /// stores nothing, so a ceiling on what is stored would never be reached and the run would
 /// spend two thousand requests learning that. Whoever wrote the page chooses the addresses,
 /// and that is the shape an archiver is aimed at something with.
+///
+/// A reference the run has already answered is not one of those, and does not count here. It
+/// is a request that will not be made, so charging it a slot bounded nothing and only made the
+/// record report an absence over bytes the archive was holding. What the ceiling still bounds
+/// is what it was drawn against: a page of fresh addresses, since extraction deduplicates
+/// references by address and a page cannot spend the budget on repeats of one URL.
+///
+/// So this is no longer also the count of subresources a capture holds, and the difference is
+/// where the record can grow: a page naming addresses a whole run has already learned
+/// references every one of them. It stays bounded, by the two thousand references extraction
+/// will hand over at all, and it costs no bytes in the store, since the bodies are already
+/// there under their own hashes and a second record only points at them.
 const MAX_ASSETS_PER_CAPTURE: usize = 128;
 
 /// The most one subresource may spend.
@@ -172,6 +184,18 @@ impl<'a> AssetCapture<'a> {
     /// inside every ceiling reads exactly as it would have without this rule, and only a
     /// page that spills past a ceiling can tell the two orders apart.
     ///
+    /// A page that spills past the count ceiling is also the one page whose stored set is not
+    /// a property of the page alone. Every reference the run has already answered is served
+    /// without spending a slot, so how many of the rest fit depends on what the pages before
+    /// it taught, and a crawl does not promise an order. Two runs reaching one page after
+    /// learning different things keep different sets of it, and since a capture id is built
+    /// from the addresses it holds, they are two captures rather than one. What is guaranteed
+    /// is narrower and is what the ceiling is for: the same page in the same run answered the
+    /// same way is dealt with identically, no run asks for more than the ceiling per capture,
+    /// and the set only ever grows with what the run knows. Charging a memo hit a slot bought
+    /// that wider determinism by reporting an absence over bytes the archive was holding,
+    /// which is the worse of the two.
+    ///
     /// A failed write ends the run, like any other, and is the only error here: everything
     /// else that can go wrong is one subresource the capture will not have, which the record
     /// carries as a miss.
@@ -192,32 +216,37 @@ impl<'a> AssetCapture<'a> {
 
         for index in fetch_order {
             let reference = &referenced[index];
+            // The memo is consulted before any ceiling, because every ceiling here bounds what
+            // one capture may spend on somebody else's host and an answer the run already has
+            // costs nothing to serve: no request, no transfer, no wait. Asking the count
+            // ceiling first spent a slot on a reference whose bytes were already in the
+            // archive and then recorded it as absent, and on a whole publication that was half
+            // of every absence reported. It is served for the same reason when the run is out
+            // of time or the capture has given up asking.
+            if let Some(known) = self.known.get(&reference.url) {
+                outcomes[index] = Some(known.clone());
+                continue;
+            }
             if let Some(reason) = no_room_for_another(dealt_with, bytes_spent) {
                 outcomes[index] = Some(Learned::Missed(reason));
                 dealt_with += 1;
                 continue;
             }
-            let learned = match self.known.get(&reference.url) {
-                // A hit costs nothing, so it is served even when the run is out of time or the
-                // capture has given up asking, and it counts against no ceiling: the bytes are
-                // already in the archive and the record that references them is written down.
-                Some(known) => known.clone(),
-                None if silences >= MAX_CONSECUTIVE_SILENCES => {
-                    Learned::Missed(AssetMiss::NothingWasAnswering)
+            let learned = if silences >= MAX_CONSECUTIVE_SILENCES {
+                Learned::Missed(AssetMiss::NothingWasAnswering)
+            } else if self.out_of_time() {
+                Learned::Missed(AssetMiss::DeadlineReached)
+            } else {
+                let asked = self.ask_for(&reference.url)?;
+                bytes_spent = bytes_spent.saturating_add(asked.transferred);
+                match asked.on_the_wire {
+                    OnTheWire::Silent => silences += 1,
+                    OnTheWire::Answered => silences = 0,
+                    OnTheWire::NothingSent => {}
                 }
-                None if self.out_of_time() => Learned::Missed(AssetMiss::DeadlineReached),
-                None => {
-                    let asked = self.ask_for(&reference.url)?;
-                    bytes_spent = bytes_spent.saturating_add(asked.transferred);
-                    match asked.on_the_wire {
-                        OnTheWire::Silent => silences += 1,
-                        OnTheWire::Answered => silences = 0,
-                        OnTheWire::NothingSent => {}
-                    }
-                    self.known
-                        .insert(reference.url.clone(), asked.learned.clone());
-                    asked.learned
-                }
+                self.known
+                    .insert(reference.url.clone(), asked.learned.clone());
+                asked.learned
             };
             outcomes[index] = Some(learned);
             dealt_with += 1;
@@ -355,7 +384,8 @@ fn fetch_priority(kind: AssetKind) -> u8 {
 ///
 /// Both ceilings are checked before anything is asked for, which is what keeps a page that
 /// references two thousand files from costing two thousand requests to then refuse most of
-/// them.
+/// them. They are consulted only for a reference the run has no answer for, since both bound
+/// what asking costs and a memo hit asks nothing.
 fn no_room_for_another(dealt_with: usize, bytes_spent: u64) -> Option<AssetMiss> {
     if dealt_with >= MAX_ASSETS_PER_CAPTURE {
         return Some(AssetMiss::CountCeilingReached);
@@ -539,10 +569,13 @@ mod tests {
         assert_eq!(assets.fetches(), MAX_ASSETS_PER_CAPTURE);
     }
 
-    /// The set stored, and its order, are both derived only from the page and the answers
-    /// a host gave, so a page fetched twice unchanged agrees with itself both times. That is
-    /// what keeps a capture id, which is built from this order, meaning the same thing on a
-    /// repeat capture that changed nothing.
+    /// The set stored, and its order, are both derived from the page, the answers a host
+    /// gave, and what the run had already learned when it arrived. Two runs that reach this
+    /// page knowing the same things agree with themselves, which is what keeps a capture id,
+    /// built from this order, meaning the same thing on a repeat capture that changed nothing.
+    ///
+    /// The third term is real and is not exercised here, deliberately: it can only be told
+    /// apart by a page that spills past the count ceiling, and `of_page` says what that costs.
     #[test]
     fn a_page_captured_twice_produces_the_same_stored_set_in_the_same_order() {
         let dir = TempDir::new().expect("temp dir");
@@ -689,6 +722,99 @@ mod tests {
             "what the images spent is spent for everything below them, and the record still
              lists what happened in the order the page named it"
         );
+    }
+
+    /// The ceiling bounds requests, and a reference the run already answered is not one. This
+    /// page names ten files nobody has asked for and then the whole of a previous page's set,
+    /// more references than the ceiling holds, and every one of the latter is already in the
+    /// archive: charging them a slot made the last ten of them be recorded as absent while
+    /// their bytes sat in the archive under another capture. On a whole publication that shape
+    /// was half of every absence reported.
+    #[test]
+    fn a_reference_the_run_already_answered_is_served_past_the_count_ceiling() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/");
+
+        let shared: Vec<String> = (0..MAX_ASSETS_PER_CAPTURE)
+            .map(|i| format!("https://example.com/shared-{i}.png"))
+            .collect();
+        let fresh: Vec<String> = (0..10)
+            .map(|i| format!("https://example.com/own-{i}.png"))
+            .collect();
+
+        let first_page: Vec<ReferencedAsset> = shared
+            .iter()
+            .map(|url| referenced(url, AssetKind::Image))
+            .collect();
+        let mut second_page: Vec<ReferencedAsset> = fresh
+            .iter()
+            .map(|url| referenced(url, AssetKind::Image))
+            .collect();
+        second_page.extend(
+            first_page
+                .iter()
+                .map(|asset| referenced(&asset.url, asset.kind)),
+        );
+
+        let answers: Vec<PageEvent> = shared
+            .iter()
+            .chain(fresh.iter())
+            .map(|url| stored_response(url))
+            .collect();
+        let engine = ScriptedEngine::serving(answers);
+
+        let mut assets = AssetCapture::new(&engine, &archive, &seed, Instant::now());
+        let first = assets
+            .of_page(&first_page)
+            .expect("a fake engine and a fresh archive do not fail a write");
+        assert!(first.missed.is_empty(), "{:?}", first.missed);
+        assert_eq!(assets.fetches(), MAX_ASSETS_PER_CAPTURE);
+
+        let second = assets
+            .of_page(&second_page)
+            .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert!(second.missed.is_empty(), "{:?}", second.missed);
+        assert_eq!(second.stored.len(), second_page.len());
+        assert_eq!(
+            assets.fetches(),
+            MAX_ASSETS_PER_CAPTURE + fresh.len(),
+            "only the addresses nobody had answered cost a request"
+        );
+    }
+
+    /// What the ceiling was drawn against, unchanged: a page of addresses the run has never
+    /// answered still deals with exactly the ceiling and asks for no more, however many it
+    /// lists. Serving a memo hit for free would be worth nothing if it bought a hostile page
+    /// an unbounded number of requests, and this is the test that says it does not.
+    #[test]
+    fn a_page_of_addresses_nobody_answered_before_still_stops_at_the_count_ceiling() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/");
+
+        let fresh: Vec<String> = (0..MAX_ASSETS_PER_CAPTURE * 2)
+            .map(|i| format!("https://example.com/photo-{i}.png"))
+            .collect();
+        let page: Vec<ReferencedAsset> = fresh
+            .iter()
+            .map(|url| referenced(url, AssetKind::Image))
+            .collect();
+        let engine =
+            ScriptedEngine::serving(fresh.iter().map(|url| stored_response(url)).collect());
+
+        let mut assets = AssetCapture::new(&engine, &archive, &seed, Instant::now());
+        let captured = assets
+            .of_page(&page)
+            .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(captured.stored.len(), MAX_ASSETS_PER_CAPTURE);
+        assert_eq!(captured.missed.len(), MAX_ASSETS_PER_CAPTURE);
+        for miss in &captured.missed {
+            assert_eq!(miss.reason, AssetMiss::CountCeilingReached);
+        }
+        assert_eq!(assets.fetches(), MAX_ASSETS_PER_CAPTURE);
     }
 
     #[test]

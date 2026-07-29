@@ -489,7 +489,6 @@ mod tests {
                 ("https://example.com/style.css", AssetKind::Stylesheet),
                 ("https://example.com/icon.png", AssetKind::Icon),
                 ("https://example.com/a.png", AssetKind::Image),
-                ("https://example.com/a-2x.png", AssetKind::Image),
                 ("https://example.com/a-3x.png", AssetKind::Image),
                 ("https://example.com/app.js", AssetKind::Script),
                 ("https://example.com/v.mp4", AssetKind::Media),
@@ -500,13 +499,74 @@ mod tests {
         );
     }
 
+    /// Every rendition of one photograph is that photograph, so the archive keeps the one a
+    /// reader wants and pays for it once. A publication writing each picture as two formats at
+    /// four widths turned one photograph into eight addresses, which is where four fifths of a
+    /// collection's bytes went and why the pass's per capture ceiling became a budget of
+    /// sixteen photographs a page rather than of the page.
+    ///
+    /// One candidate per attribute and not one per picture: the grouping is only ever stated by
+    /// the attribute, since a token stream cannot see that a `<source>` and an `<img>` stand
+    /// under one `<picture>`.
+    #[test]
+    fn a_picture_offered_at_several_sizes_is_referenced_once_for_each_attribute() {
+        let page = extract_html(
+            r#"<picture>
+                 <source type="image/webp"
+                         srcset="/w424.webp 424w, /w848.webp 848w, /w1456.webp 1456w">
+                 <img srcset="/w424.jpeg 424w, /w848.jpeg 848w, /w1456.jpeg 1456w">
+               </picture>"#,
+        );
+        let urls: Vec<&str> = page.assets.iter().map(|asset| asset.url.as_str()).collect();
+
+        assert_eq!(
+            urls,
+            [
+                "https://example.com/w1456.webp",
+                "https://example.com/w1456.jpeg",
+            ]
+        );
+    }
+
+    /// The ordinary responsive image, with no `<picture>` around it. `src` survives the rule
+    /// because it is not a candidate: it is an address the page named on its own, and it is
+    /// what a reader without the candidate list is served.
+    #[test]
+    fn a_responsive_image_keeps_its_widest_candidate_beside_the_address_in_src() {
+        let page =
+            extract_html(r#"<img src="/thumb.jpeg" srcset="/small.jpeg 424w, /large.jpeg 1456w">"#);
+        let urls: Vec<&str> = page.assets.iter().map(|asset| asset.url.as_str()).collect();
+
+        assert_eq!(
+            urls,
+            [
+                "https://example.com/thumb.jpeg",
+                "https://example.com/large.jpeg",
+            ]
+        );
+    }
+
+    /// A candidate carrying no descriptor is `1x` by the specification and not a width of
+    /// zero. Read as a zero it would rank below every other candidate, and an attribute naming
+    /// nothing else would lose the only picture it offered.
+    #[test]
+    fn a_candidate_written_without_a_descriptor_is_still_the_one_kept() {
+        let page = extract_html(r#"<picture><source srcset="/only.avif"></picture>"#);
+        let urls: Vec<&str> = page.assets.iter().map(|asset| asset.url.as_str()).collect();
+
+        assert_eq!(urls, ["https://example.com/only.avif"]);
+    }
+
     /// A comma separates candidates and is also legal inside a URL, which is how an image
     /// served through a transformation network spells its parameters. Splitting on the
     /// character alone turns one candidate into a handful of fragments, and a fragment is a
     /// relative reference: the archive then asks the page's own origin for addresses that
     /// were never on the page. The shape below is one attribute from a real publication.
+    ///
+    /// Only the widest candidate is kept, so what a wrong split produces here is extra
+    /// references beside it rather than instead of it, which is what this asserts against.
     #[test]
-    fn a_srcset_whose_urls_hold_commas_lists_only_the_candidates_the_page_wrote() {
+    fn a_srcset_whose_urls_hold_commas_lists_only_the_candidate_the_page_wrote() {
         let page = extract_html(
             r#"<img srcset="https://cdn.example/fetch/w_320,h_213,c_fill/https%3A%2F%2Forigin%2Fone.jpeg 320w,
                            https://cdn.example/fetch/w_640,h_426,c_fill/https%3A%2F%2Forigin%2Fone.jpeg 640w">"#,
@@ -515,28 +575,7 @@ mod tests {
 
         assert_eq!(
             urls,
-            [
-                "https://cdn.example/fetch/w_320,h_213,c_fill/https%3A%2F%2Forigin%2Fone.jpeg",
-                "https://cdn.example/fetch/w_640,h_426,c_fill/https%3A%2F%2Forigin%2Fone.jpeg",
-            ]
-        );
-    }
-
-    /// The separator has three spellings the parser has to agree on: a comma after
-    /// whitespace, a comma stuck to the end of a URL that carries no descriptor, and a run of
-    /// them around an empty candidate. None of the three may leave an empty address behind.
-    #[test]
-    fn a_candidate_separator_is_read_the_same_however_it_is_spelled() {
-        let page = extract_html(r#"<img srcset="/a.png,, /b.png 2x , /c.png">"#);
-        let urls: Vec<&str> = page.assets.iter().map(|asset| asset.url.as_str()).collect();
-
-        assert_eq!(
-            urls,
-            [
-                "https://example.com/a.png",
-                "https://example.com/b.png",
-                "https://example.com/c.png",
-            ]
+            ["https://cdn.example/fetch/w_640,h_426,c_fill/https%3A%2F%2Forigin%2Fone.jpeg"]
         );
     }
 
@@ -554,16 +593,14 @@ mod tests {
     /// A descriptor may hold a comma inside parentheses, and being inside them is a state
     /// rather than a depth. Counting the second opening parenthesis would hide the comma that
     /// ends the candidate, and the next candidate would be swallowed as part of the first
-    /// descriptor rather than recorded.
+    /// descriptor rather than recorded: the attribute would then offer only `/one.png`, which
+    /// is what this asserts did not happen.
     #[test]
     fn a_second_parenthesis_in_a_descriptor_does_not_swallow_the_next_candidate() {
         let page = extract_html(r#"<img srcset="/one.png foo(() , /two.png 2x">"#);
         let urls: Vec<&str> = page.assets.iter().map(|asset| asset.url.as_str()).collect();
 
-        assert_eq!(
-            urls,
-            ["https://example.com/one.png", "https://example.com/two.png"]
-        );
+        assert_eq!(urls, ["https://example.com/two.png"]);
     }
 
     /// The text of a `<title>` element is markup, not text, exactly as an attribute value
@@ -618,7 +655,13 @@ mod tests {
     /// attribute first safe, and it is the property the transformation network URLs depend on.
     #[test]
     fn a_srcset_candidate_holding_an_encoded_comma_is_not_split_on_it() {
-        let page = extract_html(r#"<img srcset="/img?x=1&#44;2 1x, /other.png 2x">"#);
+        // Written twice with the widths swapped, since only one candidate of an attribute is
+        // kept: whichever of the two wins has to be the whole address the page wrote, so a
+        // split on the encoded comma is visible whichever side it falls.
+        let page = extract_html(
+            r#"<img srcset="/img?x=1&#44;2 2x, /other.png 1x">
+               <img srcset="/img?x=1&#44;2 1x, /other.png 2x">"#,
+        );
         let urls: Vec<&str> = page.assets.iter().map(|asset| asset.url.as_str()).collect();
         assert_eq!(
             urls,
@@ -638,10 +681,9 @@ mod tests {
     fn a_srcset_separator_written_as_a_reference_still_separates() {
         let page = extract_html(r#"<img srcset="/a.png 1x&#44; /b.png 2x">"#);
         let urls: Vec<&str> = page.assets.iter().map(|asset| asset.url.as_str()).collect();
-        assert_eq!(
-            urls,
-            ["https://example.com/a.png", "https://example.com/b.png"]
-        );
+        // Split before decoding, the whole attribute is one candidate and the answer is
+        // `/a.png`; read as a browser reads it, `/b.png` is the wider of two.
+        assert_eq!(urls, ["https://example.com/b.png"]);
     }
 
     /// An ampersand written as `&amp;` never holds the raw bytes the splitter treats as a
@@ -651,13 +693,7 @@ mod tests {
     fn a_srcset_candidate_with_an_ampersand_reference_decodes_without_moving_the_split() {
         let page = extract_html(r#"<img srcset="/img?a=1&amp;b=2 1x, /img?a=3&amp;b=4 2x">"#);
         let urls: Vec<&str> = page.assets.iter().map(|asset| asset.url.as_str()).collect();
-        assert_eq!(
-            urls,
-            [
-                "https://example.com/img?a=1&b=2",
-                "https://example.com/img?a=3&b=4",
-            ]
-        );
+        assert_eq!(urls, ["https://example.com/img?a=3&b=4"]);
     }
 
     #[test]

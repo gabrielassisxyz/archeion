@@ -609,6 +609,159 @@ fn an_asset_missed_by_archive_policy_is_recovered_without_rewriting_the_capture_
     );
 }
 
+/// The order the asset pass buys references in did not reach a repass at all. Every retryable
+/// miss was handed over as an image, so the priority was uniform, the stable sort left the
+/// record's own order in place, and a page with more retryable misses than one pass deals with
+/// bought whatever it happened to list first. The role is in the metadata record beside the
+/// capture, which is where this reads it back from.
+#[test]
+fn a_repass_asks_for_the_pictures_of_a_page_before_its_scripts() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a").expect("valid URL");
+    let page = article_page(r#"<script src="/bundle.js"></script><img src="/photo.jpeg">"#);
+    let mut new = html_capture(&url, &page);
+    // The page's own order, which is the order a repass used to buy them back in.
+    new.assets_missed = vec![
+        MissedAsset {
+            url: "https://example.com/bundle.js".to_owned(),
+            reason: AssetMiss::CountCeilingReached,
+        },
+        MissedAsset {
+            url: "https://example.com/photo.jpeg".to_owned(),
+            reason: AssetMiss::CountCeilingReached,
+        },
+    ];
+    let capture = archive.write_capture(new).expect("capture is written");
+    let metadata = metadata::extract(PageSource {
+        body: page.as_bytes(),
+        content_type: Some("text/html; charset=utf-8"),
+        final_url: url.as_str(),
+    })
+    .expect("the page reads")
+    .expect("the page is html");
+    archive
+        .write_metadata(&url, &capture.id, &metadata)
+        .expect("metadata is written");
+    let engine = ScriptedEngine::new(Vec::new());
+
+    repass_archive(
+        &engine,
+        &archive,
+        &SiteRules::default(),
+        RepassOptions::default(),
+    )
+    .expect("repass succeeds");
+
+    assert_eq!(
+        engine.fetched(),
+        [
+            "https://example.com/photo.jpeg",
+            "https://example.com/bundle.js",
+        ]
+    );
+}
+
+/// A capture record is an observation and never changes; the metadata beside it is re-derived
+/// under whichever extractor runs last. The two therefore stop naming the same set as soon as a
+/// rule about which references are recorded changes, and a `srcset`'s narrower renditions are
+/// exactly that case. An address the record no longer names is still retried, and still retried
+/// as content: a lookup that came up empty says nothing about what the page was.
+#[test]
+fn a_missed_address_the_metadata_no_longer_names_is_still_retried() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a").expect("valid URL");
+    let page = article_page(r#"<img srcset="/small.jpeg 424w, /large.jpeg 1456w">"#);
+    let mut new = html_capture(&url, &page);
+    new.assets_missed = vec![MissedAsset {
+        url: "https://example.com/small.jpeg".to_owned(),
+        reason: AssetMiss::CountCeilingReached,
+    }];
+    let capture = archive.write_capture(new).expect("capture is written");
+    let metadata = metadata::extract(PageSource {
+        body: page.as_bytes(),
+        content_type: Some("text/html; charset=utf-8"),
+        final_url: url.as_str(),
+    })
+    .expect("the page reads")
+    .expect("the page is html");
+    assert!(
+        !metadata
+            .assets
+            .iter()
+            .any(|asset| asset.url == "https://example.com/small.jpeg"),
+        "the narrower rendition is the one the record stops naming"
+    );
+    archive
+        .write_metadata(&url, &capture.id, &metadata)
+        .expect("metadata is written");
+    let engine = ScriptedEngine::new(Vec::new());
+
+    repass_archive(
+        &engine,
+        &archive,
+        &SiteRules::default(),
+        RepassOptions::default(),
+    )
+    .expect("repass succeeds");
+
+    assert_eq!(engine.fetched(), ["https://example.com/small.jpeg"]);
+}
+
+/// What the fallback above is worth once there is something to rank it against. The record
+/// names the script and not the rendition, so one retry has a role and the other does not, and
+/// the one without still goes first: a lookup that came up empty is not evidence that a page's
+/// picture belongs behind its build output.
+#[test]
+fn a_missed_address_with_no_role_in_the_record_is_still_asked_for_before_a_script() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a").expect("valid URL");
+    let page = article_page(
+        r#"<script src="/bundle.js"></script><img srcset="/small.jpeg 424w, /large.jpeg 1456w">"#,
+    );
+    let mut new = html_capture(&url, &page);
+    new.assets_missed = vec![
+        MissedAsset {
+            url: "https://example.com/bundle.js".to_owned(),
+            reason: AssetMiss::CountCeilingReached,
+        },
+        MissedAsset {
+            url: "https://example.com/small.jpeg".to_owned(),
+            reason: AssetMiss::CountCeilingReached,
+        },
+    ];
+    let capture = archive.write_capture(new).expect("capture is written");
+    let metadata = metadata::extract(PageSource {
+        body: page.as_bytes(),
+        content_type: Some("text/html; charset=utf-8"),
+        final_url: url.as_str(),
+    })
+    .expect("the page reads")
+    .expect("the page is html");
+    archive
+        .write_metadata(&url, &capture.id, &metadata)
+        .expect("metadata is written");
+    let engine = ScriptedEngine::new(Vec::new());
+
+    repass_archive(
+        &engine,
+        &archive,
+        &SiteRules::default(),
+        RepassOptions::default(),
+    )
+    .expect("repass succeeds");
+
+    assert_eq!(
+        engine.fetched(),
+        [
+            "https://example.com/small.jpeg",
+            "https://example.com/bundle.js",
+        ]
+    );
+}
+
 #[test]
 fn a_failed_asset_recovery_is_not_retried_on_the_next_pass() {
     let dir = TempDir::new().expect("temp dir");

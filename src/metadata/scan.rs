@@ -383,9 +383,24 @@ impl Scanner {
     }
 
     /// A `srcset` is a comma separated list of candidates, each a URL followed by an
-    /// optional descriptor. Every candidate is the same image at another size, so all of
-    /// them are recorded: which one a reader would have been served depends on a viewport
-    /// the archive does not have.
+    /// optional descriptor, and every candidate is the same picture at another size. One of
+    /// them is recorded, the widest, because an archive has no viewport to choose against and
+    /// what it has instead is a reader who wants the best quality the page offered. It is the
+    /// address the conversion into a note already names, so the two agree and the note keeps
+    /// its picture offline.
+    ///
+    /// Recording all of them cost a fetch and a copy per size for a picture the archive
+    /// already held. A publication writing two formats at four widths turns one photograph
+    /// into eight addresses, which is where four fifths of a collection's bytes went, and it
+    /// turns the subresource pass's per capture ceiling into a budget of sixteen photographs
+    /// a page: the one page in that collection that lost a picture lost it to its own
+    /// renditions rather than to the platform's scripts.
+    ///
+    /// The grouping is the attribute and nothing wider. A `<picture>` naming one photograph in
+    /// two formats still costs two references, because a token stream cannot see that a
+    /// `<source>` and an `<img>` stand under one parent, and pairing the two by their
+    /// addresses would be reading a transformation network's path convention as though a page
+    /// had promised it.
     ///
     /// The attribute is decoded before the candidates are split, which is the order a browser
     /// reads it in: references are resolved while the tag is tokenized, and the candidate
@@ -401,8 +416,8 @@ impl Scanner {
             return;
         };
         let srcset = decode_entities(srcset);
-        for candidate in crate::srcset::candidates(&srcset) {
-            self.see_asset(candidate.url.to_owned(), AssetKind::Image);
+        if let Some(widest) = crate::srcset::widest(&srcset) {
+            self.see_asset(widest.to_owned(), AssetKind::Image);
         }
     }
 

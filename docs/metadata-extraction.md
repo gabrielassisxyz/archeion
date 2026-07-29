@@ -25,6 +25,8 @@ Three states are all ordinary, and none is an error:
 
 Version 2 reads an attribute as the markup it is rather than as text, so a character reference in one becomes the character it stands for. The streaming parser hands an attribute's bytes back as the page wrote them, and treating that as final text stored a title holding `&#x27;` where the page meant an apostrophe, and an address holding `&amp;` between query parameters, where the parameter after it then read as a name no page wrote. Every field filled from an attribute can therefore differ between the two versions, which is why a record written by version 1 is stale rather than merely thinner.
 
+Version 3 does the same for the text inside a `<title>` element, which version 2 left out: a page whose only title is `Isn&#x27;t Efficient` kept the reference instead of the apostrophe. A page carrying an OpenGraph, Twitter or schema.org title was unaffected either way, since the document title is only ever read as the last resort, but a page relying on it, most of the plain web, had the same field say something else. A record written by version 2 is stale for the same reason a version 1 one was.
+
 Adding this file to an archive is a compatible change and does not move the format version. A reader of format 1 that does not know about it walks past it, and `list_captures` still sees captures: the suffix makes the file stem no longer the shape of a capture id.
 
 ## What is read

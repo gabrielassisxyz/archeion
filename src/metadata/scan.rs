@@ -20,6 +20,15 @@ use super::model::{AssetKind, Bound};
 /// real pages, which is the point: reaching one is evidence about the page, not about the
 /// limit, and the record says so.
 const MAX_TEXT_FIELD_BYTES: usize = 4 * 1024;
+/// How much of a title's own raw markup is held before it is decoded.
+///
+/// A single character reference can spell one decoded character with far more raw bytes than
+/// `MAX_TEXT_FIELD_BYTES` allows, a numeric reference's leading zeros being the extreme case,
+/// so capping the raw accumulation at that same ceiling would cut a legitimate title before it
+/// is ever read. This ceiling exists only to bound the memory an adversarial title element can
+/// hold before decoding runs; how much of the decoded result the record keeps is still
+/// `MAX_TEXT_FIELD_BYTES`, applied once decoding is done.
+const MAX_TITLE_RAW_BYTES: usize = 64 * MAX_TEXT_FIELD_BYTES;
 const MAX_META_TAGS: usize = 256;
 const MAX_JSON_LD_BLOCKS: usize = 16;
 const MAX_JSON_LD_BYTES: usize = 64 * 1024;
@@ -65,6 +74,18 @@ pub(super) struct ScannedLink {
 /// large share of the archivable web, for a guarantee that only matters when writing HTML
 /// back out.
 pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
+    scan_writes([html])
+}
+
+/// The body of `scan`, taking the document one write at a time.
+///
+/// A capture is always handed to `scan` whole, so production code never needs more than one
+/// write. This exists so a test can hand the parser the same document split at a chosen byte
+/// offset, which is the only way to pin behaviour that depends on where a chunk boundary
+/// falls, a character reference split across two of them being the case that matters here.
+fn scan_writes<'a>(
+    writes: impl IntoIterator<Item = &'a str>,
+) -> Result<ScannedPage, RewritingError> {
     let scanner = RefCell::new(Scanner::default());
 
     {
@@ -79,7 +100,7 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
                     element!("html", |el| {
                         let mut scanner = scanner.borrow_mut();
                         if scanner.page.language.is_none() {
-                            scanner.page.language = el.get_attribute("lang").map(decode_attribute);
+                            scanner.page.language = el.get_attribute("lang").map(decode_entities);
                         }
                         Ok(())
                     }),
@@ -112,8 +133,8 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
                         scanner.borrow_mut().see_meta(
                             el.get_attribute("name")
                                 .or_else(|| el.get_attribute("property"))
-                                .map(decode_attribute),
-                            el.get_attribute("content").map(decode_attribute),
+                                .map(decode_entities),
+                            el.get_attribute("content").map(decode_entities),
                         );
                         Ok(())
                     }),
@@ -121,27 +142,27 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
                         let mut scanner = scanner.borrow_mut();
                         // The first one wins, which is what a browser does with the second.
                         if scanner.page.base_href.is_none() {
-                            scanner.page.base_href = el.get_attribute("href").map(decode_attribute);
+                            scanner.page.base_href = el.get_attribute("href").map(decode_entities);
                         }
                         Ok(())
                     }),
                     element!("link[href]", |el| {
                         scanner.borrow_mut().see_link_tag(
-                            el.get_attribute("rel").map(decode_attribute),
-                            el.get_attribute("href").map(decode_attribute),
+                            el.get_attribute("rel").map(decode_entities),
+                            el.get_attribute("href").map(decode_entities),
                         );
                         Ok(())
                     }),
                     element!("a[href]", |el| {
                         scanner.borrow_mut().see_anchor(
-                            el.get_attribute("href").map(decode_attribute),
-                            el.get_attribute("rel").map(decode_attribute),
+                            el.get_attribute("href").map(decode_entities),
+                            el.get_attribute("rel").map(decode_entities),
                         );
                         Ok(())
                     }),
                     element!("script", |el| {
                         let mut scanner = scanner.borrow_mut();
-                        if let Some(src) = el.get_attribute("src").map(decode_attribute) {
+                        if let Some(src) = el.get_attribute("src").map(decode_entities) {
                             scanner.see_asset(src, AssetKind::Script);
                         }
                         // Compared here rather than in the selector because the attribute is
@@ -149,7 +170,7 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
                         // attribute match is case sensitive.
                         scanner.inside_json_ld = el
                             .get_attribute("type")
-                            .map(decode_attribute)
+                            .map(decode_entities)
                             .is_some_and(|kind| kind.trim().eq_ignore_ascii_case(JSON_LD_TYPE));
                         Ok(())
                     }),
@@ -161,7 +182,7 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
                     }),
                     element!("img", |el| {
                         let mut scanner = scanner.borrow_mut();
-                        if let Some(src) = el.get_attribute("src").map(decode_attribute) {
+                        if let Some(src) = el.get_attribute("src").map(decode_entities) {
                             scanner.see_asset(src, AssetKind::Image);
                         }
                         scanner.see_srcset(el.get_attribute("srcset"));
@@ -173,7 +194,7 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
                     // `srcset`, the media form carries `src`.
                     element!("source", |el| {
                         let mut scanner = scanner.borrow_mut();
-                        if let Some(src) = el.get_attribute("src").map(decode_attribute) {
+                        if let Some(src) = el.get_attribute("src").map(decode_entities) {
                             scanner.see_asset(src, AssetKind::Media);
                         }
                         scanner.see_srcset(el.get_attribute("srcset"));
@@ -181,16 +202,16 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
                     }),
                     element!("video", |el| {
                         let mut scanner = scanner.borrow_mut();
-                        if let Some(src) = el.get_attribute("src").map(decode_attribute) {
+                        if let Some(src) = el.get_attribute("src").map(decode_entities) {
                             scanner.see_asset(src, AssetKind::Media);
                         }
-                        if let Some(poster) = el.get_attribute("poster").map(decode_attribute) {
+                        if let Some(poster) = el.get_attribute("poster").map(decode_entities) {
                             scanner.see_asset(poster, AssetKind::Image);
                         }
                         Ok(())
                     }),
                     element!("audio[src]", |el| {
-                        if let Some(src) = el.get_attribute("src").map(decode_attribute) {
+                        if let Some(src) = el.get_attribute("src").map(decode_entities) {
                             scanner.borrow_mut().see_asset(src, AssetKind::Media);
                         }
                         Ok(())
@@ -208,7 +229,9 @@ pub(super) fn scan(html: &str) -> Result<ScannedPage, RewritingError> {
             |_: &[u8]| {},
         );
 
-        rewriter.write(html.as_bytes())?;
+        for write in writes {
+            rewriter.write(write.as_bytes())?;
+        }
         rewriter.end()?;
     }
 
@@ -240,13 +263,16 @@ impl Scanner {
         self.inside_page_title = false;
     }
 
+    // A character reference can split across two chunks, `&#x2` in one and `7;` in the
+    // next, so it cannot be decoded as each chunk arrives: decoding runs once in `finish`,
+    // against the whole buffer. What is capped here is only the raw byte count this
+    // scanner is willing to hold before that happens.
     fn see_title(&mut self, chunk: &str) {
         if !self.inside_page_title || self.title_ended {
             return;
         }
-        if push_capped(&mut self.title, chunk, MAX_TEXT_FIELD_BYTES) {
+        if push_capped(&mut self.title, chunk, MAX_TITLE_RAW_BYTES) {
             self.title_ended = true;
-            self.page.truncated.insert(Bound::Title);
         }
     }
 
@@ -374,7 +400,7 @@ impl Scanner {
         let Some(srcset) = srcset else {
             return;
         };
-        let srcset = decode_attribute(srcset);
+        let srcset = decode_entities(srcset);
         for url in srcset_urls(&srcset) {
             self.see_asset(url.to_owned(), AssetKind::Image);
         }
@@ -384,9 +410,26 @@ impl Scanner {
         // A document that ends inside a script leaves the last block unflushed, and a
         // truncated page is exactly the case where the metadata is worth the most.
         self.finish_json_ld_block();
-        let title = self.title.trim();
+        // Decoded here, now that the buffer is whole, and capped after: the field's ceiling
+        // is about what a reader would see, and a reference only reads as itself once it is
+        // resolved. Reaching `MAX_TITLE_RAW_BYTES` above already means the title is bigger
+        // than what the record keeps, whatever this decoded prefix happens to measure, so
+        // that case counts as truncated on its own.
+        let decoded_title = decode_entities(std::mem::take(&mut self.title));
+        let title = decoded_title.trim();
+        // Outside the emptiness check below, because a title whose first bytes are all
+        // whitespace reaches the raw ceiling and then trims to nothing: the record would
+        // otherwise say the page had no title and that nothing was cut, when what happened
+        // is that everything worth keeping was past the ceiling.
+        if self.title_ended {
+            self.page.truncated.insert(Bound::Title);
+        }
         if !title.is_empty() {
-            self.page.title = Some(title.to_owned());
+            let mut capped = String::new();
+            if push_capped(&mut capped, title, MAX_TEXT_FIELD_BYTES) {
+                self.page.truncated.insert(Bound::Title);
+            }
+            self.page.title = Some(capped);
         }
         self.page
     }
@@ -465,17 +508,18 @@ fn srcset_urls(srcset: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-/// An attribute value as the parser hands it back still carries whatever character
-/// references the page wrote: `get_attribute` decodes the byte encoding of the document, not
-/// its markup. Everything downstream, the title, a URL, a description, expects the character
-/// the page meant rather than the reference that spells it, so this is the one place that
-/// turns `&#x27;` and `&amp;` into `'` and `&` before anything else looks at the string.
+/// An attribute value or an element's text, as the parser hands it back, still carries
+/// whatever character references the page wrote: neither `get_attribute` nor a `text!` chunk
+/// decodes the markup, only the byte encoding of the document. Everything downstream, the
+/// title, a URL, a description, expects the character the page meant rather than the
+/// reference that spells it, so this is the one place that turns `&#x27;` and `&amp;` into
+/// `'` and `&` before anything else looks at the string.
 ///
-/// It also has to run before every ceiling below, not after: no named or numeric reference in
-/// `html_escape`'s tables decodes to more bytes than it took to write, so calling this first
-/// is what makes a ceiling measure the value a reader would see rather than a page's choice of
-/// how verbosely to spell it.
-fn decode_attribute(value: String) -> String {
+/// It also has to run before every ceiling that measures a decoded value, not after: no
+/// named or numeric reference in `html_escape`'s tables decodes to more bytes than it took to
+/// write, so calling this first is what makes a ceiling measure the value a reader would see
+/// rather than a page's choice of how verbosely to spell it.
+fn decode_entities(value: String) -> String {
     match decode_html_entities(&value) {
         Cow::Borrowed(_) => value,
         Cow::Owned(decoded) => decoded,
@@ -495,4 +539,79 @@ fn push_capped(buffer: &mut String, chunk: &str, cap: usize) -> bool {
         buffer.push(character);
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The trap this fix exists for: `&#x2` ends one write and `7;` begins the next, and
+    /// decoding either half on its own turns the reference into nothing rather than into
+    /// `'`. Only waiting for the whole buffer before decoding reads it correctly.
+    ///
+    /// A capture arrives whole and a reference carries no `<`, so the parser does not split
+    /// one today. This is a seam held open on purpose against the day something feeds this
+    /// scanner in pieces, and it fails against the code before this change on content alone.
+    #[test]
+    fn a_character_reference_split_across_a_chunk_boundary_still_decodes() {
+        let page = scan_writes(["<title>Isn&#x2", "7;t</title>"])
+            .expect("html this test wrote is readable");
+        assert_eq!(page.title.as_deref(), Some("Isn't"));
+        assert!(page.truncated.is_empty());
+    }
+
+    #[test]
+    fn a_title_with_nothing_to_decode_is_unchanged() {
+        let page = scan("<title>plain title</title>").expect("html this test wrote is readable");
+        assert_eq!(page.title.as_deref(), Some("plain title"));
+    }
+
+    /// Capping the raw buffer at the field's own ceiling, which is what this fix removes,
+    /// would have cut this title before it was ever decoded: spelled with a reference for
+    /// every character, it runs well past `MAX_TEXT_FIELD_BYTES` as written despite reading
+    /// far short of it once decoded, and the ceiling is only supposed to measure the latter.
+    #[test]
+    fn the_ceiling_is_measured_after_decoding_not_before() {
+        let repetitions = MAX_TEXT_FIELD_BYTES / 5 + 100;
+        let raw_title = "&amp;".repeat(repetitions);
+        assert!(raw_title.len() > MAX_TEXT_FIELD_BYTES);
+
+        let page =
+            scan(&format!("<title>{raw_title}</title>")).expect("html this test wrote is readable");
+
+        let title = page.title.expect("a title");
+        assert_eq!(title.len(), repetitions);
+        assert!(title.len() < MAX_TEXT_FIELD_BYTES);
+        assert!(title.chars().all(|character| character == '&'));
+        assert!(page.truncated.is_empty());
+    }
+
+    /// A title longer than the raw ceiling is cut before it is ever decoded, and the record
+    /// has to say so: the ceiling is evidence about the page, which is the whole reason
+    /// `Bound` exists.
+    #[test]
+    fn a_title_past_the_raw_ceiling_records_that_it_was_cut() {
+        let raw_title = "a".repeat(MAX_TITLE_RAW_BYTES + 1);
+
+        let page =
+            scan(&format!("<title>{raw_title}</title>")).expect("html this test wrote is readable");
+
+        assert!(page.truncated.contains(&Bound::Title));
+        assert_eq!(page.title.expect("a title").len(), MAX_TEXT_FIELD_BYTES);
+    }
+
+    /// The case that made the truncation mark independent of whether a title survived. What
+    /// the raw ceiling kept here is whitespace, so the decoded value trims away to nothing,
+    /// and a record saying both that the page had no title and that nothing was cut would be
+    /// asserting the opposite of what happened.
+    #[test]
+    fn a_title_cut_where_only_whitespace_fit_still_records_that_it_was_cut() {
+        let padding = " ".repeat(MAX_TITLE_RAW_BYTES + 1);
+
+        let page = scan(&format!("<title>{padding}Real Title</title>"))
+            .expect("html this test wrote is readable");
+
+        assert!(page.title.is_none());
+        assert!(page.truncated.contains(&Bound::Title));
+    }
 }

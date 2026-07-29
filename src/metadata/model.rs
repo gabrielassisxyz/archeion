@@ -20,7 +20,14 @@ use serde::{Deserialize, Serialize};
 /// address keeps the ampersand between its query parameters instead of an entity that made the
 /// parameter after it read as a different name. Records written by version 1 did not merely
 /// miss information, they said something else, so a pass over the archive has to redo them.
-pub const EXTRACTOR_VERSION: u32 = 2;
+///
+/// Version 3 does the same for the text inside a `<title>` element, which version 2 left out:
+/// a page whose only title is `Isn&#x27;t Efficient` kept the reference instead of the
+/// apostrophe. A page carrying an OpenGraph, Twitter or schema.org title was never affected,
+/// since the document title is only ever read as the last resort, but a page relying on it,
+/// most of the plain web, had the same field say something else. Records written by version 2
+/// have to be redone for the same reason version 1's did.
+pub const EXTRACTOR_VERSION: u32 = 3;
 
 /// Where a resolved value came from. Kept beside the value because the precedence rules are
 /// judgement calls: without this, a title that came out wrong gives nothing to look at.

@@ -47,6 +47,63 @@ const DEEP_POST_PAGE: &str = r#"<html><head><title>A post</title></head>
     <body><a href="/p/nested/too-deep">further in</a></body></html>"#;
 const TOO_DEEP_PAGE: &str =
     "<html><head><title>Too deep</title></head><body>two hops from the seed</body></html>";
+/// Two hrefs spelled the way pages in the wild spell them: one with the HTML entity a
+/// browser decodes before it ever reaches the network, `&amp;` rather than a literal `&`,
+/// one with a non-ASCII character already percent-encoded rather than written literally.
+/// The guard's own comparison keys one side on the href as the page wrote it and the other
+/// on whatever the engine actually requested; if the engine's link extraction and this
+/// project's own resolution of the same href ever disagreed on which of the two that is,
+/// either link would be reported lost despite being archived.
+const ENTITY_INDEX: &str = r#"<html><head><title>Entity link</title></head>
+    <body><a href="/entity-target?x=1&amp;y=2">read more</a>
+    <a href="/caf%C3%A9">percent encoded</a></body></html>"#;
+const ENTITY_TARGET_PAGE: &str =
+    "<html><head><title>Target</title></head><body>found through the entity</body></html>";
+const OTHER_SCHEME_TARGET_PAGE: &str =
+    "<html><head><title>Other scheme</title></head><body>reached anyway</body></html>";
+/// A page one hop deeper than `/base-href-index.html`, and the one that actually declares
+/// the tag: `<base href>` only changes what the page's own links resolve against, so it has
+/// no effect written on the index that merely links here.
+const INTRO_PAGE: &str =
+    "<html><head><title>Intro</title></head><body>reached through the rewritten base</body></html>";
+const FTP_TARGET_PAGE: &str =
+    "<html><head><title>Reached over http</title></head><body>the ordinary link</body></html>";
+
+/// An absolute self link spelled in the other scheme from the one the seed was typed with,
+/// which is ordinary on real sites and is exactly what `push_link` in the dependency
+/// rewrites to the seed's own scheme before the link ever reaches its frontier. The engine
+/// still fetches this over plain HTTP, since `answer` never looks at the scheme a request
+/// claimed to have come through, only at the path.
+fn other_scheme_index(port: u16) -> String {
+    format!(
+        r#"<html><head><title>Other scheme</title></head>
+        <body><a href="https://127.0.0.1:{port}/other-scheme-target">the other scheme</a></body></html>"#
+    )
+}
+
+/// A page one hop from the seed that declares an absolute `<base href>` and then links
+/// relatively against it, which resolves to the site's root rather than to a sibling of this
+/// page's own path. `hop_depth_guard` has no way to read `<base href>` back out of `Page`
+/// without a second HTML pass of its own, which is the open question this bead's tests pin
+/// the chosen answer to.
+fn base_href_guide_page(port: u16) -> String {
+    format!(
+        r#"<html><head><title>Guide</title>
+        <base href="http://127.0.0.1:{port}/"></head>
+        <body><a href="intro.html">intro</a></body></html>"#
+    )
+}
+
+const BASE_HREF_INDEX: &str = r#"<html><head><title>Base href</title></head>
+    <body><a href="/docs/guide.html">the guide</a></body></html>"#;
+
+/// A same-host link in a scheme the engine will never dial. `validate_link` in the
+/// dependency drops anything that is not `http` or `https` before it ever reaches the
+/// frontier, so nothing here has to answer an FTP request for the guard to be exercised: the
+/// question is only whether this project's own bookkeeping learns not to expect one either.
+const FTP_SCHEME_INDEX: &str = r#"<html><head><title>FTP link</title></head>
+    <body><a href="/ftp-target">the ordinary link</a>
+    <a href="ftp://127.0.0.1:1/pub/x">a link the engine will not dial</a></body></html>"#;
 
 fn article_page() -> String {
     format!(
@@ -104,6 +161,7 @@ fn a_seed_is_crawled_into_an_archive_that_the_run_creates() {
              articles      1 extracted, 0 refused\n  \
              assets        1 stored, 0 missed, 1 request(s)\n  \
              pages dropped 0\n  \
+             links lost    0\n  \
              stopped       nothing was left to fetch\n",
             archive = archive_path.display(),
             seed = site.url("/index.html"),
@@ -237,6 +295,399 @@ fn a_max_depth_of_one_takes_every_link_one_hop_from_the_seed_and_no_further() {
             .expect("captures are listed")
             .is_empty(),
         "a page two hops from the seed was archived at a depth of one"
+    );
+}
+
+/// The scheduling defect the test above works around, pinned directly rather than dodged.
+/// A page with two sibling links crawled at a concurrency of one loses one of them to the
+/// vendored crawl engine's own frontier about half the time; `docs/crawl-boundary.md` has
+/// the mechanism. There is no fix for that from here, so what this asserts is the guard
+/// instead: a run that comes up short says so and leaves with a failing exit code, and a
+/// run that genuinely archived every page still leaves with a clean one. Thirty runs make a
+/// coin flip that happened to hide from every one of them a chance of about one in a
+/// billion, and each run is three tiny pages over loopback, so the whole test stays well
+/// inside the budget of `cargo test`.
+///
+/// This site's own `/robots.txt` answers 404, which the engine reads as permission to fetch
+/// everything, so every loss this test sees is the genuine one: proof that the guard below,
+/// which excuses a link `robots.txt` disallows, still reports one that was never mentioned
+/// at all.
+#[test]
+fn a_concurrency_of_one_reports_a_link_it_never_followed_instead_of_a_false_success() {
+    let site = Site::start();
+    let mut losses_seen = 0;
+
+    for _ in 0..30 {
+        let dir = TempDir::new().expect("temp dir");
+        let archive_path = dir.path().join("collection");
+
+        let output = archeion()
+            .arg("capture")
+            .arg(&archive_path)
+            .arg(site.url("/depth-index.html"))
+            .args([
+                "--max-pages",
+                "10",
+                "--max-depth",
+                "1",
+                "--concurrency",
+                "1",
+                "--max-retries",
+                "0",
+            ])
+            .args(["--deadline", "30s", "--allow-private-addresses"])
+            .output()
+            .expect("the binary runs");
+
+        let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+        let captures_of = |path: &str| {
+            let url = CanonicalUrl::parse(&site.url(path)).expect("valid url");
+            archive
+                .list_captures(&url)
+                .expect("captures are listed")
+                .len()
+        };
+        let archived = captures_of("/depth-index.html")
+            + captures_of("/shallow")
+            + captures_of("/p/deep-post");
+
+        if output.status.success() {
+            assert_eq!(
+                archived,
+                3,
+                "the run reported success while holding fewer pages than it discovered: {}",
+                stdout_of(&output)
+            );
+        } else {
+            losses_seen += 1;
+            assert!(
+                archived < 3,
+                "the run reported a loss while the archive actually holds every page: {}",
+                stderr_of(&output)
+            );
+            assert!(
+                stderr_of(&output).contains("was discovered and never fetched"),
+                "{}",
+                stderr_of(&output)
+            );
+            assert!(
+                stderr_of(&output).contains("link(s) the crawl discovered were never fetched"),
+                "{}",
+                stderr_of(&output)
+            );
+        }
+    }
+
+    assert!(
+        losses_seen > 0,
+        "thirty runs at a concurrency of one never lost a single link, so this test never \
+         exercised the guard it exists to pin"
+    );
+}
+
+const ROBOTS_TXT_DISALLOWING_PRIVATE: &str = "User-agent: *\nDisallow: /private\n";
+const ROBOTS_SEED_PAGE: &str = r#"<html><head><title>Home</title></head>
+    <body><a href="/allowed">allowed</a><a href="/private">private</a></body></html>"#;
+const ROBOTS_ALLOWED_PAGE: &str =
+    "<html><head><title>Allowed</title></head><body>fine to read</body></html>";
+const ROBOTS_PRIVATE_PAGE: &str =
+    "<html><head><title>Private</title></head><body>the site said not to</body></html>";
+
+/// The false positive a real `robots.txt` creates for the guard two tests up: a page linking
+/// a path the site's own rules disallow is not the frontier dropping a link, and a run that
+/// respects the rule and still exhausts everything else has archived exactly what it should
+/// have. Concurrency four keeps this clear of the race the earlier test pins, so the only
+/// thing that can make this one fail is the guard disagreeing with what `robots.txt` said.
+#[test]
+fn a_link_disallowed_by_robots_txt_is_not_reported_as_a_lost_link() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let port = serve_a_site_that_disallows_one_path();
+    let seed = format!("http://127.0.0.1:{port}/");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(&seed)
+        .args([
+            "--max-pages",
+            "10",
+            "--max-depth",
+            "1",
+            "--concurrency",
+            "4",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(stderr_of(&output), "");
+    assert!(
+        stdout_of(&output).contains("links lost    0"),
+        "{}",
+        stdout_of(&output)
+    );
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    let allowed = CanonicalUrl::parse(&format!("{seed}allowed")).expect("valid url");
+    assert!(
+        !archive
+            .list_captures(&allowed)
+            .expect("captures are listed")
+            .is_empty(),
+        "the page robots.txt actually allows was not archived"
+    );
+    let private = CanonicalUrl::parse(&format!("{seed}private")).expect("valid url");
+    assert!(
+        archive
+            .list_captures(&private)
+            .expect("captures are listed")
+            .is_empty(),
+        "a path robots.txt disallows was fetched anyway"
+    );
+}
+
+/// A site whose own rules disallow one of its two linked pages, answered by a server this
+/// test starts and nothing else: `/robots.txt` is a real 200 here rather than the 404 every
+/// other test in this file relies on, since the whole point is a rule the crawl has to read.
+fn serve_a_site_that_disallows_one_path() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || answer_with_a_robots_rule(stream));
+        }
+    });
+    port
+}
+
+fn answer_with_a_robots_rule(mut stream: TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    let (media_type, body): (&str, &[u8]) = match path.as_str() {
+        "/robots.txt" => ("text/plain", ROBOTS_TXT_DISALLOWING_PRIVATE.as_bytes()),
+        "/" => ("text/html; charset=utf-8", ROBOTS_SEED_PAGE.as_bytes()),
+        "/allowed" => ("text/html; charset=utf-8", ROBOTS_ALLOWED_PAGE.as_bytes()),
+        "/private" => ("text/html; charset=utf-8", ROBOTS_PRIVATE_PAGE.as_bytes()),
+        _ => ("text/plain", b"not here"),
+    };
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {media_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
+/// The other way a discovered link can look lost without being lost: not a rule that
+/// refused it, but a spelling the two sides of the comparison read differently. Two shapes
+/// pages in the wild actually write: an entity inside an href rather than the character it
+/// stands for, and a non-ASCII character percent-encoded rather than written literally.
+/// Both still have to end up archived and unreported.
+///
+/// This does not assert what either linked page's canonical URL comes out as. The engine's
+/// own link extraction turns out not to decode the entity before it is joined into a URL,
+/// which is a real defect and not this one: it mis-parses the query string rather than
+/// losing the link, and both sides of the comparison this guard runs are wrong about the
+/// address in exactly the same way, so nothing here disagrees with anything else. What is
+/// asserted is the part that is this bead's to answer: both links are still followed, still
+/// archived, and never reported as ones the crawl discovered and did not fetch.
+#[test]
+fn a_link_whose_href_spells_its_query_string_with_an_entity_is_archived_and_not_reported_lost() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let site = Site::start();
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(site.url("/entity-index.html"))
+        .args([
+            "--max-pages",
+            "4",
+            "--max-depth",
+            "1",
+            "--concurrency",
+            "4",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(stderr_of(&output), "");
+    assert!(
+        stdout_of(&output).contains("archived 3 capture(s)"),
+        "{}",
+        stdout_of(&output)
+    );
+    assert!(
+        stdout_of(&output).contains("links lost    0"),
+        "{}",
+        stdout_of(&output)
+    );
+}
+
+/// The mirror of the case above and the one seen on real sites: an absolute self link
+/// hardcoded in the other scheme from the one the seed was typed with. `push_link` in the
+/// dependency rewrites a resolved, in-scope link's scheme to the seed's own before the link
+/// ever reaches its frontier, so the fetch lands on the seed's scheme regardless of what the
+/// page wrote; `depth_key` has to land on the same spelling or this reports a link archived
+/// under a different scheme than the one it recorded.
+#[test]
+fn a_page_carrying_an_absolute_self_link_in_the_other_scheme_is_archived_without_a_reported_loss() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let site = Site::start();
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(site.url("/other-scheme-index.html"))
+        .args([
+            "--max-pages",
+            "4",
+            "--max-depth",
+            "1",
+            "--concurrency",
+            "4",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(stderr_of(&output), "");
+    assert!(
+        stdout_of(&output).contains("links lost    0"),
+        "{}",
+        stdout_of(&output)
+    );
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    let target = CanonicalUrl::parse(&site.url("/other-scheme-target")).expect("valid url");
+    assert!(
+        !archive
+            .list_captures(&target)
+            .expect("captures are listed")
+            .is_empty(),
+        "the link written in the other scheme was not archived"
+    );
+}
+
+/// A page declaring an absolute `<base href>` resolves every relative link on it against
+/// that value instead of against its own URL. This adapter has no way to read the same base
+/// back out of `Page` without a second HTML pass of its own, so a page like this one is left
+/// out of the depth map entirely: `docs/crawl-boundary.md` has the trade being made. What
+/// this pins is the outward half of that decision, that the page underneath the rewritten
+/// base is still archived and never reported as a link the crawl lost.
+#[test]
+fn a_page_declaring_an_absolute_base_href_is_archived_without_a_reported_loss() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let site = Site::start();
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(site.url("/base-href-index.html"))
+        .args([
+            "--max-pages",
+            "10",
+            "--max-depth",
+            "2",
+            "--concurrency",
+            "4",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(stderr_of(&output), "");
+    assert!(
+        stdout_of(&output).contains("links lost    0"),
+        "{}",
+        stdout_of(&output)
+    );
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    let intro = CanonicalUrl::parse(&site.url("/intro.html")).expect("valid url");
+    assert!(
+        !archive
+            .list_captures(&intro)
+            .expect("captures are listed")
+            .is_empty(),
+        "the page reached through the rewritten base was not archived"
+    );
+}
+
+/// A same-host link in a scheme the engine will never dial. `validate_link` in the
+/// dependency drops anything that is not `http` or `https` before it ever reaches the
+/// frontier, so this project's own bookkeeping has to drop it on the same terms or it
+/// reports a fetch the engine was never going to make.
+#[test]
+fn a_same_host_link_in_an_unfetchable_scheme_is_not_reported_as_a_lost_link() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let site = Site::start();
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(site.url("/ftp-index.html"))
+        .args([
+            "--max-pages",
+            "4",
+            "--max-depth",
+            "1",
+            "--concurrency",
+            "4",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(stderr_of(&output), "");
+    assert!(
+        stdout_of(&output).contains("links lost    0"),
+        "{}",
+        stdout_of(&output)
+    );
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    let target = CanonicalUrl::parse(&site.url("/ftp-target")).expect("valid url");
+    assert!(
+        !archive
+            .list_captures(&target)
+            .expect("captures are listed")
+            .is_empty(),
+        "the ordinary link beside the FTP one was not archived"
     );
 }
 
@@ -421,7 +872,7 @@ impl Site {
                 // server that answered them in turn would hold every later request behind
                 // whichever connection was opened first and left idle, and the run would
                 // then produce nothing until its deadline rather than fail.
-                thread::spawn(move || answer(stream));
+                thread::spawn(move || answer(stream, port));
             }
         });
         Self { port }
@@ -432,7 +883,7 @@ impl Site {
     }
 }
 
-fn answer(mut stream: TcpStream) -> std::io::Result<()> {
+fn answer(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
     // A connection that goes quiet mid-request gives up its thread instead of holding it for
     // as long as the client feels like keeping it open.
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -452,6 +903,8 @@ fn answer(mut stream: TcpStream) -> std::io::Result<()> {
         .unwrap_or_default()
         .to_owned();
     let article = article_page();
+    let other_scheme_index_page = other_scheme_index(port);
+    let base_href_guide = base_href_guide_page(port);
     let (status, media_type, body): (&str, &str, &[u8]) = match path.as_str() {
         // A 404 is the answer that permits every path, and the crawl asks for this first.
         "/robots.txt" => ("404 Not Found", "text/plain", b""),
@@ -479,6 +932,55 @@ fn answer(mut stream: TcpStream) -> std::io::Result<()> {
             "200 OK",
             "text/html; charset=utf-8",
             TOO_DEEP_PAGE.as_bytes(),
+        ),
+        "/entity-index.html" => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            ENTITY_INDEX.as_bytes(),
+        ),
+        "/other-scheme-index.html" => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            other_scheme_index_page.as_bytes(),
+        ),
+        "/other-scheme-target" => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            OTHER_SCHEME_TARGET_PAGE.as_bytes(),
+        ),
+        "/base-href-index.html" => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            BASE_HREF_INDEX.as_bytes(),
+        ),
+        "/docs/guide.html" => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            base_href_guide.as_bytes(),
+        ),
+        "/intro.html" => ("200 OK", "text/html; charset=utf-8", INTRO_PAGE.as_bytes()),
+        "/ftp-index.html" => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            FTP_SCHEME_INDEX.as_bytes(),
+        ),
+        "/ftp-target" => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            FTP_TARGET_PAGE.as_bytes(),
+        ),
+        // Answered on the path alone, whatever the query string turns out to be spelled
+        // as by the time it is requested: what this fixture is asking is whether the link
+        // is followed and archived at all, not whether the entity in it was decoded first.
+        path if path.starts_with("/entity-target") => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            ENTITY_TARGET_PAGE.as_bytes(),
+        ),
+        path if path.starts_with("/caf") => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            ENTITY_TARGET_PAGE.as_bytes(),
         ),
         _ => ("404 Not Found", "text/plain", b"not here"),
     };

@@ -84,10 +84,10 @@ Non-zero means the archive is not what it should be. It never means the web misb
 | code | what happened |
 |---|---|
 | 0 | the command did what it was asked |
-| 1 | the archive is missing or damaged, a seed was refused, a write failed, or a run ended up holding less than it fetched |
+| 1 | the archive is missing or damaged, a seed was refused, a write failed, a run ended up holding less than it fetched, or the crawl discovered a link it never fetched at all |
 | 2 | the command line could not be read |
 
-The distinction is the point. A URL nobody answered, a page whose address the canonical rules refuse, a page that ended inside a network and markup the extractor could not read are all reported on stderr and none of them is a failure: a crawl of two hundred pages meeting three dead links did its job, and a pipeline that stopped there would stop on nearly every site. A refused seed, a failed write, an archive that is not one and pages the crawl fetched that never reached the archive are failures, because each of those is the collection being smaller or stranger than the run claimed.
+The distinction is the point. A URL nobody answered, a page whose address the canonical rules refuse, a page that ended inside a network and markup the extractor could not read are all reported on stderr and none of them is a failure: a crawl of two hundred pages meeting three dead links did its job, and a pipeline that stopped there would stop on nearly every site. A refused seed, a failed write, an archive that is not one, pages the crawl fetched that never reached the archive, and a link the crawl found and never fetched at all are failures, because each of those is the collection being smaller or stranger than the run claimed.
 
 `list` and `export` follow the same rule from the other side: an item the walk could not read is reported, the intact items are still printed, and the code is what keeps a script from reading a short answer as a complete one.
 
@@ -97,7 +97,7 @@ The distinction is the point. A URL nobody answered, a page whose address the ca
 
 `list` answers with one object per line rather than one array, so a collection of any size can be read without holding all of it and `grep` stays a legitimate way to ask a question of it.
 
-`capture` and `export` answer with one object each, because each reports on a run rather than listing a collection. The capture object carries the counts the human report shows plus every URL the run did not archive, grouped by why: `failed_fetches`, `unaddressable_pages`, `pages_inside_a_network`, `unreadable_pages` and `unreadable_articles`. The export object carries the number of notes written and the paths it could not read.
+`capture` and `export` answer with one object each, because each reports on a run rather than listing a collection. The capture object carries the counts the human report shows plus every URL the run did not archive, grouped by why: `failed_fetches`, `unaddressable_pages`, `pages_inside_a_network`, `unreadable_pages`, `unreadable_articles` and `links_never_followed`. The export object carries the number of notes written and the paths it could not read.
 
 Both objects are declared by the command line rather than serialized off the library's own report. A field added to a record inside the crate is then not accidentally a promise to everything already parsing this output.
 

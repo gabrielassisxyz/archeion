@@ -144,7 +144,17 @@ fn fetch_one_url(url: &str, seed: &Seed) -> PageEvent {
         // A single fetch never crawls, so the callback this feeds `hop_depth_guard` is
         // never invoked and nothing is ever read back out of the map.
         let depths = Arc::new(Mutex::new(HashMap::new()));
-        let client = configured_website(url, seed, depths).configure_http_client();
+        let mut website = configured_website(url, seed, depths);
+        // The client comes from the engine's own setup, the same way a crawl gets one, and not
+        // from the builder underneath it. A client built straight from that builder cannot
+        // send at all: the request fails before a connection is opened, against a server that
+        // never sees one, with an error naming the URL and saying nothing else. Which step of
+        // that setup the client depends on is not established, only that the whole of it is
+        // enough and that the steps this file could reach on their own are not. It stayed
+        // invisible for as long as every fetch here followed a crawl, which is what acquiring
+        // the subresources of a page a crawl delivered guarantees, and nothing on this path
+        // may depend on somebody else having gone first.
+        let (client, _handler) = website.setup_base();
         page_event(Page::new_page(url, &client).await)
     })
 }

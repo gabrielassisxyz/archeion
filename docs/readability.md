@@ -169,6 +169,18 @@ A `strip` says nothing about where the article is, so it changes neither, and a 
 
 A rule reaches only inside `<body>`. Everything else a selector can name is either meaningless, as an article that is the whole page, or destructive: a `strip` on `html` leaves the scorer no tree, and a `body` of `*` reparents the `<head>` into the document body, after which the page has no head and its title text starts counting as text the page said. A page with no body at all is a `<frameset>`, which has no article in it; a host that named where its articles are has therefore already answered for it, and a host that only named furniture has nothing there to take out.
 
+### Arriving at a selector
+
+A rule is written against pages that are already captured, which is what makes finding one cheap. The responses are on disk and a repass fetches no page, only the subresources a capture recorded as missed, so reading an article, changing the rule and repassing all run against bytes the site has already served.
+
+The failure shows up in the article and its cause is only in the response. What survived into the Markdown is text, and a selector describes markup, so the text is where the search starts rather than what the rule can name. The response bodies are stored as blobs under their content hash, so a search across them finds the markup around that text, and the capture record carrying that hash says which page it came from.
+
+Naming the container rather than the text is what makes a rule outlast the page it was written against. Text that survives is usually what a module renders in one of its states, and a selector aimed at that state stops matching the moment the module has something to show, which is when it contributes more rather than less. A footer listing a publication's other posts is the shape this keeps arriving as: empty it reaches the article as a two word paragraph, full it reaches the article as a block of links, and the element holding both is what the rule should name.
+
+What a rule changed is then a comparison of two exports, since the question is not whether the furniture is gone but what else moved with it. An item that had an article and no longer has one has left the export entirely, which is what a `strip` naming too much costs: the sliver rule still runs on what the strip left behind, and a short page loses its article to it.
+
+The `rules` field is the other half of that reading, and it lives on the records inside the archive rather than in the export. It says different things for the two directives. A page whose `strip` selectors all missed records `heuristic`, so counting those across a host separates a selector that describes the site from one that describes a single page. A `body` rule records the host on every page it reached, the pages where it found nothing included, because a page without the article a rule names is answered as not an article rather than handed back to the heuristic.
+
 ### A broken rule file costs extractions, never a capture
 
 Everything that can go wrong degrades to the heuristic and reports why. A file that is absent is the ordinary case and says nothing at all. A file that no parser will read, one larger than 256 KiB, or a path that is not a regular file, leaves the extractor exactly where it was. A selector no CSS parser will read drops its host and no other: dropping the whole file would let one typo silently switch off every rule beside it, and dropping the selector alone would leave a rule doing something its author did not write.

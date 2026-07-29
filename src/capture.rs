@@ -76,6 +76,11 @@ pub struct CaptureRun {
     pub unreadable_articles: Vec<UnreadableArticle>,
     /// Pages the engine fetched that never reached the archive, straight from the engine.
     pub pages_dropped: usize,
+    /// Links the crawl discovered, inside the seed's own limits, that the engine never
+    /// fetched at all even though the run reports nothing was left to do. Straight from
+    /// the engine, and reported rather than counted for the reason every other URL here is:
+    /// each one is a page the archive is missing that a person can go and look at.
+    pub links_never_followed: Vec<String>,
     /// Subresources stored beside the captures of this run.
     pub assets_stored: usize,
     /// Subresources a page referenced and its capture does not hold. Each one is in the
@@ -135,6 +140,7 @@ pub fn capture_seed(
     })?;
 
     run.pages_dropped = outcome.pages_dropped;
+    run.links_never_followed = outcome.links_never_followed;
     run.asset_fetches = assets.fetches();
     // The engine reports that its caller stopped it. This is that caller, and it knows why.
     run.stopped = if engine_overran {
@@ -1019,6 +1025,27 @@ mod tests {
 
         assert_eq!(run.captures_written, 1);
         assert_eq!(run.pages_dropped, 3);
+    }
+
+    /// The engine's frontier can lose a link before ever fetching it, which is a different
+    /// shape from the one above: nothing was spent on it, and the only trace of it is the
+    /// engine saying so through the outcome.
+    #[test]
+    fn links_the_engine_never_followed_are_carried_into_the_report() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut engine =
+            ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, "<html>a</html>")]);
+        engine.outcome.links_never_followed = vec!["https://example.com/b".to_owned()];
+
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.captures_written, 1);
+        assert_eq!(
+            run.links_never_followed,
+            vec!["https://example.com/b".to_owned()]
+        );
     }
 
     /// The engine here replays a list and knows nothing about a deadline, which is exactly

@@ -265,6 +265,16 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
+    // A link the crawl found and never fetched is the same failure from the other side:
+    // the frontier lost it before a request was ever made, and a run that says it
+    // exhausted the seed while one of these is sitting in the report would be lying.
+    if !run.links_never_followed.is_empty() {
+        return Err(format!(
+            "{} link(s) the crawl discovered were never fetched",
+            run.links_never_followed.len()
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -321,6 +331,7 @@ struct CaptureReport {
     assets_missed: usize,
     asset_fetches: usize,
     pages_dropped: usize,
+    links_never_followed: Vec<String>,
     stopped: &'static str,
     failed_fetches: Vec<Loss>,
     unaddressable_pages: Vec<Loss>,
@@ -341,6 +352,7 @@ fn report_of(args: &CaptureArgs, run: &CaptureRun, created: bool) -> CaptureRepo
         assets_missed: run.assets_missed,
         asset_fetches: run.asset_fetches,
         pages_dropped: run.pages_dropped,
+        links_never_followed: run.links_never_followed.clone(),
         stopped: stop_name(run.stopped),
         failed_fetches: run
             .failed_fetches
@@ -426,6 +438,7 @@ fn human_report(report: &CaptureReport, stopped: CrawlStop) -> String {
             ),
         ),
         ("pages dropped", report.pages_dropped.to_string()),
+        ("links lost", report.links_never_followed.len().to_string()),
         ("stopped", stop_sentence(stopped).to_owned()),
     ];
     for (label, value) in rows {
@@ -464,11 +477,16 @@ fn losses(run: &CaptureRun) -> Vec<String> {
             article.url, article.reason
         )
     });
+    let never_followed = run
+        .links_never_followed
+        .iter()
+        .map(|url| format!("{url} was discovered and never fetched"));
     failed
         .chain(unaddressable)
         .chain(internal)
         .chain(unreadable_markup)
         .chain(unreadable_prose)
+        .chain(never_followed)
         .collect()
 }
 

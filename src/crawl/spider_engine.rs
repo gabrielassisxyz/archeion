@@ -9,13 +9,14 @@
 //! is confined to this file. `docs/crawl-boundary.md` has the reasoning and what a second
 //! adapter would have to provide.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use jiff::Timestamp;
+use lol_html::{HtmlRewriter, MemorySettings, Settings, element};
 use spider::configuration::RedirectPolicy;
 use spider::page::Page;
 use spider::reqwest::header::{CONTENT_LENGTH, HeaderMap};
@@ -140,7 +141,10 @@ fn fetch_one_url(url: &str, seed: &Seed) -> PageEvent {
         }
     };
     runtime.block_on(async {
-        let client = configured_website(url, seed).configure_http_client();
+        // A single fetch never crawls, so the callback this feeds `hop_depth_guard` is
+        // never invoked and nothing is ever read back out of the map.
+        let depths = Arc::new(Mutex::new(HashMap::new()));
+        let client = configured_website(url, seed, depths).configure_http_client();
         page_event(Page::new_page(url, &client).await)
     })
 }
@@ -209,13 +213,27 @@ async fn crawl_seed(
     seed: &Seed,
     on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
 ) -> CrawlOutcome {
-    let mut website = configured_website(start, seed);
+    // Shared with `hop_depth_guard` through `configured_website`, and read again below once
+    // the crawl ends: every same-host link the guard judged inside `max_depth` lands here,
+    // whether or not the engine ever came back to fetch it.
+    let depths: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut website = configured_website(start, seed, Arc::clone(&depths));
     // The engine fetches while the caller writes to disk, so the queue between them has to
     // absorb the difference. Sizing it to the fetch concurrency alone drops pages the
     // moment a write is slower than a fetch; sizing it to the page limit would hold a
     // whole crawl's bodies in memory. What overflows anyway is counted, never ignored.
     let mut pages = website.subscribe(fetch_concurrency(seed) * 4);
     let mut outcome = CrawlOutcome::default();
+
+    // Every URL this crawl actually handed to the caller, response or not. Compared against
+    // `depths` once the crawl claims to be done, this is what tells a link the engine
+    // dropped in its own frontier apart from one this adapter never promised to follow.
+    let mut fetched: HashSet<String> = HashSet::new();
+    let scheme = frontier_scheme(start);
+    let mut on_page = |event: PageEvent| {
+        fetched.insert(depth_key(requested_url_of(&event), &scheme));
+        on_page(event)
+    };
 
     // Scoped so the borrow of the website ends with the crawl it was driving.
     let mut stopped = {
@@ -224,14 +242,14 @@ async fn crawl_seed(
             // Drops the sender, which is what ends the drain below once it is empty.
             website.unsubscribe();
         };
-        crawl_until(crawl, seed.deadline, &mut pages, on_page, &mut outcome).await
+        crawl_until(crawl, seed.deadline, &mut pages, &mut on_page, &mut outcome).await
     };
 
     match stopped {
         // The crawl finishing does not mean the queue is empty, and cancelling the drain to
         // learn that would throw away pages already fetched.
         CrawlStop::Exhausted => {
-            if drain(&mut pages, on_page, &mut outcome).await {
+            if drain(&mut pages, &mut on_page, &mut outcome).await {
                 outcome.pages_dropped += pages.len();
                 stopped = CrawlStop::CallerStopped;
             }
@@ -240,11 +258,87 @@ async fn crawl_seed(
         // fetch each and the archive does not have them. The count is a floor, since a task
         // still in flight can queue another page after the length is read.
         CrawlStop::CallerStopped => outcome.pages_dropped += pages.len(),
-        CrawlStop::DeadlineReached => drain_queued(&mut pages, on_page, &mut outcome),
+        CrawlStop::DeadlineReached => drain_queued(&mut pages, &mut on_page, &mut outcome),
     }
 
     outcome.stopped = stopped;
+    // Gated by `frontier_claim_is_trustworthy` below. A run stopped by its deadline or by the
+    // caller already has an honest reason for what it left behind, and comparing against
+    // `depths` there would report the budget as if it were this defect.
+    //
+    // `website` is asked rather than answered for a second time: `robots.txt` was already
+    // read, during `setup()` inside `website.crawl()` above, well before the first page was
+    // fetched, so the parser it built is exactly the one that decided every link the crawl
+    // itself declined to follow. Asking anything else would be a second implementation of
+    // `robots.txt` next to the engine's own, and the two are not guaranteed to agree, least
+    // of all on a rule this project already knows the engine's parser reads wrong: it
+    // cannot match a `Disallow` with an interior wildcard, so it under-refuses rather than
+    // over-refuses there. A guard built on a second implementation would then report the gap
+    // between the two parsers as data loss, on exactly the sites where the exit code matters
+    // most. Asking is sound with no `robots.txt` served at all, too: the engine reads a 4xx
+    // for the file itself as permission to fetch everything, and answers the same way if
+    // `respect_robots_txt` were ever off.
+    if frontier_claim_is_trustworthy(outcome.stopped, outcome.pages_dropped) {
+        let discovered = depths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        outcome.links_never_followed = links_discovered_but_never_fetched(
+            &discovered,
+            &fetched,
+            start,
+            seed.max_pages,
+            |url| website.is_allowed_robots(url),
+        );
+    }
     outcome
+}
+
+/// Whether `CrawlStop::Exhausted` is a claim this run can actually stand behind, which is the
+/// gate `crawl_seed` gives the map above before trusting it at all.
+///
+/// A page counted into `pages_dropped` never reached `on_page`, so it is missing from
+/// `fetched` without anything having been refused by a budget: it is the queue between the
+/// engine and the archive losing a page it already paid for, which is a different failure
+/// with its own honest count already sitting in the outcome. Comparing `depths` against
+/// `fetched` while that count is nonzero would blame every link the crawl genuinely left in
+/// the frontier behind the lost page on this guard instead, which on a run that lost only a
+/// couple of pages out of a large crawl is thousands of lines on stderr for a loss the report
+/// already states in one number.
+fn frontier_claim_is_trustworthy(stopped: CrawlStop, pages_dropped: usize) -> bool {
+    stopped == CrawlStop::Exhausted && pages_dropped == 0
+}
+
+/// What the engine discovered as a followable, same-host link and never handed back at
+/// all, once a crawl claims there was nothing left to fetch.
+///
+/// A link only reaches `discovered` if `hop_depth_guard` already judged it in scope, so
+/// this is never firing on the depth budget, on the whitelist or the blacklist, since this
+/// adapter never sets either, or on a link already visited, since `discovered` only ever
+/// holds one entry per URL regardless of how many pages named it. `max_pages` is excluded
+/// on purpose too: a link left over when the crawl was told to stop at some number of pages
+/// is that budget working as asked, not a link the engine lost, and comparing against the
+/// pages this adapter actually received rather than a count read from inside the engine is
+/// what keeps the two from being confused. `robots_allows` excludes the one remaining
+/// reason the engine declines a link on its own: a rule the site's `robots.txt` states,
+/// asked of the engine's own parser rather than reimplemented here.
+fn links_discovered_but_never_fetched(
+    discovered: &HashMap<String, usize>,
+    fetched: &HashSet<String>,
+    seed_url: &str,
+    max_pages: u32,
+    robots_allows: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    if fetched.len() >= max_pages as usize {
+        return Vec::new();
+    }
+    let seed_key = depth_key(seed_url, &frontier_scheme(seed_url));
+    let mut missing: Vec<String> = discovered
+        .keys()
+        .filter(|url| **url != seed_key && !fetched.contains(*url) && robots_allows(url))
+        .cloned()
+        .collect();
+    missing.sort();
+    missing
 }
 
 /// Runs a crawl against the caller and the clock, and answers which of the three ended it.
@@ -338,7 +432,11 @@ fn fetch_concurrency(seed: &Seed) -> usize {
     seed.concurrency.max(1)
 }
 
-fn configured_website(start: &str, seed: &Seed) -> Website {
+fn configured_website(
+    start: &str,
+    seed: &Seed,
+    depths: Arc<Mutex<HashMap<String, usize>>>,
+) -> Website {
     let mut website = Website::new(start);
     website
         .with_limit(seed.max_pages)
@@ -350,7 +448,7 @@ fn configured_website(start: &str, seed: &Seed) -> Website {
         // every page this callback sees.
         .with_depth(0)
         .with_return_page_links(true)
-        .with_on_should_crawl_callback_closure(Some(hop_depth_guard(start, seed.max_depth)))
+        .with_on_should_crawl_callback_closure(Some(hop_depth_guard(start, seed.max_depth, depths)))
         .with_concurrency_limit(Some(fetch_concurrency(seed)))
         .with_delay(u64::try_from(seed.delay.as_millis()).unwrap_or(u64::MAX))
         // A ceiling on one request, not on the crawl. It reaches the HTTP client, so a
@@ -415,24 +513,46 @@ fn configured_website(start: &str, seed: &Seed) -> Website {
 /// A poisoned lock, which would only mean some other call to this closure panicked mid
 /// update, is recovered from rather than allowed to fail every page for the rest of the
 /// run.
+///
+/// `depths` arrives from the caller rather than being built here, because `crawl_seed`
+/// reads it again once the crawl ends, to compare what it discovered against what it
+/// actually fetched. The seed itself is entered at zero before anything else, which is
+/// also why it is the one page never missing from the map.
 fn hop_depth_guard(
     seed_url: &str,
     max_depth: usize,
+    depths: Arc<Mutex<HashMap<String, usize>>>,
 ) -> impl Fn(&Page) -> bool + Send + Sync + 'static {
     let seed_host = Url::parse(seed_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned));
-    let depths: Arc<Mutex<HashMap<String, usize>>> =
-        Arc::new(Mutex::new(HashMap::from([(depth_key(seed_url), 0)])));
+    let seed_scheme = frontier_scheme(seed_url);
+    depths
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(depth_key(seed_url, &seed_scheme))
+        .or_insert(0);
     move |page: &Page| {
         let mut depths = depths
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let depth = depths.get(&depth_key(page.get_url())).copied().unwrap_or(0);
+        let depth = depths
+            .get(&depth_key(page.get_url(), &seed_scheme))
+            .copied()
+            .unwrap_or(0);
         if depth >= max_depth {
             // Nothing found here can be expanded, so recording it would only be a page's
             // chance to spend this crawl's memory on addresses the crawl will never visit.
             return false;
+        }
+        // A page that declares an absolute `<base href>` resolves every one of its links
+        // against that value rather than against its own URL, and this has no way to
+        // resolve against the same base without reimplementing the engine's own rule for
+        // it. Leaving this page's links out of the map entirely is cheaper than reporting
+        // an address the site never had as one the crawl lost: see
+        // `page_declares_an_absolute_base_href` for why that is the trade being made.
+        if page_declares_an_absolute_base_href(page) {
+            return true;
         }
         // `page_links` holds hrefs as the page wrote them, which is relative as often as
         // not, while every page later arrives here identified by its absolute URL: without
@@ -451,8 +571,16 @@ fn hop_depth_guard(
                 if resolved.host_str() != seed_host.as_deref() {
                     continue;
                 }
+                // The engine's own frontier drops anything that is not http or https
+                // before it ever forces the scheme below, so a same-host link in another
+                // scheme, `ftp://` being the one seen in the wild, is never queued and
+                // recording it here would report a fetch the engine was never going to
+                // make in the first place.
+                if !matches!(resolved.scheme(), "http" | "https") {
+                    continue;
+                }
                 depths
-                    .entry(depth_key(resolved.as_str()))
+                    .entry(depth_key(resolved.as_str(), &seed_scheme))
                     .and_modify(|known| *known = (*known).min(depth + 1))
                     .or_insert(depth + 1);
             }
@@ -465,16 +593,94 @@ fn hop_depth_guard(
 ///
 /// The engine drops a fragment before queueing a link, so an address discovered as
 /// `/a#section` is fetched as `/a` and would look up nothing under the spelling it was
-/// stored with. Everything else is left exactly as it arrived: this is a key for matching
-/// one crawl's own URLs against each other, not the archive's canonical form, and the two
-/// answer different questions.
-fn depth_key(url: &str) -> String {
+/// stored with. It also forces the scheme of every resolved, in-scope link to the scheme
+/// below before the link ever reaches its frontier, regardless of what the page wrote, so a
+/// hardcoded `http://` link on an `https://` seed, or the mirror of that, is queued under a
+/// spelling that has nothing to do with the href's own text. Everything else is left exactly
+/// as it arrived: this is a key for matching one crawl's own URLs against each other, not the
+/// archive's canonical form, and the two answer different questions.
+fn depth_key(url: &str, scheme: &str) -> String {
     match Url::parse(url) {
         Ok(mut parsed) => {
             parsed.set_fragment(None);
+            let _ = parsed.set_scheme(scheme);
             parsed.to_string()
         }
         Err(_) => url.to_owned(),
+    }
+}
+
+/// The scheme every key in the depth map is forced to, taken once from the seed exactly as
+/// the dependency takes its own `parent_host_scheme`: read once, at the start of the crawl,
+/// and never rebuilt from a redirect. `push_link` overwrites the scheme of every resolved,
+/// in-scope link to this same value before it reaches the frontier, so a page that hardcodes
+/// the other scheme in an absolute self link is still fetched and archived, only under the
+/// seed's scheme rather than the page's own; matching that here is what keeps `depth_key`
+/// from recording the link under a spelling the frontier never uses.
+///
+/// `usable_seed_url` already refuses a seed whose scheme is not http or https before this
+/// runs, so the fallback below is unreached in practice.
+fn frontier_scheme(seed_url: &str) -> String {
+    Url::parse(seed_url)
+        .map(|parsed| parsed.scheme().to_owned())
+        .unwrap_or_else(|_| "https".to_owned())
+}
+
+/// The most a `<base href>` scan may buffer while it looks for one selector. The page body
+/// reaching here already passed the response byte ceiling, so this bounds the parser's own
+/// working memory rather than the page, the same way `MAX_PARSER_MEMORY_BYTES` does for the
+/// metadata scan.
+const MAX_BASE_HREF_SCAN_MEMORY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Whether a page declared a `<base href>` that parses as an absolute URL, which is exactly
+/// the condition under which the engine's own base-href handler fires and switches every
+/// later link on the page to resolve against that value instead of the page's own address.
+/// A relative value, `<base href="/">` included, never parses as absolute and is inert on
+/// both sides, so it is not a case this has to detect.
+///
+/// `hop_depth_guard` resolves a page's links against the page's own URL, and has no way to
+/// resolve against the engine's base without reimplementing the engine's own rule for it. A
+/// page this reports true for has its links left out of the depth map entirely rather than
+/// recorded under the wrong resolution: a link this project can no longer place is read as
+/// one hop from the seed the same way a page this cannot place already is, which is the
+/// direction this whole guard already fails open in, and it costs far less than reporting an
+/// address the site never had as one the crawl lost.
+fn page_declares_an_absolute_base_href(page: &Page) -> bool {
+    let mut found = false;
+    let mut rewriter = HtmlRewriter::new(
+        Settings {
+            element_content_handlers: vec![element!("base[href]", |el| {
+                if !found {
+                    found = el
+                        .get_attribute("href")
+                        .is_some_and(|href| Url::parse(&href).is_ok());
+                }
+                Ok(())
+            })],
+            memory_settings: MemorySettings {
+                max_allowed_memory_usage: MAX_BASE_HREF_SCAN_MEMORY_BYTES,
+                ..MemorySettings::new()
+            },
+            strict: false,
+            ..Settings::new()
+        },
+        // The rewritten output is the input, and this only ever reads: dropping it keeps
+        // the cost of a large page the size of its tokens rather than of itself.
+        |_: &[u8]| {},
+    );
+    let _ = rewriter.write(page.get_html_bytes_u8());
+    let _ = rewriter.end();
+    found
+}
+
+/// The URL a page event is filed under before any redirect, which is the spelling
+/// `hop_depth_guard` recorded a discovered link as. The final URL is where a redirected
+/// response ended up, and comparing against that would mark a link followed under an
+/// address it was never queued under.
+fn requested_url_of(event: &PageEvent) -> &str {
+    match event {
+        PageEvent::Response(response) => &response.requested_url,
+        PageEvent::NoResponse(failure) => &failure.url,
     }
 }
 
@@ -601,6 +807,12 @@ mod tests {
     use spider::tokio::sync::broadcast;
 
     use super::*;
+
+    /// A fresh map for a test that has no depths of its own to seed, which is every test
+    /// here except the ones asserting on `hop_depth_guard` and `crawl_seed` directly.
+    fn empty_depths() -> Arc<Mutex<HashMap<String, usize>>> {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
 
     #[test]
     fn a_seed_that_would_not_be_fetched_over_http_is_refused() {
@@ -1058,7 +1270,7 @@ mod tests {
         seed.request_timeout = Duration::from_secs(7);
         seed.max_retries = 3;
 
-        let website = configured_website("https://example.com/", &seed);
+        let website = configured_website("https://example.com/", &seed, empty_depths());
 
         assert_eq!(
             website.configuration.request_timeout,
@@ -1080,8 +1292,11 @@ mod tests {
     /// runs, the pages still arrive, and a hop into the metadata service is followed.
     #[test]
     fn a_redirect_is_screened_and_bounded_rather_than_followed_wherever_it_leads() {
-        let website =
-            configured_website("https://example.com/", &Seed::new("https://example.com/"));
+        let website = configured_website(
+            "https://example.com/",
+            &Seed::new("https://example.com/"),
+            empty_depths(),
+        );
 
         assert_eq!(
             website.configuration.redirect_policy,
@@ -1089,5 +1304,225 @@ mod tests {
             "a redirect off the seed's host would be followed and archived under it"
         );
         assert_eq!(website.configuration.redirect_limit, MAX_REDIRECTS);
+    }
+
+    fn discovered(urls: &[(&str, usize)]) -> HashMap<String, usize> {
+        urls.iter()
+            .map(|(url, depth)| ((*url).to_owned(), *depth))
+            .collect()
+    }
+
+    fn fetched(urls: &[&str]) -> HashSet<String> {
+        urls.iter().map(|url| (*url).to_owned()).collect()
+    }
+
+    /// What every test but the one on `robots_allows` itself is asking about: whether the
+    /// frontier came back for a link `robots.txt` never had an opinion on.
+    fn allow_all(_url: &str) -> bool {
+        true
+    }
+
+    /// The ordinary case: every link the guard judged in scope was handed back to the
+    /// caller, so a crawl that says it exhausted the frontier is telling the truth.
+    #[test]
+    fn nothing_is_reported_when_every_discovered_link_was_fetched() {
+        let discovered = discovered(&[("https://example.com/", 0), ("https://example.com/a", 1)]);
+        let fetched = fetched(&["https://example.com/", "https://example.com/a"]);
+
+        assert!(
+            links_discovered_but_never_fetched(
+                &discovered,
+                &fetched,
+                "https://example.com/",
+                10,
+                allow_all
+            )
+            .is_empty()
+        );
+    }
+
+    /// The shape this exists for: a page fetched, a link found on it, and the frontier
+    /// never coming back for it while the crawl still reports nothing left to do.
+    #[test]
+    fn a_link_the_frontier_never_came_back_for_is_reported() {
+        let discovered = discovered(&[
+            ("https://example.com/", 0),
+            ("https://example.com/a", 1),
+            ("https://example.com/b", 1),
+        ]);
+        let fetched = fetched(&["https://example.com/", "https://example.com/a"]);
+
+        assert_eq!(
+            links_discovered_but_never_fetched(
+                &discovered,
+                &fetched,
+                "https://example.com/",
+                10,
+                allow_all
+            ),
+            vec!["https://example.com/b".to_owned()]
+        );
+    }
+
+    /// The failure this whole detour exists to close: a link `robots.txt` itself refuses is
+    /// not the engine's frontier dropping anything, and reporting it as a loss would make
+    /// every site with a disallowed path linked from its own pages fail every capture of it.
+    #[test]
+    fn a_link_robots_txt_refuses_is_not_reported_as_a_loss() {
+        let discovered = discovered(&[
+            ("https://example.com/", 0),
+            ("https://example.com/allowed", 1),
+            ("https://example.com/private", 1),
+        ]);
+        let fetched = fetched(&["https://example.com/", "https://example.com/allowed"]);
+
+        assert!(
+            links_discovered_but_never_fetched(
+                &discovered,
+                &fetched,
+                "https://example.com/",
+                10,
+                |url| url != "https://example.com/private"
+            )
+            .is_empty(),
+            "the one link left over is exactly the one robots.txt disallows"
+        );
+    }
+
+    /// `robots_allows` narrows what is reported, it does not blank the report out: a link
+    /// the rule has no opinion on and the frontier still never fetched is still a loss.
+    #[test]
+    fn a_link_robots_txt_has_no_opinion_on_is_still_reported() {
+        let discovered = discovered(&[
+            ("https://example.com/", 0),
+            ("https://example.com/allowed", 1),
+            ("https://example.com/private", 1),
+        ]);
+        let fetched = fetched(&["https://example.com/"]);
+
+        assert_eq!(
+            links_discovered_but_never_fetched(
+                &discovered,
+                &fetched,
+                "https://example.com/",
+                10,
+                |url| url != "https://example.com/private"
+            ),
+            vec!["https://example.com/allowed".to_owned()]
+        );
+    }
+
+    /// The seed is always in `discovered`, at depth zero, and it was fetched first rather
+    /// than through a link: reporting it back would say the crawl lost the one page that
+    /// was never a link to begin with.
+    #[test]
+    fn the_seed_itself_is_never_reported_as_a_missing_link() {
+        let discovered = discovered(&[("https://example.com/", 0)]);
+        let fetched = fetched(&[]);
+
+        assert!(
+            links_discovered_but_never_fetched(
+                &discovered,
+                &fetched,
+                "https://example.com/",
+                10,
+                allow_all
+            )
+            .is_empty()
+        );
+    }
+
+    /// A link left over when the page count ran out is the budget working as asked, not
+    /// the engine dropping something, and reporting it would turn every capped crawl of a
+    /// larger site into a false alarm.
+    #[test]
+    fn a_link_left_over_at_the_page_limit_is_not_reported() {
+        let discovered = discovered(&[
+            ("https://example.com/", 0),
+            ("https://example.com/a", 1),
+            ("https://example.com/b", 1),
+        ]);
+        let fetched = fetched(&["https://example.com/", "https://example.com/a"]);
+
+        assert!(
+            links_discovered_but_never_fetched(
+                &discovered,
+                &fetched,
+                "https://example.com/",
+                2,
+                allow_all
+            )
+            .is_empty(),
+            "two pages were fetched against a limit of two"
+        );
+    }
+
+    /// The gate `crawl_seed` gives the map above before trusting `Exhausted` at all. A page
+    /// counted into `pages_dropped` is a reason of its own for holding less than the crawl
+    /// discovered, already stated in that count, and running the comparison anyway would
+    /// report every link left in the frontier behind the lost page as if this guard had
+    /// caught it.
+    #[test]
+    fn a_dropped_page_makes_the_frontier_claim_untrustworthy() {
+        assert!(!frontier_claim_is_trustworthy(CrawlStop::Exhausted, 1));
+        assert!(frontier_claim_is_trustworthy(CrawlStop::Exhausted, 0));
+        assert!(!frontier_claim_is_trustworthy(
+            CrawlStop::DeadlineReached,
+            0
+        ));
+        assert!(!frontier_claim_is_trustworthy(CrawlStop::CallerStopped, 0));
+    }
+
+    /// The scheme every key in the depth map is forced to, mirroring what `push_link` does
+    /// to a link before it reaches the frontier: a page carrying an absolute self link in the
+    /// other scheme is queued under the seed's, not the page's own.
+    #[test]
+    fn depth_key_forces_the_seeds_scheme_onto_every_url() {
+        assert_eq!(
+            depth_key("http://example.com/legacy", "https"),
+            "https://example.com/legacy"
+        );
+        assert_eq!(
+            depth_key("https://example.com/a#section", "https"),
+            "https://example.com/a"
+        );
+    }
+
+    /// What decides whether the fix above is needed at all: a seed's own scheme, read once
+    /// and independent of any link found on any page.
+    #[test]
+    fn frontier_scheme_is_read_from_the_seed_and_nothing_else() {
+        assert_eq!(frontier_scheme("https://example.com/"), "https");
+        assert_eq!(frontier_scheme("http://example.com/"), "http");
+    }
+
+    fn page_with_html(html: &str) -> Page {
+        let mut page = Page::default();
+        page.set_html_bytes(Some(html.as_bytes().to_vec()));
+        page
+    }
+
+    /// The condition that makes the engine's own base-href handler fire, matched exactly:
+    /// a value that parses as an absolute URL.
+    #[test]
+    fn an_absolute_base_href_is_detected() {
+        let page = page_with_html(
+            r#"<html><head><base href="https://example.com/"></head><body></body></html>"#,
+        );
+        assert!(page_declares_an_absolute_base_href(&page));
+    }
+
+    /// A relative value never parses as absolute, so it never fires the engine's handler
+    /// either: both sides read it the same way, and this has nothing to correct for.
+    #[test]
+    fn a_relative_base_href_is_not_mistaken_for_an_absolute_one() {
+        let page = page_with_html(r#"<html><head><base href="/"></head><body></body></html>"#);
+        assert!(!page_declares_an_absolute_base_href(&page));
+    }
+
+    #[test]
+    fn a_page_with_no_base_element_at_all_is_not_flagged() {
+        let page = page_with_html("<html><head></head><body><a href=\"/a\">a</a></body></html>");
+        assert!(!page_declares_an_absolute_base_href(&page));
     }
 }

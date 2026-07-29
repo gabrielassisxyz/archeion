@@ -226,6 +226,11 @@ pub struct CrawlOutcome {
     /// Pages the engine fetched and the archive never saw, because it could not keep up
     /// with them. Bytes were spent on those fetches and nothing was kept.
     pub pages_dropped: usize,
+    /// Links the crawl found in scope, through a page it fetched, and never fetched
+    /// themselves even though the run reports there was nothing left to do. Nothing was
+    /// spent on these, unlike the pages above: the loss is that a page reachable from the
+    /// seed is simply missing, with no failed fetch and no warning to say so.
+    pub links_never_followed: Vec<String>,
     pub stopped: CrawlStop,
 }
 

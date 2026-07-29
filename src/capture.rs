@@ -4,6 +4,7 @@
 //! archive. What connects them is a page event turning into a capture, which is where
 //! canonicalization decides the address the page is filed under.
 
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
@@ -93,6 +94,35 @@ pub struct CaptureRun {
     /// Why the run ended. A run that stopped at its deadline archived a prefix of a site
     /// rather than the site, and the difference is not visible in any of the counts above.
     pub stopped: CrawlStop,
+    /// The canonical addresses this run filed, which is how a second phase of it knows not to
+    /// buy the same page twice. Bounded by the page ceiling, like the run itself.
+    pub archived_urls: HashSet<String>,
+}
+
+impl CaptureRun {
+    /// Folds another run's results into this one.
+    ///
+    /// `--from-sitemap` is additive to the ordinary crawl from the seed rather than a second
+    /// report about it, so what it found is one more phase of the same run: every count is
+    /// summed, every list is extended, and the phase that ended last is the one whose stop
+    /// reason survives, since that is the one that actually decided when the run was done.
+    pub fn merge(&mut self, other: CaptureRun) {
+        self.captures_written += other.captures_written;
+        self.unaddressable_pages.extend(other.unaddressable_pages);
+        self.pages_inside_a_network
+            .extend(other.pages_inside_a_network);
+        self.failed_fetches.extend(other.failed_fetches);
+        self.unreadable_pages.extend(other.unreadable_pages);
+        self.articles_extracted += other.articles_extracted;
+        self.extractions_refused += other.extractions_refused;
+        self.unreadable_articles.extend(other.unreadable_articles);
+        self.pages_dropped += other.pages_dropped;
+        self.assets_stored += other.assets_stored;
+        self.assets_missed += other.assets_missed;
+        self.asset_fetches += other.asset_fetches;
+        self.stopped = other.stopped;
+        self.archived_urls.extend(other.archived_urls);
+    }
 }
 
 /// Crawls a seed and stores every page it produces, for as long as the seed's budget lasts.
@@ -155,6 +185,152 @@ pub fn capture_seed(
         });
     }
     Ok(run)
+}
+
+/// Fetches every URL a sitemap listed, additionally to whatever the ordinary crawl from the
+/// seed already found.
+///
+/// A sitemap answers a question a crawl cannot: what a site has, for pages nothing links to.
+/// Each URL enters at depth zero, exactly like a seed, and by default nothing is followed
+/// out of it, because a depth bound has no meaning for a page nobody linked to: `follow_links`
+/// false fetches the URL on its own, the same way a subresource is acquired, and never asks
+/// the engine to queue anything past it. An operator who gave `--max-depth` explicitly asked
+/// for more than that, so `follow_links` true takes each URL as a seed of its own and crawls
+/// from it up to that depth, sharing what is left of the run's own page count and deadline
+/// rather than starting each one with a fresh budget, which is what keeps the sitemap's
+/// bounds the same bounds the rest of the run already answers to.
+///
+/// What this deliberately does not share with the ordinary crawl is the subresource cache: a
+/// stylesheet referenced by both an ordinarily reached page and a sitemap-listed one is asked
+/// for once per phase rather than once for the whole run. That costs the host one extra
+/// request for a handful of shared files, not a correctness problem, and sharing the cache
+/// across two independently started phases was not worth the extra plumbing for what the two
+/// sites this was measured against would ever trigger.
+pub fn capture_sitemap(
+    engine: &dyn CrawlEngine,
+    archive: &Archive,
+    seed: &Seed,
+    rules: &SiteRules,
+    urls: &[String],
+    follow_links: bool,
+    already_archived: &HashSet<String>,
+) -> Result<CaptureRun, CaptureError> {
+    let mut run = CaptureRun::default();
+    let mut write_failure: Option<StorageError> = None;
+    let started = Instant::now();
+    let mut assets = AssetCapture::new(engine, archive, seed, started);
+
+    for url in urls {
+        if budget_spent(seed, &run, started) {
+            run.stopped = CrawlStop::DeadlineReached;
+            break;
+        }
+        if already_filed(url, already_archived, &run) {
+            continue;
+        }
+        if follow_links {
+            let mut sub_seed = seed.clone();
+            sub_seed.url = url.clone();
+            sub_seed.max_pages = remaining_pages(seed, &run);
+            sub_seed.deadline = remaining_deadline(seed, started);
+            // A seed the engine will not dial costs this one URL, not the rest of the list:
+            // the same host answered for every other entry, so one address the engine
+            // refuses is worth reporting and moving past rather than ending the sitemap
+            // phase over.
+            let outcome = match engine.crawl(&sub_seed, &mut |event| {
+                capture_page(
+                    event,
+                    archive,
+                    seed,
+                    rules,
+                    &mut assets,
+                    &mut run,
+                    &mut write_failure,
+                )
+            }) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    run.failed_fetches.push(FetchFailure {
+                        url: url.clone(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            run.pages_dropped += outcome.pages_dropped;
+            if write_failure.is_some() {
+                break;
+            }
+            if outcome.stopped == CrawlStop::DeadlineReached {
+                run.stopped = CrawlStop::DeadlineReached;
+                break;
+            }
+        } else {
+            let event = engine.fetch(url, seed);
+            let answer = capture_page(
+                event,
+                archive,
+                seed,
+                rules,
+                &mut assets,
+                &mut run,
+                &mut write_failure,
+            );
+            if answer.is_break() {
+                break;
+            }
+        }
+    }
+
+    run.asset_fetches = assets.fetches();
+    if let Some(source) = write_failure {
+        return Err(CaptureError::Storage {
+            source,
+            run: Box::new(run),
+        });
+    }
+    Ok(run)
+}
+
+/// Whether an address this run already filed is being asked for again.
+///
+/// A sitemap normally lists the seed, and it can list one page twice, so without this a run
+/// buys the same response more than once and the archive grows a second capture of an item
+/// nothing about the site changed. The comparison is against the canonical spelling, which is
+/// what an item is filed under: what cannot be caught here is a listed URL that redirects onto
+/// a page already filed, since only the fetch itself can say where it lands.
+fn already_filed(url: &str, already_archived: &HashSet<String>, run: &CaptureRun) -> bool {
+    let Ok(canonical) = CanonicalUrl::parse(url) else {
+        return false;
+    };
+    let canonical = canonical.to_string();
+    already_archived.contains(&canonical) || run.archived_urls.contains(&canonical)
+}
+
+/// Whether this phase has anything left to spend: the page count already written against the
+/// seed's own ceiling, or the seed's wall clock against how long this phase has run. Read
+/// plainly rather than with the margin the engine gets, because what is left over here is a
+/// prefix of a URL list rather than pages already in flight that a late guard has to hand over.
+fn budget_spent(seed: &Seed, run: &CaptureRun, started: Instant) -> bool {
+    if run.captures_written >= seed.max_pages as usize {
+        return true;
+    }
+    seed.deadline
+        .is_some_and(|budget| started.elapsed() >= budget)
+}
+
+/// What is left of the run's page count, for a sub-crawl started from a sitemap URL. Floored
+/// at one rather than let a fully spent budget reach the engine as a zero, which it would read
+/// as no limit at all instead of none left.
+fn remaining_pages(seed: &Seed, run: &CaptureRun) -> u32 {
+    let written = u32::try_from(run.captures_written).unwrap_or(u32::MAX);
+    seed.max_pages.saturating_sub(written).max(1)
+}
+
+/// What is left of the run's wall clock, for a sub-crawl started from a sitemap URL.
+fn remaining_deadline(seed: &Seed, started: Instant) -> Option<Duration> {
+    seed.deadline
+        .map(|budget| budget.saturating_sub(started.elapsed()))
 }
 
 /// Whether the engine is still handing over pages long after the budget it was given.
@@ -244,6 +420,10 @@ fn capture_page(
         }
     };
     run.captures_written += 1;
+    // Kept so a later phase of the same run does not archive an address this one already has.
+    // It is what this run wrote rather than what the archive holds, because an archive holds
+    // the history of everything ever captured and the question here is about one run.
+    run.archived_urls.insert(canonical.to_string());
     // Counted with the capture rather than with the pass. A subresource whose capture never
     // reached the disk is a blob nothing references, and reporting it beside a capture that
     // does not exist would describe an archive nobody has.

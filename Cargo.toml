@@ -37,6 +37,12 @@ lol_html = "2.9"
 # are turned back into markup so that the document goes through the same converter, and the same
 # escaping, as every article extracted from HTML.
 pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
+# A sitemap is XML from a hostile source, read for its `<loc>` text and nothing else. This
+# reader never resolves a document's own `<!ENTITY>` declarations, predefined entities and
+# character references are the only expansion it does, so there is no billion laughs to guard
+# against here. Already reachable transitively; named directly because this is the first
+# place in the tree that parses XML rather than borrowing someone else's use of it.
+quick-xml = "0.41"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"

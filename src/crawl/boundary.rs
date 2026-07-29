@@ -295,5 +295,11 @@ pub trait CrawlEngine {
     /// that produced no response, which `PageEvent` already carries a shape for. A URL this
     /// engine refuses to dial at all is reported the same way, since to the caller a
     /// subresource it cannot have is a subresource it cannot have.
+    ///
+    /// A URL a sitemap lists is fetched the same way when nothing is to be followed out of
+    /// it: it has no depth and contributes no links either, which is what it shares with a
+    /// subresource. Where it differs is that it does become an item of its own once fetched,
+    /// unlike a subresource, so the caller files it as a capture rather than folding it into
+    /// the page that referenced it.
     fn fetch(&self, url: &str, seed: &Seed) -> PageEvent;
 }

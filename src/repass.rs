@@ -173,7 +173,12 @@ fn repass_capture(
         .as_ref()
         .is_some_and(|metadata| metadata.extractor_version < metadata::EXTRACTOR_VERSION)
         || (metadata.is_none() && is_html(capture));
-    let article_stale = article_state.is_stale(capture, rules, metadata.as_ref());
+    // An article embeds what the metadata said, the page title reaching its first heading, so
+    // a metadata record this pass is about to replace makes the article built on it stale as
+    // well. Judged only by its own version, that article says it is current, which is exactly
+    // what stops any later pass from repairing it: the two spellings then sit in one note, the
+    // front matter carrying the new one and the heading the old one, permanently.
+    let article_stale = metadata_stale || article_state.is_stale(capture, rules, metadata.as_ref());
     if !metadata_stale && !article_stale {
         run.derived_unchanged += 1;
         return Ok(());

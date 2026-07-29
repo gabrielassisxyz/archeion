@@ -678,3 +678,63 @@ fn a_repass_asset_retry_still_refuses_private_addresses_before_the_engine_sees_t
         .expect("capture reads");
     assert_eq!(read_back.assets_missed[0].reason, AssetMiss::InsideANetwork);
 }
+
+/// A page whose only title is its `<title>` element, stored when the extractor still kept the
+/// character references in it. The metadata record is repaired by the version move, and the
+/// article's heading is only repaired with it because the article counts as stale when the
+/// record it was derived from does.
+#[test]
+fn an_article_built_on_metadata_this_pass_replaces_is_rebuilt_with_it() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a").expect("valid URL");
+    let page = format!("<title>Isn&#x27;t Efficient</title>{}", article_page(""));
+    let capture = archive
+        .write_capture(html_capture(&url, &page))
+        .expect("capture is written");
+    let mut stale = metadata::extract(PageSource {
+        body: page.as_bytes(),
+        content_type: Some("text/html; charset=utf-8"),
+        final_url: url.as_str(),
+    })
+    .expect("the page reads")
+    .expect("the page is html");
+    stale.extractor_version = metadata::EXTRACTOR_VERSION - 1;
+    stale.title = stale.title.map(|title| archeion::metadata::Attributed {
+        value: "Isn&#x27;t Efficient".to_owned(),
+        source: title.source,
+    });
+    archive
+        .write_metadata(&url, &capture.id, &stale)
+        .expect("metadata is written");
+    archive
+        .write_article(
+            &url,
+            &capture.id,
+            &Article {
+                markdown: "# Isn&#x27;t Efficient\n\nBread is mostly patience.".to_owned(),
+                record: article_record(readability::EXTRACTOR_VERSION, ExtractionRules::Heuristic),
+            },
+        )
+        .expect("an article carrying the old spelling is written");
+
+    let run = repass_archive(
+        &ScriptedEngine::new(Vec::new()),
+        &archive,
+        &SiteRules::default(),
+        RepassOptions::default(),
+    )
+    .expect("repass succeeds");
+
+    assert_eq!(run.metadata_written, 1);
+    assert_eq!(run.articles_written, 1);
+    let article = archive
+        .read_article(&url, &capture.id)
+        .expect("article reads")
+        .expect("article exists");
+    assert!(
+        article.markdown.starts_with("# Isn't Efficient"),
+        "the heading is rebuilt from the metadata this pass rewrote, got {:?}",
+        article.markdown.lines().next()
+    );
+}

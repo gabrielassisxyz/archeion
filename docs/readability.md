@@ -419,6 +419,8 @@ This is deliberately not a text heuristic and deliberately not aimed at one publ
 
 The absence is answered where absences are answered, by what a repass counts as worth re-reading, which is the same place the served-Markdown absence was answered and for the same reason. An article at the current version whose record carries no declaration, over a page whose stored JSON-LD does carry one, is stale for that alone. That reaches the captures this field exists for, the ones taken before anything read the declaration, without moving a version that would rewrite every article in the archive to reach a handful of them.
 
+An article is stale for a second reason of the same kind: the metadata record beside it is. What that record said is inside the article, since the page's title is what the article's first heading is built from, so an article derived from a reading that is about to be replaced was derived from something this pass has already decided was wrong. Judged only by its own version it says it is current, and saying so is what would keep every later pass from repairing it: the note would then carry one spelling in its front matter and the other in its heading, permanently. Stating the dependency is cheaper and more exact than moving a version to stand in for it, which is the argument the paragraph above makes for a declaration nobody read.
+
 A refused page gets a record of its own instead of this pair, holding the same measurement, the excerpt and nothing else:
 
 ```json

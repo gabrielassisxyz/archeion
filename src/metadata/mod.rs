@@ -566,6 +566,19 @@ mod tests {
         );
     }
 
+    /// The text of a `<title>` element is markup, not text, exactly as an attribute value
+    /// is: a page's generator escapes an apostrophe the same way in both places, and a page
+    /// with no OpenGraph, Twitter or schema.org title, most of the plain web, is read
+    /// through this path rather than through the attribute one covered below.
+    #[test]
+    fn a_title_written_with_a_character_reference_stores_the_character() {
+        let page = extract_html("<title>Isn&#x27;t Efficient</title>");
+        assert_eq!(
+            value_of(page.title),
+            Some(("Isn't Efficient".to_owned(), MetadataSource::Html))
+        );
+    }
+
     /// An attribute value is markup, not text: a page's generator escapes an apostrophe
     /// inside a double quoted attribute as `&#x27;`, and the character is what every reader
     /// after this one expects, a heading among them, not the reference that spells it.

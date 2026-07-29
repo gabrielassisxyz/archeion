@@ -28,6 +28,7 @@ Every option is one field of the seed the library crawls with, spelled the same,
 | `--max-retries <N>` | how many times a request worth repeating is repeated |
 | `--max-response-bytes <BYTES>` | the ceiling on one response body |
 | `--allow-private-addresses` | let the run reach addresses that exist only inside a network |
+| `--from-sitemap [<URL>]` | additionally archive what the site's sitemap lists |
 
 A span carries its unit: `250ms`, `30s`, `5m`, `1h`. A bare number would have to mean seconds on the deadline and milliseconds on the delay, and a run whose budget was read in the wrong unit is either over before it starts or never over at all.
 
@@ -52,6 +53,18 @@ That flag is the one that decides whether the archive can be talked into reading
 It refuses anything under a mebibyte, which is the smallest ceiling the engine honours: below that it raises the number to that floor and says nothing, so a smaller value accepted here would be a ceiling the tool reports and no run applies.
 
 The flag wins over `SPIDER_MAX_SIZE_BYTES` already in the environment, which is the escape hatch below it: a variable set there stands when the flag is absent, including a zero meaning no ceiling at all, which the flag itself will not accept.
+
+### The sitemap
+
+`--from-sitemap` archives what a site's sitemap lists, additionally to the ordinary crawl from the seed, for a site whose pages do not link to each other: an index rendering a handful of posts and loading the rest through an API a crawl has no reason to call is the case this answers.
+
+With no address given, the sitemap read is the one named by a `Sitemap:` directive in the host's `robots.txt`, read case insensitively since real files spell it in every case; the first directive found is the one read. With no directive found, `/sitemap.xml` is tried, which is where a browser would look next. Both are fetched through the same guards a page gets: the private address refusal, the response byte ceiling, the redirect screening.
+
+A URL the sitemap lists enters the run at depth zero, exactly like the seed, and by default nothing is followed out of it: a depth bound has no meaning for a page nobody linked to. Giving `--max-depth` explicitly changes that, since it is then a decision made on purpose rather than left at its default: the same depth that already bounds the ordinary crawl also bounds how far a listed URL is traversed from, taking each one as a seed of its own and sharing what is left of the run's own page count and deadline rather than starting over with a fresh budget.
+
+A URL the sitemap lists for a host other than the seed's is refused rather than fetched, since a sitemap is read for one host's sake and taking an address it names for another would let that site decide what this run fetches next. The sitemap itself is capped at fifty thousand listed URLs, the sitemap protocol's own ceiling for one file, counted while the file is still being read rather than after. A compressed sitemap and a sitemap index, one that lists further sitemaps rather than pages, are both refused with a message saying so rather than read.
+
+None of this is fatal to the run. A sitemap that cannot be found, fetched or parsed is reported as a warning: the ordinary crawl's captures already happened, and a run that turned those into a failure over a sitemap that happens not to be one would be discarding a working archive over the wrong page.
 
 ## Reading a collection
 
@@ -97,7 +110,7 @@ The distinction is the point. A URL nobody answered, a page whose address the ca
 
 `list` answers with one object per line rather than one array, so a collection of any size can be read without holding all of it and `grep` stays a legitimate way to ask a question of it.
 
-`capture` and `export` answer with one object each, because each reports on a run rather than listing a collection. The capture object carries the counts the human report shows plus every URL the run did not archive, grouped by why: `failed_fetches`, `unaddressable_pages`, `pages_inside_a_network`, `unreadable_pages`, `unreadable_articles` and `links_never_followed`. The export object carries the number of notes written and the paths it could not read.
+`capture` and `export` answer with one object each, because each reports on a run rather than listing a collection. The capture object carries the counts the human report shows plus every URL the run did not archive, grouped by why: `failed_fetches`, `unaddressable_pages`, `pages_inside_a_network`, `unreadable_pages`, `unreadable_articles` and `links_never_followed`. With `--from-sitemap`, it also carries a `sitemap` object: the address read, how many URLs it listed, how many were taken and how many a bound refused, which is where a sitemap listing 247 posts against a run that archived 200 of them is made visible. The export object carries the number of notes written and the paths it could not read.
 
 Both objects are declared by the command line rather than serialized off the library's own report. A field added to a record inside the crate is then not accidentally a promise to everything already parsing this output.
 
@@ -107,3 +120,4 @@ Both objects are declared by the command line rather than serialized off the lib
 - **A configuration file.** Every number the execution policy has is a flag with a default that is already the considered value. A file would be a second place for those numbers to disagree.
 - **A verb that creates an empty archive.** `capture` creates one when it needs one, and a collection with nothing in it is not a thing anyone has asked to make.
 - **Capturing more than one seed per run.** A seed is one host and one budget. Two seeds are two runs, which a shell already knows how to write.
+- **Expanding a sitemap index into the sitemaps it lists.** Both sites this feature was measured against publish one plain sitemap, and a bound on how deep an index may point at further indexes is a number with nothing real yet to calibrate it against. A sitemap index is refused with a message saying so rather than read as an empty sitemap.

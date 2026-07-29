@@ -11,12 +11,13 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use archeion::capture::{CaptureError, CaptureRun, capture_seed};
+use archeion::capture::{CaptureError, CaptureRun, capture_seed, capture_sitemap};
 use archeion::crawl::{
     CrawlEngine, CrawlStop, DEFAULT_MAX_RESPONSE_BYTES, SMALLEST_MAX_RESPONSE_BYTES, Seed,
     SpiderEngine,
 };
 use archeion::readability::SiteRules;
+use archeion::sitemap::{SitemapListing, read_sitemap};
 use archeion::storage::{Archive, StorageError};
 use serde::Serialize;
 
@@ -33,10 +34,11 @@ pub struct CaptureArgs {
     #[arg(long, value_name = "N", default_value_t = defaults().max_pages,
           value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
     max_pages: u32,
-    /// How far from the seed links are followed.
-    #[arg(long, value_name = "N", default_value_t = defaults().max_depth,
+    /// How far from the seed links are followed. A URL `--from-sitemap` lists follows no
+    /// further links of its own unless this is given explicitly: see that flag below.
+    #[arg(long, value_name = "N", help = max_depth_help(),
           value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
-    max_depth: usize,
+    max_depth: Option<usize>,
     /// How many requests may be in flight against the host at once.
     #[arg(long, value_name = "N", default_value_t = defaults().concurrency,
           value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
@@ -67,6 +69,12 @@ pub struct CaptureArgs {
     /// reading the machine it runs on or the network around it.
     #[arg(long)]
     allow_private_addresses: bool,
+    /// Additionally archive what the site's sitemap lists, for a site whose pages do not
+    /// link to each other. With no address, the sitemap named by a `Sitemap:` directive in
+    /// `robots.txt` is read, falling back to `/sitemap.xml`. Nothing is followed from a
+    /// listed URL unless `--max-depth` is also given explicitly.
+    #[arg(long, value_name = "URL", num_args = 0..=1)]
+    from_sitemap: Option<Option<String>>,
 }
 
 impl CaptureArgs {
@@ -87,6 +95,13 @@ fn defaults() -> Seed {
 
 fn response_ceiling_help() -> String {
     format!("Ceiling on the body of one response, in bytes [default: {DEFAULT_MAX_RESPONSE_BYTES}]")
+}
+
+fn max_depth_help() -> String {
+    format!(
+        "How far from the seed links are followed [default: {}]",
+        defaults().max_depth
+    )
 }
 
 /// A budget that a run has to be able to happen inside, which is every span here except the
@@ -233,7 +248,7 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
     let (rules, unused_rules) = SiteRules::read(&archive.extraction_rules_path());
     warn(unused_rules.iter().map(ToString::to_string));
 
-    let (run, failure) = match capture_seed(&engine, &archive, &seed, &rules) {
+    let (mut run, mut failure) = match capture_seed(&engine, &archive, &seed, &rules) {
         Ok(run) => (run, None),
         // The report is the point of carrying the run inside the error: the archive holds
         // whatever was written before the disk refused, and a caller told only that a write
@@ -242,14 +257,31 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
         Err(other) => return Err(other.into()),
     };
 
-    let report = report_of(&args, &run, created);
+    // A disk that already refused one write will refuse the next, so the sitemap phase is
+    // skipped once the ordinary crawl already failed for that reason: there is nothing left
+    // to spend more requests archiving into.
+    let (sitemap_report, sitemap_warning) = if failure.is_none() {
+        sitemap_phase(
+            &args,
+            &engine,
+            &archive,
+            &seed,
+            &rules,
+            &mut run,
+            &mut failure,
+        )
+    } else {
+        (None, None)
+    };
+
+    let report = report_of(&args, &run, created, sitemap_report);
     let output = if json {
         format!("{}\n", serde_json::to_string(&report)?)
     } else {
         human_report(&report, run.stopped)
     };
     write_stdout(&output)?;
-    warn(losses(&run));
+    warn(sitemap_warning.into_iter().chain(losses(&run)));
 
     if let Some(source) = failure {
         return Err(source.into());
@@ -281,7 +313,7 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
 fn seed_of(args: &CaptureArgs) -> Seed {
     let mut seed = Seed::new(args.seed_url.clone());
     seed.max_pages = args.max_pages;
-    seed.max_depth = args.max_depth;
+    seed.max_depth = args.max_depth.unwrap_or_else(|| defaults().max_depth);
     seed.concurrency = args.concurrency;
     seed.delay = args.delay.0;
     seed.deadline = args.deadline.0;
@@ -314,6 +346,74 @@ struct Loss {
     reason: String,
 }
 
+/// Reads the sitemap this run was asked for and archives what it lists, additionally to the
+/// ordinary crawl already run from the seed.
+///
+/// A sitemap that cannot be found or parsed is reported as a warning rather than treated as a
+/// reason to end the run: the ordinary crawl's captures are already written, and a run that
+/// turned those into a failure over a sitemap it could not read would be throwing away a
+/// working archive over a page that happens not to be one. A write failure inside this phase
+/// is the one thing that still matters to the caller, and it is folded into the same run the
+/// ordinary crawl already produced rather than reported on its own.
+fn sitemap_phase(
+    args: &CaptureArgs,
+    engine: &dyn CrawlEngine,
+    archive: &Archive,
+    seed: &Seed,
+    rules: &SiteRules,
+    run: &mut CaptureRun,
+    failure: &mut Option<StorageError>,
+) -> (Option<SitemapReport>, Option<String>) {
+    let Some(requested) = &args.from_sitemap else {
+        return (None, None);
+    };
+    let listing = match read_sitemap(engine, seed, requested.as_deref()) {
+        Ok(listing) => listing,
+        Err(error) => return (None, Some(error.to_string())),
+    };
+    // Given explicitly, the same depth that already bounds the ordinary crawl now also
+    // bounds how far a sitemap URL is traversed from; left alone, a sitemap URL is fetched
+    // on its own, since a depth bound has no meaning for a page nobody linked to.
+    let follow_links = args.max_depth.is_some();
+    let report = SitemapReport::from(&listing);
+    match capture_sitemap(engine, archive, seed, rules, &listing.urls, follow_links) {
+        Ok(sitemap_run) => {
+            run.merge(sitemap_run);
+            (Some(report), None)
+        }
+        Err(CaptureError::Storage { source, run: extra }) => {
+            run.merge(*extra);
+            *failure = Some(source);
+            (Some(report), None)
+        }
+        Err(CaptureError::Crawl(error)) => (
+            Some(report),
+            Some(format!("the sitemap's URLs could not be crawled: {error}")),
+        ),
+    }
+}
+
+/// What `--from-sitemap` found, kept small on purpose: a sitemap listing 247 URLs against a
+/// run that archived 200 of them is exactly the gap this field exists to make visible.
+#[derive(Debug, Serialize)]
+struct SitemapReport {
+    sitemap_url: String,
+    urls_listed: usize,
+    urls_taken: usize,
+    urls_refused: usize,
+}
+
+impl From<&SitemapListing> for SitemapReport {
+    fn from(listing: &SitemapListing) -> Self {
+        Self {
+            sitemap_url: listing.sitemap_url.clone(),
+            urls_listed: listing.urls_listed,
+            urls_taken: listing.urls.len(),
+            urls_refused: listing.refused_off_host + listing.refused_over_ceiling,
+        }
+    }
+}
+
 /// The run as this command line publishes it.
 ///
 /// It is declared here rather than serialized off `CaptureRun` so that the library's report
@@ -333,6 +433,7 @@ struct CaptureReport {
     pages_dropped: usize,
     links_never_followed: Vec<String>,
     stopped: &'static str,
+    sitemap: Option<SitemapReport>,
     failed_fetches: Vec<Loss>,
     unaddressable_pages: Vec<Loss>,
     pages_inside_a_network: Vec<String>,
@@ -340,7 +441,12 @@ struct CaptureReport {
     unreadable_articles: Vec<Loss>,
 }
 
-fn report_of(args: &CaptureArgs, run: &CaptureRun, created: bool) -> CaptureReport {
+fn report_of(
+    args: &CaptureArgs,
+    run: &CaptureRun,
+    created: bool,
+    sitemap: Option<SitemapReport>,
+) -> CaptureReport {
     CaptureReport {
         seed_url: args.seed_url.clone(),
         archive: args.archive.display().to_string(),
@@ -354,6 +460,7 @@ fn report_of(args: &CaptureArgs, run: &CaptureRun, created: bool) -> CaptureRepo
         pages_dropped: run.pages_dropped,
         links_never_followed: run.links_never_followed.clone(),
         stopped: stop_name(run.stopped),
+        sitemap,
         failed_fetches: run
             .failed_fetches
             .iter()
@@ -443,6 +550,14 @@ fn human_report(report: &CaptureReport, stopped: CrawlStop) -> String {
     ];
     for (label, value) in rows {
         writeln!(output, "  {label:<14}{value}").expect("writing to a string cannot fail");
+    }
+    if let Some(sitemap) = &report.sitemap {
+        writeln!(
+            output,
+            "  {:<14}{} taken, {} refused, {} listed",
+            "sitemap", sitemap.urls_taken, sitemap.urls_refused, sitemap.urls_listed
+        )
+        .expect("writing to a string cannot fail");
     }
     output
 }
@@ -662,5 +777,32 @@ mod tests {
                 "{below} was refused with: {message}"
             );
         }
+    }
+
+    /// The three states `--from-sitemap` can be in: left alone, given with nothing after it,
+    /// and given a specific address. The middle one is what asks for discovery rather than
+    /// naming a sitemap directly, and only the parse can prove clap actually tells it apart
+    /// from the other two.
+    #[test]
+    fn from_sitemap_tells_absent_bare_and_addressed_apart() {
+        assert_eq!(parse(&[]).from_sitemap, None);
+        assert_eq!(parse(&["--from-sitemap"]).from_sitemap, Some(None));
+        assert_eq!(
+            parse(&["--from-sitemap", "https://example.com/sitemap.xml"]).from_sitemap,
+            Some(Some("https://example.com/sitemap.xml".to_owned()))
+        );
+    }
+
+    /// A depth nobody typed has to still be the library's own default, since that is the
+    /// number every other test here assumes a bare seed crawls with. Whether it was typed at
+    /// all is what `--from-sitemap` needs to tell apart from a depth of two nobody asked for.
+    #[test]
+    fn a_max_depth_nobody_typed_is_the_library_s_own_default() {
+        assert_eq!(parse(&[]).max_depth, None);
+        assert_eq!(
+            seed_of(&parse(&[])).max_depth,
+            Seed::new("https://example.com/").max_depth
+        );
+        assert_eq!(parse(&["--max-depth", "3"]).max_depth, Some(3));
     }
 }

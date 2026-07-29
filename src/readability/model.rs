@@ -28,7 +28,15 @@ use serde::{Deserialize, Serialize};
 /// is new and additive, and its absence on a record written before it existed is already the
 /// correct reading, "nothing was declared", rather than a claim the field never had a chance to
 /// make. Nothing here needs a repass to keep reading true.
-pub const EXTRACTOR_VERSION: u32 = 3;
+///
+/// 4 is which address an image carries and whether an anchor around one is a link at all. A
+/// record written under 3 names a rendition the page offered as its small default rather than
+/// the largest it listed, or an address a lazy-image repair replaced with a descriptor nothing
+/// serves, and spells an anchor wrapping a picture as characters no CommonMark reader sees as a
+/// link. Those records do not merely miss something added since: they say something else, and
+/// what an export builds from them differs from what a rebuild produces, so a repass has to
+/// treat them as stale.
+pub const EXTRACTOR_VERSION: u32 = 4;
 
 /// How the prose in a record was obtained.
 ///

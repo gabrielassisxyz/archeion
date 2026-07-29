@@ -4,6 +4,7 @@
 //! archive. What connects them is a page event turning into a capture, which is where
 //! canonicalization decides the address the page is filed under.
 
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
@@ -93,6 +94,9 @@ pub struct CaptureRun {
     /// Why the run ended. A run that stopped at its deadline archived a prefix of a site
     /// rather than the site, and the difference is not visible in any of the counts above.
     pub stopped: CrawlStop,
+    /// The canonical addresses this run filed, which is how a second phase of it knows not to
+    /// buy the same page twice. Bounded by the page ceiling, like the run itself.
+    pub archived_urls: HashSet<String>,
 }
 
 impl CaptureRun {
@@ -117,6 +121,7 @@ impl CaptureRun {
         self.assets_missed += other.assets_missed;
         self.asset_fetches += other.asset_fetches;
         self.stopped = other.stopped;
+        self.archived_urls.extend(other.archived_urls);
     }
 }
 
@@ -208,6 +213,7 @@ pub fn capture_sitemap(
     rules: &SiteRules,
     urls: &[String],
     follow_links: bool,
+    already_archived: &HashSet<String>,
 ) -> Result<CaptureRun, CaptureError> {
     let mut run = CaptureRun::default();
     let mut write_failure: Option<StorageError> = None;
@@ -218,6 +224,9 @@ pub fn capture_sitemap(
         if budget_spent(seed, &run, started) {
             run.stopped = CrawlStop::DeadlineReached;
             break;
+        }
+        if already_filed(url, already_archived, &run) {
+            continue;
         }
         if follow_links {
             let mut sub_seed = seed.clone();
@@ -281,6 +290,21 @@ pub fn capture_sitemap(
         });
     }
     Ok(run)
+}
+
+/// Whether an address this run already filed is being asked for again.
+///
+/// A sitemap normally lists the seed, and it can list one page twice, so without this a run
+/// buys the same response more than once and the archive grows a second capture of an item
+/// nothing about the site changed. The comparison is against the canonical spelling, which is
+/// what an item is filed under: what cannot be caught here is a listed URL that redirects onto
+/// a page already filed, since only the fetch itself can say where it lands.
+fn already_filed(url: &str, already_archived: &HashSet<String>, run: &CaptureRun) -> bool {
+    let Ok(canonical) = CanonicalUrl::parse(url) else {
+        return false;
+    };
+    let canonical = canonical.to_string();
+    already_archived.contains(&canonical) || run.archived_urls.contains(&canonical)
 }
 
 /// Whether this phase has anything left to spend: the page count already written against the
@@ -396,6 +420,10 @@ fn capture_page(
         }
     };
     run.captures_written += 1;
+    // Kept so a later phase of the same run does not archive an address this one already has.
+    // It is what this run wrote rather than what the archive holds, because an archive holds
+    // the history of everything ever captured and the question here is about one run.
+    run.archived_urls.insert(canonical.to_string());
     // Counted with the capture rather than with the pass. A subresource whose capture never
     // reached the disk is a blob nothing references, and reporting it beside a capture that
     // does not exist would describe an archive nobody has.

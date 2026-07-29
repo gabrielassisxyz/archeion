@@ -248,13 +248,21 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
     let (rules, unused_rules) = SiteRules::read(&archive.extraction_rules_path());
     warn(unused_rules.iter().map(ToString::to_string));
 
-    let (mut run, mut failure) = match capture_seed(&engine, &archive, &seed, &rules) {
-        Ok(run) => (run, None),
-        // The report is the point of carrying the run inside the error: the archive holds
-        // whatever was written before the disk refused, and a caller told only that a write
-        // failed has to go looking for the rest.
-        Err(CaptureError::Storage { source, run }) => (*run, Some(source)),
-        Err(other) => return Err(other.into()),
+    // A sitemap exists for a site whose pages do not link one another, so crawling such a site
+    // anyway spends the run's budget on the listing, navigation and comment pages the sitemap
+    // was reached for in order to skip, and files the pages both phases find twice. Asking for
+    // a depth explicitly is asking for both, and then both run.
+    let (mut run, mut failure) = if traverses_from_the_seed(&args) {
+        match capture_seed(&engine, &archive, &seed, &rules) {
+            Ok(run) => (run, None),
+            // The report is the point of carrying the run inside the error: the archive holds
+            // whatever was written before the disk refused, and a caller told only that a write
+            // failed has to go looking for the rest.
+            Err(CaptureError::Storage { source, run }) => (*run, Some(source)),
+            Err(other) => return Err(other.into()),
+        }
+    } else {
+        (CaptureRun::default(), None)
     };
 
     // A disk that already refused one write will refuse the next, so the sitemap phase is
@@ -346,15 +354,26 @@ struct Loss {
     reason: String,
 }
 
-/// Reads the sitemap this run was asked for and archives what it lists, additionally to the
-/// ordinary crawl already run from the seed.
+/// Whether links are followed out of the seed at all.
+///
+/// A sitemap exists for a site whose pages do not link one another, so a run told to read one
+/// and given no depth of its own is the sitemap rather than a crawl with a sitemap after it:
+/// crawling such a site anyway spends the budget on the listing, navigation and comment pages
+/// the sitemap was reached for in order to skip, and files whatever both phases find twice.
+/// Naming a depth explicitly is asking for both, and then both run.
+fn traverses_from_the_seed(args: &CaptureArgs) -> bool {
+    args.from_sitemap.is_none() || args.max_depth.is_some()
+}
+
+/// Reads the sitemap this run was asked for and archives what it lists.
 ///
 /// A sitemap that cannot be found or parsed is reported as a warning rather than treated as a
-/// reason to end the run: the ordinary crawl's captures are already written, and a run that
-/// turned those into a failure over a sitemap it could not read would be throwing away a
-/// working archive over a page that happens not to be one. A write failure inside this phase
-/// is the one thing that still matters to the caller, and it is folded into the same run the
-/// ordinary crawl already produced rather than reported on its own.
+/// reason to end the run. Where the ordinary crawl also ran, its captures are already written
+/// and turning those into a failure over a page that happens not to be one would throw away a
+/// working archive. Where it did not, the seed is archived and the warning says exactly what
+/// was not read, which leaves the operator a run to repeat rather than a silent half job. A
+/// write failure inside this phase is the one thing that still matters to the caller, and it
+/// is folded into the same run rather than reported on its own.
 fn sitemap_phase(
     args: &CaptureArgs,
     engine: &dyn CrawlEngine,
@@ -367,27 +386,49 @@ fn sitemap_phase(
     let Some(requested) = &args.from_sitemap else {
         return (None, None);
     };
-    let listing = match read_sitemap(engine, seed, requested.as_deref()) {
-        Ok(listing) => listing,
-        Err(error) => return (None, Some(error.to_string())),
+    let (listing, warning) = match read_sitemap(engine, seed, requested.as_deref()) {
+        Ok(listing) => (Some(listing), None),
+        Err(error) => (None, Some(error.to_string())),
     };
+    // The seed leads the list when nothing crawled from it, because it is still the address
+    // somebody typed and a run that archived everything except the page it was pointed at
+    // would be answering a question nobody asked.
+    let mut urls: Vec<String> = Vec::new();
+    if !traverses_from_the_seed(args) {
+        urls.push(seed.url.clone());
+    }
+    if let Some(listing) = &listing {
+        urls.extend(listing.urls.iter().cloned());
+    }
+    if urls.is_empty() {
+        return (None, warning);
+    }
     // Given explicitly, the same depth that already bounds the ordinary crawl now also
     // bounds how far a sitemap URL is traversed from; left alone, a sitemap URL is fetched
     // on its own, since a depth bound has no meaning for a page nobody linked to.
     let follow_links = args.max_depth.is_some();
-    let report = SitemapReport::from(&listing);
-    match capture_sitemap(engine, archive, seed, rules, &listing.urls, follow_links) {
+    let report = listing.as_ref().map(SitemapReport::from);
+    let already_archived = run.archived_urls.clone();
+    match capture_sitemap(
+        engine,
+        archive,
+        seed,
+        rules,
+        &urls,
+        follow_links,
+        &already_archived,
+    ) {
         Ok(sitemap_run) => {
             run.merge(sitemap_run);
-            (Some(report), None)
+            (report, warning)
         }
         Err(CaptureError::Storage { source, run: extra }) => {
             run.merge(*extra);
             *failure = Some(source);
-            (Some(report), None)
+            (report, warning)
         }
         Err(CaptureError::Crawl(error)) => (
-            Some(report),
+            report,
             Some(format!("the sitemap's URLs could not be crawled: {error}")),
         ),
     }

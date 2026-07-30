@@ -36,7 +36,7 @@ A seed is one host, and the run is bounded: two hundred pages, two levels deep, 
 
 ## Design
 
-- **The archive outlives the tool.** Raw responses are stored verbatim and addressed by content hash, so a later version can re-derive metadata without re-fetching anything.
+- **The archive outlives the tool.** Raw response bodies are stored verbatim and addressed by content hash, so a later version can re-derive metadata without re-fetching anything. Headers are kept beside them, with one exception: what a `set-cookie` said is never stored, because a durable collection copied between machines has no business holding credentials or tracking identifiers.
 - **The crawler is a dependency, not the product.** It sits behind an interface this project owns. Canonicalization, dedupe, per-seed deadlines, retry and rate-limit policy, storage layout, extraction, retention, indexing and export are Archeion's job, and they do not change when the engine underneath does.
 - **Local first.** The first useful version runs on one machine with no hosted service, no account and no network dependency beyond the sites being archived.
 - **Personal archiving, not redistribution.** Authenticated and terms-sensitive content is handled carefully by default.

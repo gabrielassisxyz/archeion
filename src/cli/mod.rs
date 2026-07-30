@@ -9,6 +9,7 @@ pub mod capture;
 pub mod export;
 pub mod list;
 pub mod repass;
+pub mod session_cookie;
 
 use std::io::{self, Write as _};
 

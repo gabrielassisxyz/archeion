@@ -121,6 +121,10 @@ Both ends of that window widen as captures arrive, rather than only the last one
 
 `requested_url` and `final_url` differ exactly when the fetch redirected. Response headers are a list and not a map, because a map drops the repeated ones, and `set-cookie` and `link` repeat.
 
+**One header is kept without its value.** A `set-cookie` reaches the record as `(dropped by the archive)`, once per occurrence, so the record says the header was sent and how many times and never what it set. It holds with a session and without one, because a rule that depended on which kind of run was in progress would be wrong once, and an archive written under the wrong answer cannot be repaired by changing the answer later. Anonymously the same header is a tracking identifier rather than a credential, and this is a repair and not a precaution: 247 of the 250 captures of one publication were already holding 930 of these values between them. The cost is stated rather than hidden, and it is the only place this format knowingly pays it: a stored response is no longer byte for byte what arrived. It is paid at the crawl boundary, so nothing above that line ever holds a session token, and [`crawl-boundary.md`](crawl-boundary.md) makes it part of what an engine adapter owes the archive.
+
+Because the response headers are part of the capture fingerprint, the value that is hashed is the dropped one. Two fetches of a page that differ only in what their cookies said are therefore the same capture, which is what the definition above already says about two fetches alike in every recorded respect. Nothing on disk moves: a fingerprint is computed when a capture is written and never again.
+
 A capture that did not get everything the page referenced carries one more field, and a capture that got everything does not, which is also the shape of every record written before the field existed:
 
 ```json
@@ -131,6 +135,16 @@ A capture that did not get everything the page referenced carries one more field
 ```
 
 The reason is the point of the field. Comparing what the derived record says the page referenced against what the capture holds already shows that something is gone, as long as the same extractor wrote both; only this says whether the archive refused it, and therefore whether a different number would have kept the page whole. It stays out of the capture fingerprint, and can only stay out because each asset contributes its address to that fingerprint as well as its bytes: two captures that agree on every asset they hold, address by address, referenced the same subresources and therefore missed the same ones. Hashing a failure would mean hashing a reason string that varies between two attempts at the same failure.
+
+A capture whose run departed from the archive's default policy carries one more, and a capture from an ordinary run does not:
+
+```json
+  "policy_departures": ["session"]
+```
+
+One field with one entry per departure, rather than a boolean per decision, so the next thing a run can be told to do differently costs one entry and no new field. `session` says the request carried a subscription the operator holds, which makes the capture a different observation of the page from an anonymous one: the body is longer and nothing else in the record would say why. What the credential was is not here and is nowhere else either.
+
+It describes the capture and not the whole run, because a session belongs to one origin: a run holding one for a publication asks another host's pages without it, and those captures carry nothing. It is decided from `final_url` rather than from `requested_url`, since the field says what the stored response is and the HTTP client drops the credential when a redirect leaves its origin: an apex redirecting to its `www` form would otherwise store the teaser an anonymous reader was served under a record claiming a paying one. It stays out of the capture fingerprint, for the reason `assets_missed` does, and adding it needed no format version bump under the rule at the end of this document, since a field added to a record is a compatible change.
 
 Records are JSON, pretty printed. The format costs some bytes against the raw bodies it sits beside, and buys a file that `diff` and `grep` can work with and that any language will still parse in twenty years.
 
@@ -181,3 +195,5 @@ The alternative, holding the records in SQLite and keeping only blobs on disk, w
 ## The format version
 
 `archeion.json` names the format and its version. Opening a directory that holds something else fails rather than scattering records into it, and opening an archive written by a newer format fails rather than misreading it. A field added to a record is a compatible change; a field whose meaning changes is a version bump plus a migration that rewrites the tree.
+
+**One field's meaning changed without a bump, and this is the exception rather than an oversight.** `response_headers` went from every value as it arrived to every value except what a `set-cookie` said, which is a change of meaning by the rule above. What a bump plus a migration buys a reader is the ability to tell a record written under the old meaning from one written under the new, and here the record already says so itself: a dropped value is the literal string `(dropped by the archive)`, per occurrence, which is greppable and which no host has ever sent. So the version stays at 1, because moving it would cost a rewrite of every tree in existence and tell a reader something the record in their hand already told them. Every archive written before this keeps the values it holds; nothing rewrites a capture record. That reasoning is what makes it an exception: a field whose old and new meanings are indistinguishable inside a single record is still a bump and a migration.

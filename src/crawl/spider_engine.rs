@@ -19,7 +19,7 @@ use jiff::Timestamp;
 use lol_html::{HtmlRewriter, MemorySettings, Settings, element};
 use spider::configuration::RedirectPolicy;
 use spider::page::Page;
-use spider::reqwest::header::{CONTENT_LENGTH, HeaderMap};
+use spider::reqwest::header::{CONTENT_LENGTH, COOKIE, HeaderMap, HeaderValue, SET_COOKIE};
 use spider::tokio::runtime::{Builder, Runtime};
 use spider::tokio::sync::broadcast::Receiver;
 use spider::tokio::sync::broadcast::error::{RecvError, TryRecvError};
@@ -489,6 +489,26 @@ fn configured_website(
         // The sitemap is a claim about what exists; the crawl records what is reachable.
         .with_ignore_sitemap(true)
         .with_user_agent(Some(USER_AGENT));
+    // Asked about `start` and not about the seed's own URL, because `start` is the address the
+    // requests of this client are aimed at: a crawl is built around its seed, and a single
+    // fetch around the subresource or listed URL being acquired. A cookie that belongs to
+    // another origin is simply not configured, so the run asks for that page anonymously
+    // rather than refusing it.
+    if let Some(mut cookie) = seed
+        .session_cookie
+        .as_ref()
+        .and_then(|cookie| cookie.value_for(start))
+        // A value with a character no header can carry is refused by the command line before a
+        // run starts, so this only ever declines one a caller assembled by hand.
+        .and_then(|value| HeaderValue::from_str(value).ok())
+    {
+        // The guarantee that a credential is never printed stops resting on no logger existing:
+        // a sensitive value prints as `Sensitive` from anything that formats the map.
+        cookie.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, cookie);
+        website.with_headers(Some(headers));
+    }
     website
 }
 
@@ -758,6 +778,30 @@ fn declared_length(page: &Page) -> u64 {
         .unwrap_or(0)
 }
 
+/// What stands in the record where a `set-cookie` value arrived. It is unmistakable for a
+/// cookie a host actually sent, which an empty value would not be: a server may genuinely send
+/// one of those.
+const DROPPED_HEADER_VALUE: &str = "(dropped by the archive)";
+
+/// The response headers as the archive keeps them, which is every one of them except what a
+/// `set-cookie` said.
+///
+/// The value of that header is dropped with a session and without one, and the header itself
+/// stays: the record says it was sent, and how many times, and not what it set. Three reasons,
+/// none of which depends on whether a particular run carried a credential.
+///
+/// A rule that did depend on that would be wrong once, and an archive written under the wrong
+/// answer cannot be repaired by changing the answer later. The response body is what this
+/// collection is authoritative about, and a cookie is transport state travelling beside it.
+/// And it is a repair rather than a precaution: 247 of the 250 captures of one publication
+/// already hold 930 of these values between them, anonymously, being the tracking identifiers
+/// a session-less reader is issued.
+///
+/// The cost is real and is stated rather than hidden: a stored response is no longer byte for
+/// byte what arrived. It is paid here, at the boundary, so that nothing above this line ever
+/// holds a session token, including the metadata and readability passes that read a response
+/// before it is written and are re-run over it later. A second engine adapter has to drop it
+/// too, and `docs/crawl-boundary.md` says so; nothing guards an adapter that does not exist.
 fn headers_of(headers: Option<&HeaderMap>) -> Vec<Header> {
     let Some(headers) = headers else {
         return Vec::new();
@@ -767,9 +811,13 @@ fn headers_of(headers: Option<&HeaderMap>) -> Vec<Header> {
         .iter()
         .map(|(name, value)| Header {
             name: name.as_str().to_owned(),
-            // A header whose bytes are not text still says something happened. The lossy
-            // form keeps the line in the record instead of deleting the evidence.
-            value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            value: if name == SET_COOKIE {
+                DROPPED_HEADER_VALUE.to_owned()
+            } else {
+                // A header whose bytes are not text still says something happened. The lossy
+                // form keeps the line in the record instead of deleting the evidence.
+                String::from_utf8_lossy(value.as_bytes()).into_owned()
+            },
         })
         .collect()
 }
@@ -817,6 +865,7 @@ mod tests {
     use spider::tokio::sync::broadcast;
 
     use super::*;
+    use crate::crawl::SessionCookie;
 
     /// A fresh map for a test that has no depths of its own to seed, which is every test
     /// here except the ones asserting on `hop_depth_guard` and `crawl_seed` directly.
@@ -953,28 +1002,78 @@ mod tests {
         assert!(headers_of(None).is_empty());
     }
 
+    fn values_of(headers: &[Header], name: &str) -> Vec<String> {
+        headers
+            .iter()
+            .filter(|header| header.name == name)
+            .map(|header| header.value.clone())
+            .collect()
+    }
+
     /// A header map groups by name and says nothing about the order two different names
     /// arrived in, so what is checked here is the part that is actually preserved: a name
     /// that repeats keeps every one of its values, in the order it sent them.
+    ///
+    /// Asked of `link`, which repeats on real responses the same way `set-cookie` does, since
+    /// that one is the single header whose values the archive deliberately does not keep.
     #[test]
     fn a_header_that_repeats_keeps_all_of_its_values() {
         let mut map = HeaderMap::new();
-        map.append("set-cookie", "a=1".parse().expect("valid header value"));
+        map.append(
+            "link",
+            "</a>; rel=next".parse().expect("valid header value"),
+        );
         map.append(
             "content-type",
             "text/html".parse().expect("valid header value"),
         );
-        map.append("set-cookie", "b=2".parse().expect("valid header value"));
+        map.append(
+            "link",
+            "</b>; rel=prev".parse().expect("valid header value"),
+        );
 
         let headers = headers_of(Some(&map));
-        let cookies: Vec<&str> = headers
-            .iter()
-            .filter(|header| header.name == "set-cookie")
-            .map(|header| header.value.as_str())
-            .collect();
 
         assert_eq!(headers.len(), 3);
-        assert_eq!(cookies, ["a=1", "b=2"]);
+        assert_eq!(
+            values_of(&headers, "link"),
+            ["</a>; rel=next", "</b>; rel=prev"]
+        );
+    }
+
+    /// The companion to the test above, and the one header it does not hold for. What a
+    /// `set-cookie` said is not archived, with a session or without one, while the fact that it
+    /// was sent and how many times survives: a collection built to be durable and copied
+    /// between machines has no business holding session tokens or the tracking identifiers the
+    /// same header carries to an anonymous reader.
+    #[test]
+    fn a_set_cookie_value_does_not_survive_into_the_record() {
+        let mut map = HeaderMap::new();
+        map.append(
+            "set-cookie",
+            "substack.sid=secret; Path=/".parse().expect("valid header"),
+        );
+        map.append(
+            "set-cookie",
+            "ab_testing_id=%22abc%22".parse().expect("valid header"),
+        );
+        map.append(
+            "content-type",
+            "text/html".parse().expect("valid header value"),
+        );
+
+        let headers = headers_of(Some(&map));
+
+        assert_eq!(
+            values_of(&headers, "set-cookie"),
+            [DROPPED_HEADER_VALUE, DROPPED_HEADER_VALUE],
+            "the record says the header was sent twice and not what it set"
+        );
+        assert!(
+            !format!("{headers:?}").contains("secret"),
+            "a credential reached the record"
+        );
+        assert_eq!(values_of(&headers, "content-type"), ["text/html"]);
     }
 
     #[test]
@@ -1293,6 +1392,93 @@ mod tests {
         assert_eq!(
             website.configuration.http_first_byte_timeout, None,
             "the watchdog that invents a status is on"
+        );
+    }
+
+    fn seed_with_a_session(seed_url: &str) -> Seed {
+        let mut seed = Seed::new(seed_url);
+        seed.session_cookie = Some(SessionCookie::bound_to(
+            seed_url,
+            "substack.sid=secret".to_owned(),
+        ));
+        seed
+    }
+
+    /// What the cookie is configured on, since the header the engine sends is not reachable
+    /// from here: the request is made inside the dependency, on a client built from this
+    /// configuration, so where the value lands in it is the whole of what a test can say.
+    fn configured_header(url: &str, seed: &Seed) -> Option<HeaderValue> {
+        configured_website(url, seed, empty_depths())
+            .configuration
+            .headers
+            .as_ref()
+            .and_then(|headers| headers.inner().get(COOKIE).cloned())
+    }
+
+    fn configured_cookie(url: &str, seed: &Seed) -> Option<String> {
+        configured_header(url, seed).map(|value| {
+            value
+                .to_str()
+                .expect("the value went in as text")
+                .to_owned()
+        })
+    }
+
+    /// The reason the whole flag exists: a page the subscription paid for is asked for with the
+    /// subscription attached, so the archive holds the post rather than an appeal to subscribe.
+    #[test]
+    fn the_session_cookie_reaches_a_request_to_the_host_it_is_bound_to() {
+        let seed = seed_with_a_session("https://parknotes.substack.com/archive");
+
+        assert_eq!(
+            configured_cookie("https://parknotes.substack.com/p/a-paid-post", &seed).as_deref(),
+            Some("substack.sid=secret")
+        );
+    }
+
+    /// The value is marked sensitive on the way in, so the guarantee that a credential is never
+    /// printed stops depending on nothing in this process ever formatting a header map. It is
+    /// the configuration the dependency holds for the whole crawl, which is exactly the thing a
+    /// panic message or a future log line would be most likely to print.
+    #[test]
+    fn the_configured_session_header_does_not_print_its_value() {
+        let seed = seed_with_a_session("https://parknotes.substack.com/archive");
+        let header = configured_header("https://parknotes.substack.com/p/a-paid-post", &seed)
+            .expect("the cookie is configured");
+
+        assert!(
+            !format!("{header:?}").contains("secret"),
+            "the configured header printed the credential"
+        );
+    }
+
+    /// The same client builder, aimed elsewhere. Every picture on these pages lives on a content
+    /// network, so this is the ordinary case rather than the exotic one.
+    #[test]
+    fn a_request_to_any_other_host_is_configured_without_the_cookie() {
+        let seed = seed_with_a_session("https://parknotes.substack.com/archive");
+
+        for elsewhere in [
+            "https://parkersfiction.substack.com/p/a-story",
+            "https://substackcdn.com/image/fetch/w_1456/a.jpeg",
+        ] {
+            assert_eq!(
+                configured_cookie(elsewhere, &seed),
+                None,
+                "{elsewhere} would have been asked with the session attached"
+            );
+        }
+    }
+
+    /// A run that was given no session sends no `Cookie` at all, rather than an empty one.
+    #[test]
+    fn a_run_without_a_session_configures_no_cookie() {
+        assert_eq!(
+            configured_cookie(
+                "https://parknotes.substack.com/archive",
+                &Seed::new("https://parknotes.substack.com/archive"),
+            ),
+            None
         );
     }
 

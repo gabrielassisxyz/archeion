@@ -231,6 +231,7 @@ impl Archive {
             fetched_at: new.fetched_at,
             assets: new.assets,
             assets_missed: new.assets_missed,
+            policy_departures: new.policy_departures,
         };
 
         self.record_item(&new.canonical_url, new.fetched_at)?;

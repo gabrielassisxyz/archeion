@@ -15,13 +15,14 @@ use std::time::Duration;
 use archeion::capture::{CaptureError, CaptureRun, capture_seed, capture_sitemap};
 use archeion::crawl::{
     CrawlEngine, CrawlStop, DEFAULT_MAX_RESPONSE_BYTES, SMALLEST_MAX_RESPONSE_BYTES, Seed,
-    SpiderEngine,
+    SessionCookie, SpiderEngine,
 };
 use archeion::readability::SiteRules;
 use archeion::sitemap::{SitemapListing, read_sitemap};
 use archeion::storage::{Archive, StorageError};
 use serde::Serialize;
 
+use super::session_cookie::{COOKIE_HEADER_VARIABLE, cookie_header_value};
 use super::{warn, write_stdout};
 
 #[derive(Debug, clap::Args)]
@@ -70,6 +71,14 @@ pub struct CaptureArgs {
     /// reading the machine it runs on or the network around it.
     #[arg(long)]
     allow_private_addresses: bool,
+    /// File holding the `Cookie` header of an authenticated request, so that pages a
+    /// subscription paid for are archived as the pages rather than as an appeal to subscribe.
+    /// It must be readable by its owner alone, it is sent to the seed's own origin and to no
+    /// other, and `ARCHEION_COOKIE_HEADER` is the alternative to it. There is deliberately no
+    /// flag that takes the credential itself: an argument lands in shell history and in the
+    /// process table.
+    #[arg(long, value_name = "PATH")]
+    cookie_file: Option<PathBuf>,
     /// Additionally archive what the site's sitemap lists, for a site whose pages do not
     /// link to each other. With no address, the sitemap named by a `Sitemap:` directive in
     /// `robots.txt` is read, falling back to `/sitemap.xml`. Nothing is followed from a
@@ -234,7 +243,14 @@ impl Display for Deadline {
 }
 
 pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
-    let seed = seed_of(&args);
+    // Read before anything else and refused rather than worked around: a run that silently went
+    // out anonymous would archive a publication's paid half as teasers, which is the state this
+    // flag exists to leave behind and looks like nothing in the report.
+    let credential = cookie_header_value(
+        args.cookie_file.as_deref(),
+        std::env::var_os(COOKIE_HEADER_VARIABLE),
+    )?;
+    let seed = seed_of(&args, credential);
     // Before the archive, because opening one creates it. A seed the engine will not dial is
     // a run that was never going to fetch anything, and creating a directory for it leaves
     // an empty archive on the path that was typed wrong, which is exactly the case the line
@@ -283,7 +299,7 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
         (None, None)
     };
 
-    let report = report_of(&args, &run, created, sitemap_report);
+    let report = report_of(&args, &seed, &run, created, sitemap_report);
     let output = if json {
         format!("{}\n", serde_json::to_string(&report)?)
     } else {
@@ -319,7 +335,10 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn seed_of(args: &CaptureArgs) -> Seed {
+/// The seed this run crawls with. The credential arrives separately because reading it can fail
+/// and because it is bound here rather than where it was read: the origin it may be sent to is
+/// the seed's own, which is what keeps this flag ignorant of any particular publisher.
+fn seed_of(args: &CaptureArgs, credential: Option<String>) -> Seed {
     let mut seed = Seed::new(args.seed_url.clone());
     seed.max_pages = args.max_pages;
     seed.max_depth = args.max_depth.unwrap_or_else(|| defaults().max_depth);
@@ -329,6 +348,7 @@ fn seed_of(args: &CaptureArgs) -> Seed {
     seed.request_timeout = args.request_timeout.0;
     seed.max_retries = args.max_retries;
     seed.allow_private_addresses = args.allow_private_addresses;
+    seed.session_cookie = credential.map(|value| SessionCookie::bound_to(&args.seed_url, value));
     seed
 }
 
@@ -456,6 +476,20 @@ impl From<&SitemapListing> for SitemapReport {
     }
 }
 
+/// What a run's subscription reached, present only when the run was given one.
+///
+/// A credential can apply to nothing and cost nothing but the archive: a seed spelled with a
+/// trailing dot, an `http` seed whose host redirects to `https`, a credential bound to an origin
+/// the run never asks for. Every one of those archives a publication's paid half as teasers and
+/// exits zero. Naming the origin and the count is what makes the difference readable: an origin
+/// that is not the one the operator meant, or a count of zero against a run of hundreds, says the
+/// session did nothing.
+#[derive(Debug, Serialize)]
+struct SessionReport {
+    origin: String,
+    captures_used: usize,
+}
+
 /// The run as this command line publishes it.
 ///
 /// It is declared here rather than serialized off `CaptureRun` so that the library's report
@@ -478,6 +512,7 @@ struct CaptureReport {
     pages_dropped: usize,
     links_never_followed: Vec<String>,
     stopped: &'static str,
+    session: Option<SessionReport>,
     sitemap: Option<SitemapReport>,
     failed_fetches: Vec<Loss>,
     unaddressable_pages: Vec<Loss>,
@@ -488,6 +523,7 @@ struct CaptureReport {
 
 fn report_of(
     args: &CaptureArgs,
+    seed: &Seed,
     run: &CaptureRun,
     created: bool,
     sitemap: Option<SitemapReport>,
@@ -510,6 +546,10 @@ fn report_of(
         pages_dropped: run.pages_dropped,
         links_never_followed: run.links_never_followed.clone(),
         stopped: stop_name(run.stopped),
+        session: seed.session_cookie.as_ref().map(|cookie| SessionReport {
+            origin: cookie.origin(),
+            captures_used: run.captures_with_a_session,
+        }),
         sitemap,
         failed_fetches: run
             .failed_fetches
@@ -622,6 +662,18 @@ fn human_report(report: &CaptureReport, stopped: CrawlStop) -> String {
     for (label, value) in rows {
         writeln!(output, "  {label:<14}{value}").expect("writing to a string cannot fail");
     }
+    // Only for a run that carried one, since a row about a credential nobody supplied is a row
+    // every ordinary run has to read past. What it says when it is there is both halves of the
+    // question: where the credential was allowed to go, and how many captures it reached. A
+    // count of zero is the whole point of the row, and it is the shape a mistyped seed takes.
+    if let Some(session) = &report.session {
+        writeln!(
+            output,
+            "  {:<14}{}, {} capture(s)",
+            "session", session.origin, session.captures_used
+        )
+        .expect("writing to a string cannot fail");
+    }
     if let Some(sitemap) = &report.sitemap {
         writeln!(
             output,
@@ -707,7 +759,7 @@ mod tests {
 
     #[test]
     fn a_seed_with_no_flags_is_the_seed_the_library_would_have_built() {
-        let seed = seed_of(&parse(&[]));
+        let seed = seed_of(&parse(&[]), None);
         let library = Seed::new("https://example.com/");
 
         assert_eq!(seed.max_pages, library.max_pages);
@@ -725,23 +777,26 @@ mod tests {
 
     #[test]
     fn every_flag_lands_on_the_seed_field_it_names() {
-        let seed = seed_of(&parse(&[
-            "--max-pages",
-            "12",
-            "--max-depth",
-            "3",
-            "--concurrency",
-            "2",
-            "--delay",
-            "250ms",
-            "--deadline",
-            "90s",
-            "--request-timeout",
-            "5s",
-            "--max-retries",
-            "0",
-            "--allow-private-addresses",
-        ]));
+        let seed = seed_of(
+            &parse(&[
+                "--max-pages",
+                "12",
+                "--max-depth",
+                "3",
+                "--concurrency",
+                "2",
+                "--delay",
+                "250ms",
+                "--deadline",
+                "90s",
+                "--request-timeout",
+                "5s",
+                "--max-retries",
+                "0",
+                "--allow-private-addresses",
+            ]),
+            None,
+        );
 
         assert_eq!(seed.url, "https://example.com/");
         assert_eq!(seed.max_pages, 12);
@@ -822,14 +877,20 @@ mod tests {
     /// is exactly that.
     #[test]
     fn a_delay_of_zero_is_the_default_and_stays_accepted() {
-        assert_eq!(seed_of(&parse(&["--delay", "0s"])).delay, Duration::ZERO);
+        assert_eq!(
+            seed_of(&parse(&["--delay", "0s"]), None).delay,
+            Duration::ZERO
+        );
     }
 
     /// A run that asked for no deadline is making a decision, not asking for a budget of
     /// nothing, so the guard above has to let it through.
     #[test]
     fn a_run_with_no_deadline_is_not_mistaken_for_one_with_an_empty_budget() {
-        assert_eq!(seed_of(&parse(&["--deadline", "none"])).deadline, None);
+        assert_eq!(
+            seed_of(&parse(&["--deadline", "none"]), None).deadline,
+            None
+        );
     }
 
     /// The engine raises anything under a megabyte to a megabyte without saying so, so a
@@ -864,6 +925,65 @@ mod tests {
         );
     }
 
+    /// The credential is a path on this command line and never the value, and a run given none
+    /// carries none. What the flag names is checked here; where that credential may be sent is
+    /// the seed's own rule, and the library tests it.
+    #[test]
+    fn the_cookie_file_is_a_path_and_the_credential_reaches_the_seed() {
+        assert_eq!(parse(&[]).cookie_file, None);
+        assert!(seed_of(&parse(&[]), None).session_cookie.is_none());
+        assert_eq!(
+            parse(&["--cookie-file", "/home/reader/.config/archeion/a.cookie"]).cookie_file,
+            Some(PathBuf::from("/home/reader/.config/archeion/a.cookie"))
+        );
+        assert!(
+            seed_of(&parse(&[]), Some("substack.sid=secret".to_owned()))
+                .session_cookie
+                .is_some()
+        );
+    }
+
+    /// A credential bound to an origin the run never asks for archives teasers and exits zero, so
+    /// the report is the only thing that can say the session did nothing. It names the origin as
+    /// well as the count, because a count of zero on the origin the operator meant and a count of
+    /// zero on a seed they mistyped are different problems.
+    #[test]
+    fn a_run_carrying_a_session_reports_the_origin_it_was_bound_to_and_what_it_reached() {
+        let args = parse(&[]);
+        let seed = seed_of(&args, Some("substack.sid=secret".to_owned()));
+        let run = CaptureRun {
+            captures_written: 3,
+            captures_with_a_session: 2,
+            ..CaptureRun::default()
+        };
+
+        let report = report_of(&args, &seed, &run, false, None);
+        let printed = human_report(&report, run.stopped);
+
+        assert!(
+            printed.contains("session       https://example.com, 2 capture(s)"),
+            "the run reported: {printed}"
+        );
+        assert!(!printed.contains("secret"), "the credential was printed");
+    }
+
+    /// The ordinary run has no such row at all, because a line about a credential nobody supplied
+    /// is one every run would have to read past.
+    #[test]
+    fn a_run_carrying_no_session_reports_no_such_row() {
+        let args = parse(&[]);
+        let report = report_of(
+            &args,
+            &seed_of(&args, None),
+            &CaptureRun::default(),
+            false,
+            None,
+        );
+
+        assert!(report.session.is_none());
+        assert!(!human_report(&report, CrawlStop::Exhausted).contains("session"));
+    }
+
     /// A depth nobody typed has to still be the library's own default, since that is the
     /// number every other test here assumes a bare seed crawls with. Whether it was typed at
     /// all is what `--from-sitemap` needs to tell apart from a depth of two nobody asked for.
@@ -871,7 +991,7 @@ mod tests {
     fn a_max_depth_nobody_typed_is_the_library_s_own_default() {
         assert_eq!(parse(&[]).max_depth, None);
         assert_eq!(
-            seed_of(&parse(&[])).max_depth,
+            seed_of(&parse(&[]), None).max_depth,
             Seed::new("https://example.com/").max_depth
         );
         assert_eq!(parse(&["--max-depth", "3"]).max_depth, Some(3));

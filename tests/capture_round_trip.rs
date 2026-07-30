@@ -54,6 +54,7 @@ fn page_capture(
         fetched_at,
         assets: vec![stylesheet],
         assets_missed: Vec::new(),
+        policy_departures: Vec::new(),
     }
 }
 
@@ -1021,6 +1022,40 @@ fn a_capture_that_missed_nothing_carries_no_list_of_misses() {
             .read_capture(&url, &capture.id)
             .expect("capture is found")
             .assets_missed
+            .is_empty()
+    );
+}
+
+/// A capture from a run that departed from nothing is shaped exactly as every record written
+/// before the field existed, which is what makes adding it a compatible change rather than a
+/// format version and a migration.
+#[test]
+fn a_capture_from_an_ordinary_run_carries_no_list_of_departures() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a-page").expect("valid url");
+
+    let capture = archive
+        .write_capture(page_capture(
+            &archive,
+            &url,
+            at("2026-07-25T14:03:22Z"),
+            PAGE,
+        ))
+        .expect("capture is stored");
+
+    let record =
+        std::fs::read_to_string(capture_file(dir.path(), &url, &capture.id)).expect("read record");
+    assert!(
+        !record.contains("policy_departures"),
+        "an ordinary run wrote a list of departures: {record}"
+    );
+    // Read back, because a record with the field absent is also every record already on disk.
+    assert!(
+        archive
+            .read_capture(&url, &capture.id)
+            .expect("capture is found")
+            .policy_departures
             .is_empty()
     );
 }

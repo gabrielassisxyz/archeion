@@ -90,6 +90,7 @@ fn html_capture(url: &CanonicalUrl, body: &str) -> NewCapture {
         fetched_at: at("2026-07-25T14:03:22Z"),
         assets: Vec::new(),
         assets_missed: Vec::new(),
+        policy_departures: Vec::new(),
     }
 }
 

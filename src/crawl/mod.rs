@@ -10,6 +10,7 @@ mod spider_engine;
 pub(crate) use boundary::points_inside_a_network;
 pub use boundary::{
     CrawlEngine, CrawlError, CrawlOutcome, CrawlStop, FetchFailure, PageEvent, PageResponse, Seed,
+    SessionCookie,
 };
 pub use spider_engine::{
     DEFAULT_MAX_RESPONSE_BYTES, SMALLEST_MAX_RESPONSE_BYTES, SpiderEngine,

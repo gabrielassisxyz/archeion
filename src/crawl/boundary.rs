@@ -5,14 +5,88 @@
 //! the archive's terms rather than the engine's, so swapping the engine is a new adapter
 //! and not a rewrite of the code that stores what it produced.
 
+use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::ControlFlow;
 use std::time::Duration;
 
 use jiff::Timestamp;
-use url::{Host, Url};
+use url::{Host, Origin, Url};
 
 use crate::storage::Header;
+
+/// A subscription the run was given, so that a page a reader has paid for is archived as the
+/// page rather than as an invitation to subscribe.
+///
+/// It holds the value of a `Cookie` header taken from an authenticated request, and the origin
+/// that credential belongs to. **It is sent to that origin and to nothing else.** A run follows
+/// redirects and acquires subresources from wherever a page names them, so a cookie attached to
+/// every request the run happens to make is a credential handed to whatever host a page points
+/// at, which is the failure here that costs the most and shows the least.
+///
+/// The origin is captured when this is built rather than read from `Seed::url` when a request
+/// is made, because the sitemap phase clones the seed once per listed URL and replaces that
+/// field: a binding derived on the fly would follow the clone onto whatever address the listing
+/// named. What the sitemap phase can hand over is narrower than it looks, since `read_sitemap`
+/// already refuses a listed URL whose host is not the seed's, so what remains is a listed URL
+/// sharing the host under another scheme or port. The requests that genuinely aim elsewhere are
+/// a subresource on a content network and a redirect the run followed off the host.
+///
+/// An origin and not a hostname, which is what "its host" means once a scheme and a port are in
+/// play: the same name on another scheme is another site's session as far as this is concerned,
+/// and the comparison costs nothing.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionCookie {
+    /// Where this credential may be sent. An address that does not parse gets an opaque origin,
+    /// which equals nothing, so the cookie is sent nowhere rather than everywhere.
+    origin: Origin,
+    /// The whole `Cookie` header value, as an authenticated request sent it.
+    value: String,
+}
+
+impl SessionCookie {
+    /// Binds a `Cookie` header value to the origin of the URL the run was given.
+    pub fn bound_to(url: &str, value: String) -> Self {
+        let origin = Url::parse(url)
+            .map(|parsed| parsed.origin())
+            .unwrap_or_else(|_unreadable| Origin::new_opaque());
+        Self { origin, value }
+    }
+
+    /// Where this credential may be sent, for a report that has to name it. The origin and never
+    /// the value: an opaque origin serializes as `null`, which is the honest answer for a seed
+    /// address nothing could read.
+    pub fn origin(&self) -> String {
+        self.origin.ascii_serialization()
+    }
+
+    /// The header value to send with a request aimed at this URL, and `None` for every other
+    /// address.
+    ///
+    /// How often it is asked is the caller's business and it differs between the two: a single
+    /// fetch builds a client per address, so the question is asked per request, while a crawl
+    /// builds one client for the whole traversal and the answer rides every page it fetches.
+    /// That is sound because a crawl is one host by construction. What is unmeasured is whether
+    /// the engine's frontier will queue a same-host link on another port, which is the one shape
+    /// that would make a crawl's single answer too generous; it is the dependency's rule and
+    /// nobody here has driven it.
+    pub(crate) fn value_for(&self, url: &str) -> Option<&str> {
+        let parsed = Url::parse(url).ok()?;
+        (parsed.origin() == self.origin).then_some(self.value.as_str())
+    }
+}
+
+/// Prints where the credential goes and never what it is. `Seed` derives `Debug`, so anything
+/// that ever writes a seed into a message, a log line or an error would otherwise publish a
+/// session token.
+impl fmt::Debug for SessionCookie {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.debug_struct("SessionCookie")
+            .field("origin", &self.origin.ascii_serialization())
+            .field("value", &"(not shown)")
+            .finish()
+    }
+}
 
 /// Where a crawl starts and the limits it has to stay inside.
 ///
@@ -54,6 +128,9 @@ pub struct Seed {
     /// only way the fetch path itself is ever exercised, since every check of it points at
     /// a server on localhost.
     pub allow_private_addresses: bool,
+    /// A subscription the run was given, sent only to the origin it is bound to. Absent by
+    /// default, which is a run that archives what an anonymous reader is served.
+    pub session_cookie: Option<SessionCookie>,
 }
 
 impl Seed {
@@ -84,6 +161,9 @@ impl Seed {
             // has no business naming, so the default is the safe half of the choice and
             // reaching a local server is the part that has to be asked for.
             allow_private_addresses: false,
+            // Carrying a credential is never the default. A run says so, out loud, and says
+            // where the credential came from.
+            session_cookie: None,
         }
     }
 }
@@ -302,4 +382,116 @@ pub trait CrawlEngine {
     /// unlike a subresource, so the caller files it as a capture rather than folding it into
     /// the page that referenced it.
     fn fetch(&self, url: &str, seed: &Seed) -> PageEvent;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cookie_for(seed_url: &str) -> SessionCookie {
+        SessionCookie::bound_to(seed_url, "substack.sid=secret".to_owned())
+    }
+
+    /// The whole point of carrying one: a page the subscription paid for is asked for with the
+    /// subscription attached.
+    #[test]
+    fn a_cookie_reaches_a_request_to_the_origin_it_is_bound_to() {
+        let cookie = cookie_for("https://parknotes.substack.com/archive");
+
+        assert_eq!(
+            cookie.value_for("https://parknotes.substack.com/p/a-paid-post"),
+            Some("substack.sid=secret")
+        );
+        // The port a URL leaves out is the scheme's own, so writing it changes nothing.
+        assert_eq!(
+            cookie.value_for("https://parknotes.substack.com:443/p/a-paid-post"),
+            Some("substack.sid=secret")
+        );
+    }
+
+    /// The ordinary case rather than the exotic one: every picture on these pages lives on a
+    /// content network, and a run may follow a redirect off the seed's host. A credential sent
+    /// to a host that did not issue it is a credential given away.
+    #[test]
+    fn a_request_to_any_other_host_carries_no_cookie() {
+        let cookie = cookie_for("https://parknotes.substack.com/archive");
+
+        for elsewhere in [
+            "https://parkersfiction.substack.com/p/a-story",
+            "https://substackcdn.com/image/fetch/w_1456/a.jpeg",
+            "https://substack.com/",
+        ] {
+            assert_eq!(
+                cookie.value_for(elsewhere),
+                None,
+                "{elsewhere} was asked for with the session attached"
+            );
+        }
+    }
+
+    /// The binding is an origin, so the two ways an address can leave it are both refused: a
+    /// different host, and the seed's own host under another scheme. It asserts the predicate
+    /// and nothing about a redirect: the hop the engine makes inside a chain never reaches this
+    /// project, `remove_sensitive_headers` in the HTTP client is what strips `Cookie` there, and
+    /// no test here can drive it, because the engine refuses a redirect to a loopback target
+    /// before any policy is consulted and a test may not leave the machine.
+    #[test]
+    fn the_binding_covers_neither_another_host_nor_the_same_host_on_another_scheme() {
+        let cookie = cookie_for("https://parknotes.substack.com/archive");
+
+        assert_eq!(cookie.value_for("https://elsewhere.example/landing"), None);
+        // The same name under another scheme is another origin, which is the reading of "its
+        // host" this binding takes.
+        assert_eq!(cookie.value_for("http://parknotes.substack.com/p/a"), None);
+    }
+
+    /// A binding is captured when the cookie is built, so a phase that replaces the seed's own
+    /// URL per address it works through cannot move the credential to whatever that address
+    /// named. The sitemap phase already refuses a listed URL on another host, so the shape it
+    /// can still hand over is the seed's own host on another port, which is another origin and
+    /// gets nothing either.
+    #[test]
+    fn a_seed_cloned_for_another_url_keeps_the_binding_it_was_given() {
+        let mut seed = Seed::new("https://parknotes.substack.com/archive");
+        seed.session_cookie = Some(cookie_for(&seed.url));
+
+        let mut listed = seed.clone();
+        listed.url = "https://parknotes.substack.com:8443/p/a-story".to_owned();
+        let cookie = listed.session_cookie.expect("the clone keeps the cookie");
+
+        assert_eq!(cookie.value_for(&listed.url), None);
+        assert_eq!(
+            cookie.value_for("https://parknotes.substack.com/p/a-paid-post"),
+            Some("substack.sid=secret")
+        );
+    }
+
+    /// An address this cannot read is an address the credential is not sent to. The opposite
+    /// default would send a session wherever a URL happened not to parse.
+    #[test]
+    fn an_address_that_is_not_a_url_receives_nothing() {
+        let cookie = cookie_for("https://parknotes.substack.com/archive");
+
+        for unusable in ["/p/a-paid-post", "parknotes.substack.com", ""] {
+            assert_eq!(cookie.value_for(unusable), None, "{unusable} was trusted");
+        }
+        // A seed that does not parse binds the cookie to nothing rather than to everything.
+        assert_eq!(
+            cookie_for("not a url").value_for("https://example.com/"),
+            None
+        );
+    }
+
+    /// `Seed` derives `Debug`, so a message, a log line or an error that prints one must not
+    /// publish the credential it carries.
+    #[test]
+    fn a_session_cookie_never_prints_the_credential() {
+        let mut seed = Seed::new("https://parknotes.substack.com/archive");
+        seed.session_cookie = Some(cookie_for(&seed.url));
+
+        let printed = format!("{seed:?}");
+
+        assert!(!printed.contains("secret"), "the cookie was printed");
+        assert!(printed.contains("https://parknotes.substack.com"));
+    }
 }

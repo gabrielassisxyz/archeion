@@ -68,6 +68,9 @@ pub fn repass_archive(
     })?;
     run.unreadable_items = walk.unreadable.iter().map(ToString::to_string).collect();
 
+    // A seed with no URL and no session. A credential binds to the origin of the address that was
+    // typed, and there is none here: this walks an archive that may hold captures of any number of
+    // hosts, so nothing in a repass could say which origin a session belongs to.
     let mut seed = Seed::new(String::new());
     seed.allow_private_addresses = options.allow_private_addresses;
     let mut assets = AssetCapture::new(engine, archive, &seed, Instant::now());

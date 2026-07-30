@@ -248,6 +248,33 @@ pub struct Capture {
     /// written before the archive recorded this.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assets_missed: Vec<MissedAsset>,
+    /// How this capture departed from the archive's default policy, empty for a run that
+    /// departed from nothing and for every record written before the field existed.
+    ///
+    /// It stays out of the capture fingerprint, for the reason `assets_missed` does: it says
+    /// what the run did rather than what the response was, and two fetches that agree on every
+    /// recorded byte are the same capture whatever the run was carrying at the time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_departures: Vec<PolicyDeparture>,
+}
+
+/// How a capture departed from the archive's default policy.
+///
+/// Two captures of one URL, one made as an anonymous reader and one with a subscription, are
+/// different observations of the page, and a reader comparing them has to be able to tell which
+/// is which. It is one field with one entry per departure rather than a boolean per decision,
+/// so the next thing a run can be told to do differently costs a variant here and nothing else.
+///
+/// What it describes is this capture and not the whole run: a run holding a session for one host
+/// asks another host's pages without it, and marking those as authenticated would be a lie about
+/// the observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyDeparture {
+    /// The request carried a subscription the operator holds, so what came back is what a paying
+    /// reader is served rather than what the page shows everyone else. What the credential was is
+    /// not recorded anywhere: the archive keeps that a session was used and never the session.
+    Session,
 }
 
 /// A subresource a capture needed. It is stored inside the capture rather than as a
@@ -333,6 +360,7 @@ pub struct NewCapture {
     pub fetched_at: Timestamp,
     pub assets: Vec<Asset>,
     pub assets_missed: Vec<MissedAsset>,
+    pub policy_departures: Vec<PolicyDeparture>,
 }
 
 /// A subresource that was fetched and not yet stored.

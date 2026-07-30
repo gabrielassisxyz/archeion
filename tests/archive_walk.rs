@@ -38,6 +38,7 @@ fn capture_of(url: &CanonicalUrl, fetched_at: Timestamp) -> NewCapture {
         fetched_at,
         assets: Vec::new(),
         assets_missed: Vec::new(),
+        policy_departures: Vec::new(),
     }
 }
 

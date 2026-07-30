@@ -31,6 +31,7 @@ The scheme, the case of the host, the default port, the resolution of `.` and `.
 | Tracking parameters identify a campaign, not a page. | `https://example.com/a?utm_source=news&id=7` | `https://example.com/a?id=7` |
 | A query that was only tracking leaves no question mark. | `https://example.com/a?utm_source=news` | `https://example.com/a` |
 | Parameter order is not part of the address. | `https://example.com/a?b=2&a=1` | `https://example.com/a?a=1&b=2` |
+| An ampersand a page had to escape is a separator, not part of the name behind it. | `https://example.com/a?id=7&amp;utm_source=news` | `https://example.com/a?id=7` |
 
 Two rules refuse the URL outright rather than rewriting it.
 
@@ -49,6 +50,14 @@ The parameters are sorted by name, stably, so repeated names keep the order they
 
 They are also kept as the raw text they arrived as, rather than decoded into pairs and re-encoded. A round trip through key and value rewrites the escaping and turns a valueless `?print` into `?print=`, which would canonicalize a URL into one that was never requested.
 
+### The one thing rewritten inside the query
+
+An `href` attribute spells `&` as `&amp;`, which is what the HTML standard asks a page for, and nothing between the attribute and here decodes it. The query then splits on the literal `&` and every parameter behind the escape arrives carrying the rest of the reference on the front of its name: `amp;utm_medium` where the page wrote `utm_medium`. That name is not a name any rule below matches, so the campaign parameters a link was built out of survive the rules written to drop them, and the page is filed under an address no reader will ever type. On a thirty page run of one publication, four pages were filed a second time this way. The percent-encoded spelling, `&amp%3B`, is the same link escaped twice and arrives just as often.
+
+The tail is therefore stripped off a parameter before anything reads its name, repeatedly, since a name escaped twice that shed one layer per pass would name a different address each time a stored record was read back. A parameter genuinely named `amp` is untouched: what is stripped is the reference plus the semicolon that ends it.
+
+It is undone here rather than at the href it came off. An address also reaches the archive from a sitemap and from an operator's command line, and a rule about what a URL means belongs where every source of one passes. What this does not fix is the request: a fetch is aimed at the URL as it was found, so a crawl still spends a request on the escaped spelling and stores its capture under the corrected address, and `requested_url` records honestly what went out on the wire.
+
 ## Rules that were considered and rejected
 
 - **Collapsing `http` into `https`.** They are different addresses, and which one a site serves is exactly the kind of fact an archive exists to record. When a site redirects one to the other, the redirect says so, and the capture records both ends of it.
@@ -60,6 +69,7 @@ They are also kept as the raw text they arrived as, rather than decoded into pai
 ## Known limits
 
 - **`www` is stripped without consulting a public suffix list.** `www.co.uk` reduces to `co.uk`, which is a registry name and not a site. No rule about the shape of the string can avoid this, since `co.uk` and `example.com` are the same shape and only a list knows which of them is registrable. The list is the problem: public suffixes are added and removed continuously, so canonicalization built on one produces a different address for the same URL depending on when it ran, and that address is the item's identity, its directory name and the id stored inside its record. An archive whose identities move under it between two versions of the binary corrupts itself quietly. If this is ever worth fixing, the way to do it is to vendor the list into the repository, treat it as part of the archive format and treat updating it as a format version change with a migration, rather than to depend on a list that changes on its own.
+- **Undoing the escaped separator moved the address of items already stored under it.** A rule change is a migration that rewrites the tree, and there is none: an item filed under an address holding `amp;` in a parameter name no longer hashes to the directory it sits in, so the walk reports it as misfiled and it drops out of listings and exports while its files stay on disk. Only an address carrying the escape moves, which is only an address that was the defect, so nothing correctly filed is touched. The item that address duplicated is unaffected and still holds the page. A page reachable under no other spelling is the loss, and capturing it again files it correctly.
 - **An address literal and a domain can share a grouping directory.** `http://[::1]/` and a domain named `--1` both group under `items/--1/`, since the colons of an IPv6 literal become dashes. Nothing merges, because the item id is derived from the full canonical URL and those differ, but the directory a human browses is ambiguous.
 - **Nothing here is a guard against fetching a private address.** `http://127.0.0.1/`, `http://[::1]/` and `http://169.254.169.254/` are all valid addresses to canonicalize, and refusing them is a decision about what may be fetched, not about what a URL means. That guard belongs on the fetch path, which does not exist yet.
 

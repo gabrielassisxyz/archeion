@@ -43,6 +43,15 @@ const TRACKING_PARAMETERS: &[&str] = &[
     "fbclid", "gclid", "dclid", "msclkid", "twclid", "igshid", "mc_cid", "mc_eid",
 ];
 
+/// What an escaped ampersand leaves glued to the front of the parameter behind it. An
+/// attribute value spells `&` as `&amp;`, which is what the HTML standard asks a page for,
+/// and nothing between the href and here decodes it; the second spelling is the same link
+/// with its semicolon percent-encoded on top of the escape. Both come off real sites.
+///
+/// Matched case insensitively, since `&AMP;` is a reference the standard defines as well and
+/// the hex digits of a percent-encoded byte carry no case.
+const ESCAPED_AMPERSAND_TAILS: &[&str] = &["amp;", "amp%3b"];
+
 impl CanonicalUrl {
     pub fn parse(url: &str) -> Result<Self, InvalidCanonicalUrl> {
         let mut parsed = Url::parse(url).map_err(|reason| InvalidCanonicalUrl::Unparseable {
@@ -159,10 +168,11 @@ fn host_directory(host: &Host<&str>) -> Result<String, InvalidCanonicalUrl> {
 
 /// Drops the tracking parameters and sorts what survives.
 ///
-/// The parameters are kept as the raw text they arrived as rather than decoded and
+/// The parameters are otherwise kept as the raw text they arrived as rather than decoded and
 /// re-encoded. A round trip through key-value pairs rewrites the escaping and turns a
 /// valueless `?print` into `?print=`, which would canonicalize a URL into one the server
-/// was never asked for.
+/// was never asked for. The escaped separator is the one exception, and it is undone before
+/// anything reads a name, since until it is the names are not the page's.
 fn drop_tracking_parameters(url: &mut Url) {
     let rebuilt = {
         let Some(query) = url.query() else {
@@ -170,6 +180,7 @@ fn drop_tracking_parameters(url: &mut Url) {
         };
         let mut kept: Vec<&str> = query
             .split('&')
+            .map(undo_escaped_ampersand)
             .filter(|parameter| !parameter.is_empty())
             .filter(|parameter| !is_tracking(parameter_name(parameter)))
             .collect();
@@ -179,6 +190,41 @@ fn drop_tracking_parameters(url: &mut Url) {
         (!kept.is_empty()).then(|| kept.join("&"))
     };
     url.set_query(rebuilt.as_deref());
+}
+
+/// Removes what an escaped ampersand left on the front of a parameter.
+///
+/// A query splits on the literal `&`, so a page that wrote its separator the way HTML
+/// requires hands every parameter after the first a name it never meant: `amp;utm_medium`
+/// rather than `utm_medium`. That name defeats the tracking rules below, and what survives
+/// them is sorted and stored as a second address for a page the archive already holds, which
+/// is the one thing canonicalization exists to prevent.
+///
+/// Undone here, at the address, rather than at the href it came off: an address also arrives
+/// from a sitemap and from an operator's command line, and a rule about what a URL means
+/// belongs where every source of one passes. It stays wrong on the wire either way, since the
+/// request is aimed at the URL as it was found and not at this one.
+///
+/// Stripped in a loop rather than once, because these rules have to be a fixed point: a name
+/// escaped twice would shed one layer per pass and name a different address every time a
+/// stored record was read back.
+fn undo_escaped_ampersand(parameter: &str) -> &str {
+    let mut name = parameter;
+    loop {
+        let stripped = ESCAPED_AMPERSAND_TAILS
+            .iter()
+            .find_map(|tail| strip_prefix_ignoring_case(name, tail));
+        match stripped {
+            Some(rest) => name = rest,
+            None => return name,
+        }
+    }
+}
+
+fn strip_prefix_ignoring_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
 }
 
 fn parameter_name(parameter: &str) -> &str {
@@ -313,6 +359,11 @@ mod tests {
                 "https://example.com/a?a=1&b=2",
             ),
             (
+                "an ampersand a page had to escape is a separator, not part of the next name",
+                "https://example.com/a?id=7&amp;utm_source=news",
+                "https://example.com/a?id=7",
+            ),
+            (
                 "a valueless parameter keeps its shape",
                 "https://example.com/a?print",
                 "https://example.com/a?print",
@@ -341,6 +392,8 @@ mod tests {
             "https://www.www.example.com/page",
             "https://www.www.www.co.uk./a?b=2&utm_id=1&a=1#top",
             "https://www.www.com/a",
+            "https://example.com/a?id=7&amp;utm_source=news",
+            "https://example.com/a?amp%3Bamp%3Bid=7",
         ] {
             let once = canonical(url);
             assert_eq!(canonical(&once), once, "{url}");
@@ -361,6 +414,63 @@ mod tests {
             CanonicalUrl::parse("https://www.www..example.com/page"),
             Err(InvalidCanonicalUrl::UnsafeHost { .. })
         ));
+    }
+
+    /// The spelling the HTML standard asks an attribute for, which reached these rules
+    /// undecoded and filed a second item for a post already archived. Every parameter behind
+    /// the escape arrived named `amp;utm_medium` rather than `utm_medium`, so the rules that
+    /// drop a campaign never matched and what they left was an address nobody would type.
+    #[test]
+    fn an_escaped_ampersand_between_parameters_is_still_a_separator() {
+        let post = "https://example.substack.com/p/an-essay";
+        let bare = CanonicalUrl::parse(&format!(
+            "{post}?utm_source=substack&utm_medium=email&utm_content=share&action=share"
+        ))
+        .expect("valid url");
+
+        for escaped in [
+            format!(
+                "{post}?utm_source=substack&amp;utm_medium=email&amp;utm_content=share&amp;action=share"
+            ),
+            // The same link with the semicolon percent-encoded on top of the escape, which is
+            // the shape a quarter of the run that found this defect arrived in.
+            format!(
+                "{post}?utm_source=substack&amp%3Butm_medium=email&amp%3Butm_content=share&amp%3Baction=share"
+            ),
+            format!(
+                "{post}?utm_source=substack&AMP;utm_medium=email&amp%3butm_content=share&amp;action=share"
+            ),
+        ] {
+            let filed = CanonicalUrl::parse(&escaped).expect("valid url");
+            assert_eq!(filed, bare, "{escaped}");
+            assert_eq!(filed.as_str(), format!("{post}?action=share"));
+        }
+
+        // The first parameter carries the tail too, once the tracking parameter that used to
+        // sit in front of it has been dropped.
+        assert_eq!(
+            canonical("https://example.com/s/notebook-philosophy?amp%3Butm_medium=menu"),
+            "https://example.com/s/notebook-philosophy"
+        );
+    }
+
+    /// `amp=1` is a parameter real platforms serve. What is stripped above is the tail of a
+    /// character reference, which is the name plus the semicolon that ends it, so a parameter
+    /// that merely starts with those three letters is untouched.
+    #[test]
+    fn a_parameter_actually_named_amp_is_left_alone() {
+        assert_eq!(
+            canonical("https://example.com/a?amp=1"),
+            "https://example.com/a?amp=1"
+        );
+        assert_eq!(
+            canonical("https://example.com/a?amp"),
+            "https://example.com/a?amp"
+        );
+        assert_eq!(
+            canonical("https://example.com/a?ampersand=1"),
+            "https://example.com/a?ampersand=1"
+        );
     }
 
     #[test]

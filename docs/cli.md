@@ -22,7 +22,7 @@ Every option is one field of the seed the library crawls with, spelled the same,
 | `--max-pages <N>` | how many pages the run may archive |
 | `--max-depth <N>` | how far from the seed links are followed |
 | `--concurrency <N>` | requests in flight against the host at once |
-| `--delay <SPAN>` | the wait between requests, which slows the crawl rather than bounding it |
+| `--delay <SPAN>` | the wait between page requests, which slows a run rather than bounding it |
 | `--deadline <SPAN>` | the wall clock the whole run gets, or `none` |
 | `--request-timeout <SPAN>` | how long one request may take before it counts as no response |
 | `--max-retries <N>` | how many times a request worth repeating is repeated |
@@ -61,6 +61,12 @@ The flag wins over `SPIDER_MAX_SIZE_BYTES` already in the environment, which is 
 With no address given, the sitemap read is the one named by a `Sitemap:` directive in the host's `robots.txt`, read case insensitively since real files spell it in every case; the first directive found is the one read. With no directive found, `/sitemap.xml` is tried, which is where a browser would look next. Both are fetched through the same guards a page gets: the private address refusal, the response byte ceiling, the redirect screening.
 
 A URL the sitemap lists enters the run at depth zero, exactly like the seed, and by default nothing is followed out of it: a depth bound has no meaning for a page nobody linked to. Giving `--max-depth` explicitly changes that, since it is then a decision made on purpose rather than left at its default: the same depth that already bounds the ordinary crawl also bounds how far a listed URL is traversed from, taking each one as a seed of its own and sharing what is left of the run's own page count and deadline rather than starting over with a fresh budget.
+
+**`--delay` is what paces this phase, and it is worth passing.** A sitemap phase asks a host for page after page with nothing between the requests: it exists precisely for a site whose pages do not link one another, so there is no traversal to slow it down and no natural gap. Measured against a real publication, a 250 page sitemap run with no delay asked at 2.2 pages a second and the host refused 160 of them with a 429. The wait is paid per request, so a URL the run already filed costs nothing, and it comes out of the same wall clock the deadline is measured on: a host asked slowly is a host fewer of whose pages fit in a given hour. The deadline is read again on the far side of the wait, so a run does not sleep past its own end and then ask for one more page.
+
+It is paid whether a listed URL is fetched or, with `--max-depth` given explicitly, crawled. The engine applies the same delay inside a crawl, but only around the links that crawl discovers for itself, and a sitemap sub-crawl discovers none: a sitemap exists for a site whose pages do not link one another, so its seed is fetched with no wait of the engine's own. Leaving that branch to the engine would leave it exactly as unpaced as it was.
+
+What the delay does not pace, on this path or on a crawl, is a page's own subresources. Those are fetched from inside the pass that acquires them, one at a time, and [`asset-capture.md`](asset-capture.md) has why that pass is serial and what it does and does not stand in for.
 
 A URL the sitemap lists for a host other than the seed's is refused rather than fetched, since a sitemap is read for one host's sake and taking an address it names for another would let that site decide what this run fetches next. The sitemap itself is capped at fifty thousand listed URLs, the sitemap protocol's own ceiling for one file, counted while the file is still being read rather than after. A compressed sitemap and a sitemap index, one that lists further sitemaps rather than pages, are both refused with a message saying so rather than read.
 
@@ -110,7 +116,7 @@ The distinction is the point. A URL nobody answered, a page whose address the ca
 
 `list` answers with one object per line rather than one array, so a collection of any size can be read without holding all of it and `grep` stays a legitimate way to ask a question of it.
 
-`capture` and `export` answer with one object each, because each reports on a run rather than listing a collection. The capture object carries the counts the human report shows plus every URL the run did not archive, grouped by why: `failed_fetches`, `unaddressable_pages`, `pages_inside_a_network`, `unreadable_pages`, `unreadable_articles` and `links_never_followed`. With `--from-sitemap`, it also carries a `sitemap` object: the address read, how many URLs it listed, how many were taken and how many a bound refused, which is where a sitemap listing 247 posts against a run that archived 200 of them is made visible. The export object carries the number of notes written and the paths it could not read.
+`capture` and `export` answer with one object each, because each reports on a run rather than listing a collection. The capture object carries the counts the human report shows, `responses_refused` among them, a count by status of the captures a host answered with an error, plus every URL the run did not archive, grouped by why: `failed_fetches`, `unaddressable_pages`, `pages_inside_a_network`, `unreadable_pages`, `unreadable_articles` and `links_never_followed`. With `--from-sitemap`, it also carries a `sitemap` object: the address read, how many URLs it listed, how many were taken and how many a bound refused, which is where a sitemap listing 247 posts against a run that archived 200 of them is made visible. The export object carries the number of notes written and the paths it could not read.
 
 Both objects are declared by the command line rather than serialized off the library's own report. A field added to a record inside the crate is then not accidentally a promise to everything already parsing this output.
 

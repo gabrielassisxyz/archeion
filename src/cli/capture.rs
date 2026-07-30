@@ -5,6 +5,7 @@
 //! of decisions with reasons attached, written down in `docs/crawl-boundary.md`, and a
 //! command line that restated the numbers would be a second opinion about them.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Write as _};
 use std::path::{Path, PathBuf};
@@ -466,6 +467,9 @@ struct CaptureReport {
     archive: String,
     archive_created: bool,
     captures_written: usize,
+    /// Keyed by status, declared here in the shape this command promises rather than
+    /// serialized off the library's report, which is this file's convention for every field.
+    responses_refused: BTreeMap<String, usize>,
     articles_extracted: usize,
     extractions_refused: usize,
     assets_stored: usize,
@@ -493,6 +497,11 @@ fn report_of(
         archive: args.archive.display().to_string(),
         archive_created: created,
         captures_written: run.captures_written,
+        responses_refused: run
+            .responses_refused
+            .iter()
+            .map(|(status, count)| (status.to_string(), *count))
+            .collect(),
         articles_extracted: run.articles_extracted,
         extractions_refused: run.extractions_refused,
         assets_stored: run.assets_stored,
@@ -538,6 +547,23 @@ fn report_of(
     }
 }
 
+/// What the host answered with an error, said in one line.
+///
+/// It is a row that prints even when it is empty, like the losses beside it, because a row
+/// that only appears on a bad run is a row nobody has learned to look for. A run refused by a
+/// host used to say nothing at all, and the only symptom was a count of articles that read as
+/// a defect somewhere else.
+fn refused_sentence(refused: &BTreeMap<String, usize>) -> String {
+    if refused.is_empty() {
+        return "none".to_owned();
+    }
+    refused
+        .iter()
+        .map(|(status, count)| format!("{count} answered {status}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn stop_name(stopped: CrawlStop) -> &'static str {
     match stopped {
         CrawlStop::Exhausted => "exhausted",
@@ -571,6 +597,10 @@ fn human_report(report: &CaptureReport, stopped: CrawlStop) -> String {
     .expect("writing to a string cannot fail");
 
     let rows = [
+        // First, because it qualifies the line above it rather than the ones below: those
+        // captures are part of the count just printed, and every other row here is about
+        // what a run made of a page it did have.
+        ("host refused", refused_sentence(&report.responses_refused)),
         (
             "articles",
             format!(

@@ -158,6 +158,7 @@ fn a_seed_is_crawled_into_an_archive_that_the_run_creates() {
         format!(
             "created an archive at {archive}\n\
              archived 2 capture(s) from {seed} into {archive}\n  \
+             host refused  none\n  \
              articles      1 extracted, 0 refused\n  \
              assets        1 stored, 0 missed, 1 request(s)\n  \
              pages dropped 0\n  \

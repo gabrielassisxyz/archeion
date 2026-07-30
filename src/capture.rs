@@ -4,7 +4,7 @@
 //! archive. What connects them is a page event turning into a capture, which is where
 //! canonicalization decides the address the page is filed under.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,25 @@ pub struct UnaddressablePage {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CaptureRun {
     pub captures_written: usize,
+    /// How many stored captures the host answered with an error, by status.
+    ///
+    /// The response is stored either way, because a capture is what the server answered and
+    /// a 429 is an answer. What this exists for is that the answer must not vanish into the
+    /// count above: a run a host refused reported a collection larger than it holds, and the
+    /// only symptom was a derived count that read as a defect somewhere else entirely.
+    ///
+    /// Counted by status rather than listed by URL, because the interesting question is
+    /// whether the run was refused at all and one line can say so. Which URLs is a question
+    /// the archive itself answers, and a hundred and sixty of them on stderr is a wall
+    /// nobody reads.
+    ///
+    /// Four hundred and up, so a redirect the archive stored rather than followed is not
+    /// counted here. Under the strict redirect policy every hop off the host is archived as
+    /// the record of what the host said, which is a decision this archive made and not a
+    /// refusal: counting those would print `250 answered 301` for a site that moved and
+    /// answered every request, which is the false alarm that would teach a reader to ignore
+    /// this row.
+    pub responses_refused: BTreeMap<u16, usize>,
     pub unaddressable_pages: Vec<UnaddressablePage>,
     /// Pages that ended on an address existing only inside a network, which a run that did
     /// not ask for those addresses had no business reaching. They are reported rather than
@@ -108,6 +127,9 @@ impl CaptureRun {
     /// reason survives, since that is the one that actually decided when the run was done.
     pub fn merge(&mut self, other: CaptureRun) {
         self.captures_written += other.captures_written;
+        for (status, count) in other.responses_refused {
+            *self.responses_refused.entry(status).or_default() += count;
+        }
         self.unaddressable_pages.extend(other.unaddressable_pages);
         self.pages_inside_a_network
             .extend(other.pages_inside_a_network);
@@ -220,6 +242,8 @@ pub fn capture_sitemap(
     let started = Instant::now();
     let mut assets = AssetCapture::new(engine, archive, seed, started);
 
+    let mut asked_the_host_for_something = false;
+
     for url in urls {
         if budget_spent(seed, &run, started) {
             run.stopped = CrawlStop::DeadlineReached;
@@ -228,6 +252,40 @@ pub fn capture_sitemap(
         if already_filed(url, already_archived, &run) {
             continue;
         }
+        // The wait belongs here because this is the only phase that asks a host for page
+        // after page with no traversal between them, and `--delay` does not otherwise reach
+        // it: the flag is documented as the wait between requests and it reaches the engine
+        // through `with_delay`, which the engine applies to a crawl. What had been standing
+        // in for it was the subresource pass being serial, which is an accident of how much
+        // work a run happened to do rather than a policy, and it stopped being enough the
+        // moment a page's pictures stopped costing eight requests each.
+        //
+        // Paid per request rather than per URL: an address this run already filed is skipped
+        // without asking anybody anything, and the first request has nothing to wait behind.
+        //
+        // Paid on both branches, including the one where each URL is crawled rather than
+        // fetched, and that is not the redundancy it looks like. The engine does sleep for a
+        // non-zero delay, but only around the links a crawl discovers for itself: before a
+        // batch it already has and before each link it queues. A sitemap sub-crawl has neither,
+        // because a sitemap exists precisely for a site whose pages do not link one another, so
+        // its seed is fetched with no wait at all. Measured against a loopback site at a one
+        // second delay: the sub-crawls ran back to back, gaps of 0.05 seconds, while a crawl of
+        // two linked pages at two seconds took four. Skipping the wait here on the strength of
+        // the engine's own would leave `--max-depth` runs exactly as unpaced as before.
+        //
+        // The budget is read again on the far side of the wait, and that is not the same
+        // check twice. A wait long enough to matter is a wait the deadline can expire inside,
+        // and a phase that checked only before it would sleep past the run's own end and then
+        // ask for one more page. What a deadline means is that nothing more is asked for, so
+        // the moment it says so is the moment before asking rather than the top of the loop.
+        if asked_the_host_for_something {
+            pace(seed.delay);
+            if budget_spent(seed, &run, started) {
+                run.stopped = CrawlStop::DeadlineReached;
+                break;
+            }
+        }
+        asked_the_host_for_something = true;
         if follow_links {
             let mut sub_seed = seed.clone();
             sub_seed.url = url.clone();
@@ -305,6 +363,22 @@ fn already_filed(url: &str, already_archived: &HashSet<String>, run: &CaptureRun
     };
     let canonical = canonical.to_string();
     already_archived.contains(&canonical) || run.archived_urls.contains(&canonical)
+}
+
+/// Waits the run's politeness delay, if it has one.
+///
+/// The zero case is a guard and not an optimisation: zero is documented as the one span that
+/// means what it says, no wait at all, and handing it to the clock would still cost a trip
+/// through the scheduler on every URL of a list that can run to hundreds.
+///
+/// The wait is counted against the run's deadline, which is measured on the same wall clock,
+/// so a delay large enough to matter shortens the run rather than extending it. That is the
+/// honest arithmetic: a host that wants to be asked slowly is a host fewer of whose pages fit
+/// in a given hour.
+fn pace(delay: Duration) {
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
 }
 
 /// Whether this phase has anything left to spend: the page count already written against the
@@ -412,6 +486,9 @@ fn capture_page(
         }
     };
     let (stored, missed) = (captured.stored.len(), captured.missed.len());
+    // Read before the response is moved into the record, and counted after the write below,
+    // so what is reported is what actually reached the disk.
+    let status = page.status;
     let capture = match archive.write_capture(new_capture(canonical.clone(), page, captured)) {
         Ok(capture) => capture,
         Err(error) => {
@@ -420,6 +497,9 @@ fn capture_page(
         }
     };
     run.captures_written += 1;
+    if status >= 400 {
+        *run.responses_refused.entry(status).or_default() += 1;
+    }
     // Kept so a later phase of the same run does not archive an address this one already has.
     // It is what this run wrote rather than what the archive holds, because an archive holds
     // the history of everything ever captured and the question here is about one run.
@@ -1926,5 +2006,224 @@ mod tests {
         assert_eq!(counted(&AssetMiss::NothingWasAnswering), 125);
         assert_eq!(counted(&AssetMiss::CountCeilingReached), 872);
         assert_eq!(capture.assets_missed.len(), 1_000);
+    }
+    /// The sitemap phase asks for page after page with nothing between the requests, and it is
+    /// the phase that does so hundreds of times: it exists for a site whose pages do not link
+    /// one another. `--delay` reached the engine through the crawl, which this phase does not
+    /// run, so the flag was documented as the wait between requests and did nothing here.
+    ///
+    /// Measured against a real publication before this: 250 pages in 114 seconds, and the host
+    /// refused 160 of them. The same capture before the subresource pass got cheaper took 22.7
+    /// minutes and was refused none, because the serial subresource pass was standing in for a
+    /// politeness delay nobody had asked for.
+    #[test]
+    fn the_sitemap_phase_waits_between_the_pages_it_asks_for() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut seed = Seed::new("https://example.com/");
+        seed.delay = Duration::from_millis(60);
+        let urls: Vec<String> = (0..3)
+            .map(|i| format!("https://example.com/p/{i}"))
+            .collect();
+        let engine = ScriptedCrawlEngine::new(Vec::new()).serving(
+            urls.iter()
+                .map(|url| page(url, 200, "<html><body><p>prose</p></body></html>"))
+                .collect(),
+        );
+
+        let started = Instant::now();
+        let run = capture_sitemap(
+            &engine,
+            &archive,
+            &seed,
+            &SiteRules::default(),
+            &urls,
+            false,
+            &HashSet::new(),
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(run.captures_written, 3);
+        assert_eq!(engine.urls_fetched().len(), 3);
+        // Two gaps between three requests. A lower bound, which is the only kind a sleep can
+        // be held to: it never returns early, and asserting an upper bound would be asserting
+        // that this machine was not busy.
+        assert!(
+            started.elapsed() >= Duration::from_millis(120),
+            "three pages at a 60ms delay wait twice, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The wait is paid for a request and not for a loop iteration. A URL the run already
+    /// filed is skipped without asking the host anything, so pacing it would spend the run's
+    /// wall clock on politeness towards a request nobody made.
+    ///
+    /// This one passes with the change reverted, and it is a guard rather than a regression
+    /// test: reverting removes all waiting, so what it catches is a future `pace` moved above
+    /// the skip, which is the plausible wrong version of this and costs thirty seconds a URL.
+    #[test]
+    fn a_url_the_run_already_filed_is_skipped_without_waiting_for_it() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut seed = Seed::new("https://example.com/");
+        seed.delay = Duration::from_secs(30);
+        let urls: Vec<String> = (0..3)
+            .map(|i| format!("https://example.com/p/{i}"))
+            .collect();
+        let engine = ScriptedCrawlEngine::new(Vec::new()).serving(vec![page(
+            &urls[2],
+            200,
+            "<html><body><p>prose</p></body></html>",
+        )]);
+        let already: HashSet<String> = urls[..2].iter().cloned().collect();
+
+        let started = Instant::now();
+        let run = capture_sitemap(
+            &engine,
+            &archive,
+            &seed,
+            &SiteRules::default(),
+            &urls,
+            false,
+            &already,
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(run.captures_written, 1);
+        assert_eq!(engine.urls_fetched().len(), 1);
+        // One request, so no gap to pace. At a thirty second delay, paying for the two skips
+        // or for the first request is the difference between this and a run nobody waits for.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a single request waits for nothing, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A response that is not a success is stored, because a capture is what the server
+    /// answered. What it must not do is disappear into the count of captures: a run refused by
+    /// a host reported a collection larger than it held, and the only visible symptom was an
+    /// article count that read as an extraction defect.
+    ///
+    /// Measured: 160 of 250 pages answered 429 with a seventeen byte body, and the run said
+    /// `250 captures, stopped: nothing was left to fetch` and nothing else.
+    #[test]
+    fn a_capture_the_host_refused_is_counted_apart_from_the_ones_it_served() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![
+            page(
+                "https://example.com/a",
+                200,
+                "<html><body><p>a</p></body></html>",
+            ),
+            page("https://example.com/b", 429, "Too Many Requests"),
+            page("https://example.com/c", 429, "Too Many Requests"),
+            page("https://example.com/d", 503, "unavailable"),
+        ]);
+
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(run.captures_written, 4, "every response is still stored");
+        assert_eq!(
+            run.responses_refused,
+            BTreeMap::from([(429, 2), (503, 1)]),
+            "a run has to be able to say the host refused it"
+        );
+    }
+    /// The sitemap phase is where a host refusing a run was actually seen, and its counts reach
+    /// the report through `merge` rather than directly. A count that survived the crawl path
+    /// and was dropped on the way out of this one would report the same silence the row exists
+    /// to break.
+    #[test]
+    fn a_refusal_during_the_sitemap_phase_survives_into_the_run_it_is_merged_into() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/");
+        let urls: Vec<String> = (0..3)
+            .map(|i| format!("https://example.com/p/{i}"))
+            .collect();
+        let engine = ScriptedCrawlEngine::new(Vec::new()).serving(vec![
+            page(&urls[0], 200, "<html><body><p>served</p></body></html>"),
+            page(&urls[1], 429, "Too Many Requests"),
+            page(&urls[2], 429, "Too Many Requests"),
+        ]);
+
+        let sitemap_run = capture_sitemap(
+            &engine,
+            &archive,
+            &seed,
+            &SiteRules::default(),
+            &urls,
+            false,
+            &HashSet::new(),
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        let mut whole_run = CaptureRun::default();
+        whole_run.merge(sitemap_run);
+
+        assert_eq!(whole_run.captures_written, 3);
+        assert_eq!(whole_run.responses_refused, BTreeMap::from([(429, 2)]));
+    }
+
+    /// A redirect the archive stored rather than followed is not a refusal, and counting it as
+    /// one would print `answered 301` for a site that moved and served every request. The
+    /// strict redirect policy archives that hop on purpose, so this is the archive's own
+    /// decision showing up in the record rather than anything a host did to the run.
+    #[test]
+    fn a_redirect_the_archive_stored_is_not_counted_as_a_refusal() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![
+            page("https://example.com/moved", 301, ""),
+            page("https://example.com/gone", 404, "not found"),
+        ]);
+
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(run.captures_written, 2, "both responses are still stored");
+        assert_eq!(run.responses_refused, BTreeMap::from([(404, 1)]));
+    }
+    /// The wait is paid when each listed URL is crawled too, not only when it is fetched, and
+    /// this is the test that says why. A review read the engine's own throttle and concluded
+    /// this branch was already paced, which would have made the wait here a redundant third
+    /// delay; the engine sleeps only around the links a crawl finds for itself, and a sitemap
+    /// sub-crawl has none, because a sitemap exists for a site whose pages do not link one
+    /// another. Measured with the binary before this was written down: sub-crawls ran 0.05
+    /// seconds apart under a one second delay.
+    #[test]
+    fn a_listed_url_that_is_crawled_rather_than_fetched_is_paced_the_same() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut seed = Seed::new("https://example.com/");
+        seed.delay = Duration::from_millis(60);
+        let urls: Vec<String> = (0..3)
+            .map(|i| format!("https://example.com/p/{i}"))
+            .collect();
+        // Answering with no page at all, so what is measured is the gap between one listed URL
+        // and the next rather than anything a crawl did inside one.
+        let engine = ScriptedCrawlEngine::new(Vec::new());
+
+        let started = Instant::now();
+        capture_sitemap(
+            &engine,
+            &archive,
+            &seed,
+            &SiteRules::default(),
+            &urls,
+            true,
+            &HashSet::new(),
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(120),
+            "three crawled URLs wait twice, took {:?}",
+            started.elapsed()
+        );
     }
 }

@@ -10,6 +10,11 @@
 .beads
 .bv
 
+# Notes a tool writes about how a change was produced: which branch was merged into
+# which, what a review round concluded. That is process, and this repository is read by
+# strangers who need the software explained, not the work. No trailing slash, as above.
+.kernl
+
 # >>> repo-harness:gitignore-private-boundary >>>
 # Maintainer notes — not part of the project; they live in the private notes repo,
 # reachable through the `local` symlink. NO trailing slash on any path in this block:

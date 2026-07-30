@@ -28,6 +28,7 @@ Every option is one field of the seed the library crawls with, spelled the same,
 | `--max-retries <N>` | how many times a request worth repeating is repeated |
 | `--max-response-bytes <BYTES>` | the ceiling on one response body |
 | `--allow-private-addresses` | let the run reach addresses that exist only inside a network |
+| `--cookie-file <PATH>` | the `Cookie` header of an authenticated request, sent to the seed's own origin |
 | `--from-sitemap [<URL>]` | additionally archive what the site's sitemap lists |
 
 A span carries its unit: `250ms`, `30s`, `5m`, `1h`. A bare number would have to mean seconds on the deadline and milliseconds on the delay, and a run whose budget was read in the wrong unit is either over before it starts or never over at all.
@@ -45,6 +46,23 @@ The per-host extraction rules that sit in the archive are read at the start of t
 A seed naming loopback, a private range, a link-local address or one of the names a cloud metadata service answers on is refused before anything is dialled, and a page that ends on one of those addresses after a redirect is refused before it is stored. `--allow-private-addresses` turns both off for the run, which is how a locally served site is archived at all.
 
 That flag is the one that decides whether the archive can be talked into reading the machine it runs on. It exists because pointing the crawler at a server on localhost is also the only way the fetch path is exercised at all.
+
+### A subscription the run carries
+
+A publication whose posts are paid for is otherwise archived as its teasers: measured on one publication of 241 posts, 107 of them, 44 percent, were stored as a few hundred words ending in an appeal to subscribe. `--cookie-file` is what closes that. It names a file holding the whole `Cookie` header of a request made by a browser that is signed in, which is the same thing the reader's own session is, and the run sends it with the pages it asks for.
+
+**The credential is never an argument.** There is no flag that takes the value, and there will not be: an argument lands in shell history and in the process table, where every other process of the same user can read it for as long as the run lasts. A file and an environment variable are both readable by this user's other processes too; what they are not is written down by a shell and shown to everybody on the machine.
+
+- **The file must be readable by its owner alone.** One readable by its group or by anybody else is refused before anything is fetched, and the refusal says which of the two it is because that is how far the exposure already went: a file its group can read was available to the accounts in that group, and one anybody can read was available to every account on the machine. `chmod 600` is the answer either way, and a credential that was exposed is worth replacing rather than only protecting.
+- **`ARCHEION_COOKIE_HEADER` is the alternative**, holding the header value rather than a path. Neither source is required, and a run given neither archives what an anonymous reader is served. With both present the file wins, since a path typed for this run is a decision made now and a variable may have been exported hours ago.
+- **The flag knows nothing about any publisher.** The variable names this tool and the header, and the origin the credential belongs to comes from the seed, so one variable serves every site.
+- **A value carrying a character no header can hold is refused**, a newline being the one that matters: inside a header value it is a second header nobody wrote.
+
+**The cookie is bound to the seed's own origin and is sent nowhere else.** Scheme, host and port together: a run pointed at `https://example.com/archive` sends it to that site and to nothing that site names. A picture on a content network and a redirect that leaves the host are each a request to somewhere else, and handing a session to whatever address a page points at is handing a credential to a third party. Inside a redirect chain the strip is the HTTP client's own, which compares the next hop's host, port and scheme against the previous one's and drops `Cookie` when any of the three differs.
+
+**The run says what its session reached.** A credential can apply to nothing at all while the run still exits zero: a seed spelled with a trailing dot, an `http` seed whose host redirects to `https`, a credential bound to an origin the run never asks for. Each of those archives the paid half of a publication as teasers and looks exactly like a run nobody gave a session to, so the report carries a `session` row naming the origin the credential was bound to and how many captures it reached, and `--json` carries the same two numbers. A count of zero against a run of hundreds is the whole reason the row exists, and the origin beside it says whether the seed was the address that was meant.
+
+**What the archive stores of it is nothing.** The value of a `set-cookie` header is dropped from every capture, with a session and without one, and the header stays in the record saying it was sent and how many times. That is a repair rather than a precaution: 247 of the 250 captures of one publication already held 930 of these values between them, being the tracking identifiers a site issues to an anonymous reader. [`storage-model.md`](storage-model.md) has what the record says instead, and the capture also says that the run carried a session, so two captures of one page, one anonymous and one paid for, can be told apart by a reader who has both.
 
 ### The response byte ceiling
 
@@ -95,6 +113,8 @@ A capture with no article beside it is re-read when it holds something the extra
 For subresources, the pass only asks for URLs already listed in `assets_missed` where the archive's own policy stopped the original asset capture, such as a count ceiling, byte ceiling, deadline or a host that had stopped answering before that URL was tried. A URL that directly answered nothing is not retried blindly. Recovered assets, and retry results that are still missing, are written beside the capture and folded into `Archive::read_capture`; the original capture record is not rewritten because its id includes the assets present when it was filed.
 
 `--allow-private-addresses` has the same meaning as it does on `capture`, but only for recovered subresources. It is off by default, so a stored page still cannot make a later pass read the local machine or network around it.
+
+There is no `--cookie-file` here, and that is a decision rather than an omission. A credential is bound to the origin of the address that was typed, and a repass is given no address: it walks an archive that may hold captures of any number of hosts, so there is nothing for a binding to come from. A flag here would have to carry its own origin, which is a second surface for a need nobody has: a subresource on the host that issued the session is asked for with it during the capture, and a page behind a paywall is fetched again by capturing it again.
 
 ## Exit codes
 

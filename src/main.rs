@@ -36,6 +36,13 @@ enum Command {
     /// Crawl a seed into an archive.
     Capture(CaptureArgs),
     /// Re-read stored captures and refresh their derived records.
+    ///
+    /// There is no `--cookie-file` here, and it is not an omission. A credential is bound to the
+    /// origin of the seed that was typed, and a repass has no seed: it walks an archive that may
+    /// hold captures of any number of hosts, so there is nothing for a binding to come from. A
+    /// flag here would have to carry its own origin, which is a second surface for a need nobody
+    /// has yet: what a repass retries is a subresource, and a page behind a paywall is refetched
+    /// by capturing it again.
     Repass {
         /// Let recovered subresources reach addresses that exist only inside a network.
         #[arg(long)]

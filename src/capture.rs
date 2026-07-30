@@ -16,7 +16,7 @@ use crate::crawl::{
 };
 use crate::metadata::{self, PageMetadata, PageSource, ReferencedAsset, UnreadablePage};
 use crate::readability::{self, Extraction, SiteRules, UnreadableArticle};
-use crate::storage::{Archive, Header, NewCapture, StorageError};
+use crate::storage::{Archive, Header, NewCapture, PolicyDeparture, StorageError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
@@ -50,6 +50,15 @@ pub struct UnaddressablePage {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CaptureRun {
     pub captures_written: usize,
+    /// How many of those captures the run's subscription actually reached, which is zero for
+    /// every run that carries none.
+    ///
+    /// A credential can apply to nothing at all and cost nothing but the archive: a seed spelled
+    /// with a trailing dot, an `http` seed whose host redirects to `https`, a credential bound to
+    /// an origin the run never asks for. Each of those archives the paid half of a publication as
+    /// teasers, exits zero, and looks exactly like a run nobody gave a session to. This count is
+    /// the one thing that separates the two, so the report can say the session did nothing.
+    pub captures_with_a_session: usize,
     /// How many stored captures the host answered with an error, by status.
     ///
     /// The response is stored either way, because a capture is what the server answered and
@@ -127,6 +136,7 @@ impl CaptureRun {
     /// reason survives, since that is the one that actually decided when the run was done.
     pub fn merge(&mut self, other: CaptureRun) {
         self.captures_written += other.captures_written;
+        self.captures_with_a_session += other.captures_with_a_session;
         for (status, count) in other.responses_refused {
             *self.responses_refused.entry(status).or_default() += count;
         }
@@ -489,7 +499,8 @@ fn capture_page(
     // Read before the response is moved into the record, and counted after the write below,
     // so what is reported is what actually reached the disk.
     let status = page.status;
-    let capture = match archive.write_capture(new_capture(canonical.clone(), page, captured)) {
+    let capture = match archive.write_capture(new_capture(canonical.clone(), page, captured, seed))
+    {
         Ok(capture) => capture,
         Err(error) => {
             *write_failure = Some(error);
@@ -497,6 +508,14 @@ fn capture_page(
         }
     };
     run.captures_written += 1;
+    // Counted off the record that landed rather than off the seed, so what the report says a
+    // session reached is what the archive says too.
+    if capture
+        .policy_departures
+        .contains(&PolicyDeparture::Session)
+    {
+        run.captures_with_a_session += 1;
+    }
     if status >= 400 {
         *run.responses_refused.entry(status).or_default() += 1;
     }
@@ -612,8 +631,10 @@ fn new_capture(
     canonical_url: CanonicalUrl,
     page: PageResponse,
     captured: CapturedAssets,
+    seed: &Seed,
 ) -> NewCapture {
     let media_type = media_type_of(&page.headers);
+    let policy_departures = policy_departures_of(seed, &page.final_url);
     NewCapture {
         canonical_url,
         requested_url: page.requested_url,
@@ -626,7 +647,31 @@ fn new_capture(
         fetched_at: page.fetched_at,
         assets: captured.stored,
         assets_missed: captured.missed,
+        policy_departures,
     }
+}
+
+/// How the response this capture holds departed from what an ordinary run receives.
+///
+/// It is asked of one address rather than of the run as a whole, because a session belongs to
+/// one origin: a run holding one for a publication asks another host's pages without it, and
+/// recording those as authenticated would describe an observation nobody made.
+///
+/// The final URL and not the requested one. The field says what the stored response is, and a
+/// redirect that leaves the credential's origin makes the HTTP client drop the header before the
+/// hop, so the body that arrived is the one an anonymous reader gets: an apex redirecting to its
+/// `www` form, or an `http` seed reaching its `https` one, would otherwise store a teaser under
+/// a record claiming a paying reader was served. What this still cannot see is a chain that
+/// leaves the origin and comes back, since the header is gone for the rest of the chain while
+/// the final address matches again.
+fn policy_departures_of(seed: &Seed, final_url: &str) -> Vec<PolicyDeparture> {
+    let mut departures = Vec::new();
+    if let Some(cookie) = &seed.session_cookie
+        && cookie.value_for(final_url).is_some()
+    {
+        departures.push(PolicyDeparture::Session);
+    }
+    departures
 }
 
 /// The media type without its parameters: `text/html` out of `text/html; charset=utf-8`.
@@ -658,7 +703,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::crawl::CrawlOutcome;
+    use crate::crawl::{CrawlOutcome, SessionCookie};
     use crate::storage::AssetMiss;
 
     /// A run over a host nothing has been told about, which is what every test here but the one
@@ -2224,6 +2269,156 @@ mod tests {
             started.elapsed() >= Duration::from_millis(120),
             "three crawled URLs wait twice, took {:?}",
             started.elapsed()
+        );
+    }
+
+    fn seed_with_a_session(seed_url: &str) -> Seed {
+        let mut seed = Seed::new(seed_url);
+        seed.session_cookie = Some(SessionCookie::bound_to(
+            seed_url,
+            "substack.sid=secret".to_owned(),
+        ));
+        seed
+    }
+
+    /// Two captures of one URL, one anonymous and one with a subscription, are different
+    /// observations of the page, and nothing else in the record distinguishes them: the body is
+    /// simply longer. So the record says which kind of run produced it, and never what the
+    /// credential was.
+    #[test]
+    fn a_capture_made_with_a_session_says_so_in_the_record() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://parknotes.substack.com/p/a-paid-post",
+            200,
+            "<html><head><title>A paid post</title></head><body><p>All of it.</p></body></html>",
+        )]);
+
+        capture_with_no_rules(
+            &engine,
+            &archive,
+            &seed_with_a_session("https://parknotes.substack.com/archive"),
+        )
+        .expect("the run completes");
+
+        let capture = only_capture_of(&archive, "https://parknotes.substack.com/p/a-paid-post");
+        assert_eq!(capture.policy_departures, vec![PolicyDeparture::Session]);
+        assert!(
+            !format!("{capture:?}").contains("secret"),
+            "the credential reached the record"
+        );
+    }
+
+    /// The failure that is not silence but a false claim inside the archive. An apex redirecting
+    /// to its `www` form and an `http` seed reaching its `https` one are both ordinary, and on
+    /// either the HTTP client drops the header before the hop: what comes back is the teaser an
+    /// anonymous reader is served. A record marking that capture as paid for would assert the
+    /// archive holds a page it does not, which is worse than holding the teaser.
+    #[test]
+    fn a_capture_a_redirect_took_off_the_credential_s_origin_claims_no_session() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut redirected = page(
+            "https://parknotes.substack.com/p/a-paid-post",
+            200,
+            "<html><head><title>A teaser</title></head><body><p>Subscribe.</p></body></html>",
+        );
+        response_of(&mut redirected).final_url =
+            "https://www.parknotes.substack.com/p/a-paid-post".to_owned();
+        let engine = ScriptedCrawlEngine::new(vec![redirected]);
+
+        let run = capture_with_no_rules(
+            &engine,
+            &archive,
+            &seed_with_a_session("https://parknotes.substack.com/archive"),
+        )
+        .expect("the run completes");
+
+        assert!(
+            only_capture_of(&archive, "https://www.parknotes.substack.com/p/a-paid-post")
+                .policy_departures
+                .is_empty(),
+            "a capture the credential never reached was recorded as authenticated"
+        );
+        assert_eq!(run.captures_with_a_session, 0);
+    }
+
+    /// A credential can apply to nothing at all: bound to an origin the run never asks for, or to
+    /// a seed whose host redirects everything away. The run then archives teasers and exits zero,
+    /// so the count is what lets the report say the session did nothing.
+    #[test]
+    fn a_run_counts_the_captures_its_session_reached() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![
+            page(
+                "https://parknotes.substack.com/p/one",
+                200,
+                "<html>a</html>",
+            ),
+            page(
+                "https://parknotes.substack.com/p/two",
+                200,
+                "<html>b</html>",
+            ),
+            page("https://substack.com/discover", 200, "<html>c</html>"),
+        ]);
+
+        let run = capture_with_no_rules(
+            &engine,
+            &archive,
+            &seed_with_a_session("https://parknotes.substack.com/archive"),
+        )
+        .expect("the run completes");
+
+        assert_eq!(run.captures_written, 3);
+        assert_eq!(run.captures_with_a_session, 2);
+    }
+
+    /// A page on another host, which reaches the archive through a redirect the run followed off
+    /// the seed. It is asked for without the session, so a record saying it was captured with one
+    /// would describe an observation nobody made.
+    #[test]
+    fn a_capture_of_another_host_says_nothing_about_a_session() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://parkersfiction.substack.com/p/a-story",
+            200,
+            "<html><head><title>A story</title></head><body><p>Free.</p></body></html>",
+        )]);
+
+        capture_with_no_rules(
+            &engine,
+            &archive,
+            &seed_with_a_session("https://parknotes.substack.com/archive"),
+        )
+        .expect("the run completes");
+
+        assert!(
+            only_capture_of(&archive, "https://parkersfiction.substack.com/p/a-story")
+                .policy_departures
+                .is_empty()
+        );
+    }
+
+    /// The ordinary run, which is every run before this existed: no departure to record, and a
+    /// record shaped exactly as it was.
+    #[test]
+    fn a_capture_from_an_ordinary_run_records_no_departure() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine =
+            ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, "<html></html>")]);
+
+        capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert!(
+            only_capture_of(&archive, "https://example.com/a")
+                .policy_departures
+                .is_empty()
         );
     }
 }

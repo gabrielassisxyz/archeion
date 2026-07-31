@@ -249,6 +249,8 @@ pub enum CrawlStop {
     Exhausted,
     /// The seed's wall-clock budget ran out and the rest of the crawl was cancelled.
     DeadlineReached,
+    /// The run archived the number of pages the caller allowed and left the rest untouched.
+    PageLimitReached,
     /// The caller asked to stop, on a page it was handed.
     CallerStopped,
 }

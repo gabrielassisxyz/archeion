@@ -127,6 +127,14 @@ const LONE_PAGE: &str = "<html><head><title>A post</title></head><body>\
     </body></html>";
 
 fn capture_command(archive_path: &std::path::Path, seed_url: &str) -> Command {
+    capture_command_with_max_pages(archive_path, seed_url, 10)
+}
+
+fn capture_command_with_max_pages(
+    archive_path: &std::path::Path,
+    seed_url: &str,
+    max_pages: usize,
+) -> Command {
     let mut command = archeion();
     command
         .arg("capture")
@@ -134,7 +142,7 @@ fn capture_command(archive_path: &std::path::Path, seed_url: &str) -> Command {
         .arg(seed_url)
         .args([
             "--max-pages",
-            "10",
+            &max_pages.to_string(),
             "--concurrency",
             "4",
             "--max-retries",
@@ -142,6 +150,65 @@ fn capture_command(archive_path: &std::path::Path, seed_url: &str) -> Command {
         ])
         .args(["--deadline", "30s", "--allow-private-addresses"]);
     command
+}
+
+/// A crawl followed by a sitemap is one run. The first phase used to archive its full page
+/// allowance and the second phase then started the same allowance over from zero.
+#[test]
+fn a_sitemap_phase_uses_only_the_page_count_the_crawl_left() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let (listener, site) = Site::bind();
+    let listed = vec![site.url("/sitemap-only")];
+    let seed_page = format!(
+        "<html><body><a href=\"{}\">linked</a></body></html>",
+        site.url("/linked")
+    );
+    Site::serve(
+        listener,
+        vec![
+            route("/index.html", "text/html; charset=utf-8", seed_page),
+            route("/linked", "text/html; charset=utf-8", LONE_PAGE),
+            route("/sitemap.xml", "application/xml", urlset(&listed)),
+            route("/sitemap-only", "text/html; charset=utf-8", LONE_PAGE),
+        ],
+    );
+
+    let output = capture_command_with_max_pages(&archive_path, &site.url("/index.html"), 2)
+        .args([
+            "--from-sitemap",
+            &site.url("/sitemap.xml"),
+            "--max-depth",
+            "1",
+        ])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stdout_of(&output).contains("archived 2 capture(s)"),
+        "{}",
+        stdout_of(&output)
+    );
+    assert!(
+        stdout_of(&output).contains("sitemap       1 taken, 0 refused, 1 listed"),
+        "{}",
+        stdout_of(&output)
+    );
+    assert!(
+        stdout_of(&output).contains("stopped       the run's page limit was reached"),
+        "{}",
+        stdout_of(&output)
+    );
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    let sitemap_only = CanonicalUrl::parse(&listed[0]).expect("valid url");
+    assert!(
+        archive
+            .list_captures(&sitemap_only)
+            .expect("captures are listed")
+            .is_empty(),
+        "the sitemap phase exceeded the run's page count"
+    );
 }
 
 /// The measured shape this feature exists for: a seed whose own page links nowhere, and a

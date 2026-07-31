@@ -16,7 +16,7 @@ use std::thread;
 use std::time::Duration;
 
 use archeion::CanonicalUrl;
-use archeion::capture::capture_seed;
+use archeion::capture::{CaptureBudget, capture_seed};
 use archeion::crawl::{CrawlError, Seed, SpiderEngine};
 use archeion::readability::SiteRules;
 use archeion::storage::Archive;
@@ -37,6 +37,7 @@ fn a_redirect_into_the_metadata_service_is_refused_and_nothing_of_it_is_archived
         &archive,
         &local_seed(port),
         &SiteRules::default(),
+        &CaptureBudget::start(),
     )
     .expect("the run completes");
 
@@ -76,6 +77,7 @@ fn a_seed_pointed_at_the_metadata_service_never_reaches_a_socket() {
         &archive,
         &Seed::new(METADATA_URL),
         &SiteRules::default(),
+        &CaptureBudget::start(),
     )
     .expect_err("the seed is refused");
 

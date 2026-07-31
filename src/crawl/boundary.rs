@@ -249,6 +249,11 @@ pub enum CrawlStop {
     Exhausted,
     /// The seed's wall-clock budget ran out and the rest of the crawl was cancelled.
     DeadlineReached,
+    /// The seed's page count was reached and the run stopped asking for more. It is a
+    /// separate answer from the one above because the two send an operator somewhere
+    /// different: a ceiling reached says a larger number takes the rest of the site, and a
+    /// clock that ran out says the run needs longer or the host needs asking more slowly.
+    PageCeilingReached,
     /// The caller asked to stop, on a page it was handed.
     CallerStopped,
 }

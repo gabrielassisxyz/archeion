@@ -267,7 +267,9 @@ async fn crawl_seed(
         // What the caller leaves unread is counted like any other loss: those pages cost a
         // fetch each and the archive does not have them. The count is a floor, since a task
         // still in flight can queue another page after the length is read.
-        CrawlStop::CallerStopped => outcome.pages_dropped += pages.len(),
+        CrawlStop::CallerStopped | CrawlStop::PageLimitReached => {
+            outcome.pages_dropped += pages.len();
+        }
         CrawlStop::DeadlineReached => drain_queued(&mut pages, &mut on_page, &mut outcome),
     }
 

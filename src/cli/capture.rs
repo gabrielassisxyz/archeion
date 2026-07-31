@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use archeion::capture::{CaptureError, CaptureRun, capture_seed, capture_sitemap};
+use archeion::capture::{
+    CaptureBudget, CaptureBudgetState, CaptureError, CaptureRun, capture_seed, capture_sitemap,
+};
 use archeion::crawl::{
     CrawlEngine, CrawlStop, DEFAULT_MAX_RESPONSE_BYTES, SMALLEST_MAX_RESPONSE_BYTES, Seed,
     SessionCookie, SpiderEngine,
@@ -264,13 +266,14 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
     // produced later from what is on disk.
     let (rules, unused_rules) = SiteRules::read(&archive.extraction_rules_path());
     warn(unused_rules.iter().map(ToString::to_string));
+    let budget = CaptureBudget::start();
 
     // A sitemap exists for a site whose pages do not link one another, so crawling such a site
     // anyway spends the run's budget on the listing, navigation and comment pages the sitemap
     // was reached for in order to skip, and files the pages both phases find twice. Asking for
     // a depth explicitly is asking for both, and then both run.
     let (mut run, mut failure) = if traverses_from_the_seed(&args) {
-        match capture_seed(&engine, &archive, &seed, &rules) {
+        match capture_seed(&engine, &archive, &seed, &rules, &budget) {
             Ok(run) => (run, None),
             // The report is the point of carrying the run inside the error: the archive holds
             // whatever was written before the disk refused, and a caller told only that a write
@@ -286,15 +289,10 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
     // skipped once the ordinary crawl already failed for that reason: there is nothing left
     // to spend more requests archiving into.
     let (sitemap_report, sitemap_warning) = if failure.is_none() {
-        sitemap_phase(
-            &args,
-            &engine,
-            &archive,
-            &seed,
-            &rules,
-            &mut run,
-            &mut failure,
-        )
+        let (report, warning, sitemap_failure) =
+            sitemap_phase(&args, &engine, &archive, &seed, &rules, &mut run, &budget);
+        failure = sitemap_failure;
+        (report, warning)
     } else {
         (None, None)
     };
@@ -402,11 +400,19 @@ fn sitemap_phase(
     seed: &Seed,
     rules: &SiteRules,
     run: &mut CaptureRun,
-    failure: &mut Option<StorageError>,
-) -> (Option<SitemapReport>, Option<String>) {
+    budget: &CaptureBudget,
+) -> (Option<SitemapReport>, Option<String>, Option<StorageError>) {
     let Some(requested) = &args.from_sitemap else {
-        return (None, None);
+        return (None, None, None);
     };
+    if budget.state(seed, run.captures_written) == CaptureBudgetState::DeadlineReached {
+        run.stopped = CrawlStop::DeadlineReached;
+        return (
+            None,
+            Some("the run's deadline was spent before the sitemap could be read".to_owned()),
+            None,
+        );
+    }
     let (listing, warning) = match read_sitemap(engine, seed, requested.as_deref()) {
         Ok(listing) => (Some(listing), None),
         Err(error) => (None, Some(error.to_string())),
@@ -422,14 +428,13 @@ fn sitemap_phase(
         urls.extend(listing.urls.iter().cloned());
     }
     if urls.is_empty() {
-        return (None, warning);
+        return (None, warning, None);
     }
     // Given explicitly, the same depth that already bounds the ordinary crawl now also
     // bounds how far a sitemap URL is traversed from; left alone, a sitemap URL is fetched
     // on its own, since a depth bound has no meaning for a page nobody linked to.
     let follow_links = args.max_depth.is_some();
     let report = listing.as_ref().map(SitemapReport::from);
-    let already_archived = run.archived_urls.clone();
     match capture_sitemap(
         engine,
         archive,
@@ -437,20 +442,20 @@ fn sitemap_phase(
         rules,
         &urls,
         follow_links,
-        &already_archived,
+        &budget.after(run),
     ) {
         Ok(sitemap_run) => {
             run.merge(sitemap_run);
-            (report, warning)
+            (report, warning, None)
         }
         Err(CaptureError::Storage { source, run: extra }) => {
             run.merge(*extra);
-            *failure = Some(source);
-            (report, warning)
+            (report, warning, Some(source))
         }
         Err(CaptureError::Crawl(error)) => (
             report,
             Some(format!("the sitemap's URLs could not be crawled: {error}")),
+            None,
         ),
     }
 }
@@ -608,17 +613,19 @@ fn stop_name(stopped: CrawlStop) -> &'static str {
     match stopped {
         CrawlStop::Exhausted => "exhausted",
         CrawlStop::DeadlineReached => "deadline-reached",
+        CrawlStop::PageLimitReached => "page-limit-reached",
         CrawlStop::CallerStopped => "stopped-by-the-archive",
     }
 }
 
-/// The same three answers a person reads. It is a second exhaustive match rather than a
+/// The same answers a person reads. It is a second exhaustive match rather than a
 /// lookup on the name above, so a stop that gets added is a stop this file fails to compile
 /// without rather than one that quietly reads as an ordinary end.
 fn stop_sentence(stopped: CrawlStop) -> &'static str {
     match stopped {
         CrawlStop::Exhausted => "nothing was left to fetch",
         CrawlStop::DeadlineReached => "the seed's deadline ran out",
+        CrawlStop::PageLimitReached => "the run's page limit was reached",
         CrawlStop::CallerStopped => "the archive ended the run",
     }
 }

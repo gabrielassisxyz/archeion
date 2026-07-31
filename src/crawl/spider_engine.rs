@@ -268,7 +268,14 @@ async fn crawl_seed(
         // fetch each and the archive does not have them. The count is a floor, since a task
         // still in flight can queue another page after the length is read.
         CrawlStop::CallerStopped => outcome.pages_dropped += pages.len(),
-        CrawlStop::DeadlineReached => drain_queued(&mut pages, &mut on_page, &mut outcome),
+        // This engine never answers with the page ceiling. All it learns is that its own
+        // crawl future finished, whether that was the whole site or the count it was given,
+        // so a phase bounded by the count says so from above this line. The arm is grouped
+        // with the deadline rather than left to a wildcard so that an engine that does come
+        // to report it hands over the pages it already fetched instead of dropping them.
+        CrawlStop::DeadlineReached | CrawlStop::PageCeilingReached => {
+            drain_queued(&mut pages, &mut on_page, &mut outcome);
+        }
     }
 
     outcome.stopped = stopped;

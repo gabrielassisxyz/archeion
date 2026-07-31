@@ -255,8 +255,8 @@ pub fn capture_sitemap(
     let mut asked_the_host_for_something = false;
 
     for url in urls {
-        if budget_spent(seed, &run, started) {
-            run.stopped = CrawlStop::DeadlineReached;
+        if let Some(bound) = bound_reached(seed, &run, started) {
+            run.stopped = bound;
             break;
         }
         if already_filed(url, already_archived, &run) {
@@ -290,8 +290,8 @@ pub fn capture_sitemap(
         // the moment it says so is the moment before asking rather than the top of the loop.
         if asked_the_host_for_something {
             pace(seed.delay);
-            if budget_spent(seed, &run, started) {
-                run.stopped = CrawlStop::DeadlineReached;
+            if let Some(bound) = bound_reached(seed, &run, started) {
+                run.stopped = bound;
                 break;
             }
         }
@@ -391,16 +391,22 @@ fn pace(delay: Duration) {
     }
 }
 
-/// Whether this phase has anything left to spend: the page count already written against the
-/// seed's own ceiling, or the seed's wall clock against how long this phase has run. Read
+/// Which of this phase's bounds is spent, if either: the page count already written against
+/// the seed's own ceiling, or the seed's wall clock against how long this phase has run. Read
 /// plainly rather than with the margin the engine gets, because what is left over here is a
 /// prefix of a URL list rather than pages already in flight that a late guard has to hand over.
-fn budget_spent(seed: &Seed, run: &CaptureRun, started: Instant) -> bool {
+///
+/// It answers which one rather than that one of them was, because the caller writes the answer
+/// into the run's stop reason and the two lead somewhere different. A single boolean here had
+/// both bounds reporting the deadline, so a run given `--deadline none` printed that its
+/// deadline ran out.
+fn bound_reached(seed: &Seed, run: &CaptureRun, started: Instant) -> Option<CrawlStop> {
     if run.captures_written >= seed.max_pages as usize {
-        return true;
+        return Some(CrawlStop::PageCeilingReached);
     }
     seed.deadline
         .is_some_and(|budget| started.elapsed() >= budget)
+        .then_some(CrawlStop::DeadlineReached)
 }
 
 /// What is left of the run's page count, for a sub-crawl started from a sitemap URL. Floored
@@ -2212,6 +2218,79 @@ mod tests {
 
         assert_eq!(whole_run.captures_written, 3);
         assert_eq!(whole_run.responses_refused, BTreeMap::from([(429, 2)]));
+    }
+
+    /// The two bounds this phase answers to are different facts and send an operator to
+    /// different flags: a ceiling reached says a larger number takes the rest of the site,
+    /// while a clock that ran out says the run needs longer or the host needs asking more
+    /// slowly. One boolean stood for both, so a run given no deadline at all still reported
+    /// that its deadline ran out.
+    #[test]
+    fn a_sitemap_phase_stopped_by_the_page_ceiling_does_not_blame_the_deadline() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut seed = Seed::new("https://example.com/");
+        seed.max_pages = 2;
+        seed.deadline = None;
+        let urls: Vec<String> = (0..4)
+            .map(|i| format!("https://example.com/p/{i}"))
+            .collect();
+        let engine = ScriptedCrawlEngine::new(Vec::new()).serving(
+            urls.iter()
+                .map(|url| page(url, 200, "<html><body><p>prose</p></body></html>"))
+                .collect(),
+        );
+
+        let run = capture_sitemap(
+            &engine,
+            &archive,
+            &seed,
+            &SiteRules::default(),
+            &urls,
+            false,
+            &HashSet::new(),
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(run.captures_written, 2);
+        assert_eq!(run.stopped, CrawlStop::PageCeilingReached);
+    }
+
+    /// The other half of the same distinction: the phase that really did run out of clock
+    /// still says so. Without this, naming the ceiling everywhere would pass the test above
+    /// while telling an operator to raise a number that was never the bound.
+    #[test]
+    fn a_sitemap_phase_stopped_by_its_deadline_still_names_the_clock() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut seed = Seed::new("https://example.com/");
+        seed.deadline = Some(Duration::ZERO);
+        let urls: Vec<String> = (0..4)
+            .map(|i| format!("https://example.com/p/{i}"))
+            .collect();
+        let engine = ScriptedCrawlEngine::new(Vec::new()).serving(
+            urls.iter()
+                .map(|url| page(url, 200, "<html><body><p>prose</p></body></html>"))
+                .collect(),
+        );
+
+        let run = capture_sitemap(
+            &engine,
+            &archive,
+            &seed,
+            &SiteRules::default(),
+            &urls,
+            false,
+            &HashSet::new(),
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(
+            engine.urls_fetched().len(),
+            0,
+            "a budget already spent asks the host for nothing"
+        );
+        assert_eq!(run.stopped, CrawlStop::DeadlineReached);
     }
 
     /// A redirect the archive stored rather than followed is not a refusal, and counting it as

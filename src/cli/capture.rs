@@ -608,17 +608,19 @@ fn stop_name(stopped: CrawlStop) -> &'static str {
     match stopped {
         CrawlStop::Exhausted => "exhausted",
         CrawlStop::DeadlineReached => "deadline-reached",
+        CrawlStop::PageCeilingReached => "page-ceiling-reached",
         CrawlStop::CallerStopped => "stopped-by-the-archive",
     }
 }
 
-/// The same three answers a person reads. It is a second exhaustive match rather than a
-/// lookup on the name above, so a stop that gets added is a stop this file fails to compile
-/// without rather than one that quietly reads as an ordinary end.
+/// The same answers a person reads. It is a second exhaustive match rather than a lookup on
+/// the name above, so a stop that gets added is a stop this file fails to compile without
+/// rather than one that quietly reads as an ordinary end.
 fn stop_sentence(stopped: CrawlStop) -> &'static str {
     match stopped {
         CrawlStop::Exhausted => "nothing was left to fetch",
         CrawlStop::DeadlineReached => "the seed's deadline ran out",
+        CrawlStop::PageCeilingReached => "the run had archived every page it was allowed",
         CrawlStop::CallerStopped => "the archive ended the run",
     }
 }
@@ -982,6 +984,34 @@ mod tests {
 
         assert!(report.session.is_none());
         assert!(!human_report(&report, CrawlStop::Exhausted).contains("session"));
+    }
+
+    /// The stop is the row an operator reads to decide which flag to change, so the page
+    /// ceiling and the deadline have to read as the two different answers they are. The name
+    /// in the JSON report is asserted beside the sentence because a pipeline reads that one
+    /// and would otherwise keep filing ceiling-bounded runs under a deadline.
+    #[test]
+    fn a_run_stopped_by_the_page_ceiling_reports_the_ceiling_and_not_the_deadline() {
+        let args = parse(&["--max-pages", "2"]);
+        let seed = seed_of(&args, None);
+        let run = CaptureRun {
+            captures_written: 2,
+            stopped: CrawlStop::PageCeilingReached,
+            ..CaptureRun::default()
+        };
+
+        let report = report_of(&args, &seed, &run, false, None);
+        let printed = human_report(&report, run.stopped);
+
+        assert_eq!(report.stopped, "page-ceiling-reached");
+        assert!(
+            printed.contains("stopped       the run had archived every page it was allowed"),
+            "the run reported: {printed}"
+        );
+        assert!(
+            !printed.contains("deadline"),
+            "a page ceiling is not a deadline: {printed}"
+        );
     }
 
     /// A depth nobody typed has to still be the library's own default, since that is the

@@ -5,6 +5,7 @@
 //! `docs/crawl-boundary.md`.
 
 mod boundary;
+mod robots;
 mod spider_engine;
 
 pub(crate) use boundary::points_inside_a_network;

@@ -925,6 +925,7 @@ fn usable_url(url: &str, allow_private_addresses: bool) -> Result<String, String
 
 #[cfg(test)]
 mod tests {
+    use spider::packages::robotparser::parser::RobotFileParser;
     use spider::tokio::sync::broadcast;
 
     use super::*;
@@ -1783,5 +1784,36 @@ mod tests {
     fn a_page_with_no_base_element_at_all_is_not_flagged() {
         let page = page_with_html("<html><head></head><body><a href=\"/a\">a</a></body></html>");
         assert!(!page_declares_an_absolute_base_href(&page));
+    }
+
+    /// What makes combining groups reachable rather than theoretical: the parse this project
+    /// is handed keeps two groups naming the same crawler apart, so a matcher reading only
+    /// the first archives every path the second refuses. Driven through the engine's own
+    /// parser and the same mapping `robots_rules` uses, which is everything between the file
+    /// and the answer except the request that fetched it.
+    #[test]
+    fn two_groups_naming_this_crawler_are_parsed_apart_and_both_govern() {
+        let mut parser = RobotFileParser::new();
+        parser.parse_str(
+            "User-agent: archeion\nDisallow: /first\n\n\
+             User-agent: *\nDisallow: /general\n\n\
+             User-agent: Archeion\nDisallow: /second\n",
+        );
+        assert_eq!(
+            parser.get_entries().len(),
+            2,
+            "the parser stopped keeping repeated groups for one agent apart"
+        );
+
+        let groups = parser
+            .get_entries()
+            .iter()
+            .chain(std::iter::once(parser.get_base_entry()))
+            .map(group_of)
+            .collect();
+        let rules = RobotRules::for_agent(groups, USER_AGENT);
+        assert!(!rules.allows("https://example.test/first"));
+        assert!(!rules.allows("https://example.test/second"));
+        assert!(rules.allows("https://example.test/general"));
     }
 }

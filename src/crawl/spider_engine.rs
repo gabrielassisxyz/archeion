@@ -18,6 +18,7 @@ use std::time::Duration;
 use jiff::Timestamp;
 use lol_html::{HtmlRewriter, MemorySettings, Settings, element};
 use spider::configuration::RedirectPolicy;
+use spider::packages::robotparser::parser::Entry;
 use spider::page::Page;
 use spider::reqwest::header::{CONTENT_LENGTH, COOKIE, HeaderMap, HeaderValue, SET_COOKIE};
 use spider::tokio::runtime::{Builder, Runtime};
@@ -30,6 +31,7 @@ use super::boundary::{
     CrawlEngine, CrawlError, CrawlOutcome, CrawlStop, FetchFailure, PageEvent, PageResponse, Seed,
     is_internal_host,
 };
+use super::robots::{Group, RobotRules, Rule};
 use crate::storage::Header;
 
 /// Archiving under a name that says what it is and where to complain about it. A crawler
@@ -228,6 +230,7 @@ async fn crawl_seed(
     // whether or not the engine ever came back to fetch it.
     let depths: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut website = configured_website(start, seed, Arc::clone(&depths));
+    let robots = robots_rules(&mut website).await;
     // The engine fetches while the caller writes to disk, so the queue between them has to
     // absorb the difference. Sizing it to the fetch concurrency alone drops pages the
     // moment a write is slower than a fetch; sizing it to the page limit would hold a
@@ -241,6 +244,16 @@ async fn crawl_seed(
     let mut fetched: HashSet<String> = HashSet::new();
     let scheme = frontier_scheme(start);
     let mut on_page = |event: PageEvent| {
+        // The one place a page the site refused can still be stopped. The engine's own
+        // frontier reads a `Disallow` with an interior wildcard as a literal prefix nothing
+        // begins with, so it queues and fetches the page regardless of what `robots.txt`
+        // said; refusing it here is what keeps it out of the archive, out of the extraction
+        // pass, and out of the subresource requests that would follow it. The request itself
+        // is already spent by the time this runs, and no hook this engine offers can prevent
+        // it: see `docs/crawl-boundary.md`.
+        if !robots.allows(requested_url_of(&event)) {
+            return ControlFlow::Continue(());
+        }
         fetched.insert(depth_key(requested_url_of(&event), &scheme));
         on_page(event)
     };
@@ -283,18 +296,21 @@ async fn crawl_seed(
     // caller already has an honest reason for what it left behind, and comparing against
     // `depths` there would report the budget as if it were this defect.
     //
-    // `website` is asked rather than answered for a second time: `robots.txt` was already
-    // read, during `setup()` inside `website.crawl()` above, well before the first page was
-    // fetched, so the parser it built is exactly the one that decided every link the crawl
-    // itself declined to follow. Asking anything else would be a second implementation of
-    // `robots.txt` next to the engine's own, and the two are not guaranteed to agree, least
-    // of all on a rule this project already knows the engine's parser reads wrong: it
-    // cannot match a `Disallow` with an interior wildcard, so it under-refuses rather than
-    // over-refuses there. A guard built on a second implementation would then report the gap
-    // between the two parsers as data loss, on exactly the sites where the exit code matters
-    // most. Asking is sound with no `robots.txt` served at all, too: the engine reads a 4xx
-    // for the file itself as permission to fetch everything, and answers the same way if
-    // `respect_robots_txt` were ever off.
+    // Both matchers are asked, and a link either one refuses is not a link this crawl lost.
+    //
+    // `website` answers for the frontier: `robots.txt` was already read, before the first
+    // page was fetched, so its parser is exactly the one that decided every link the crawl
+    // itself declined to follow. It is not enough on its own, because it under-refuses a
+    // `Disallow` with an interior wildcard, and `robots` above is what makes up that
+    // difference by refusing the page after it arrives; a link refused there is missing from
+    // `fetched` and would otherwise be reported as data loss on exactly the sites this
+    // project cares about. It is not enough on its own either, because the two disagree in
+    // the other direction as well: the engine takes the first rule that matches while RFC
+    // 9309 takes the longest, so a `Disallow: /p/` followed by an `Allow: /p/keep` is a
+    // link the frontier never queued and this project would have allowed.
+    //
+    // Asking is sound with no `robots.txt` served at all: the engine reads a 4xx for the
+    // file itself as permission to fetch everything, and both answer the same way.
     if frontier_claim_is_trustworthy(outcome.stopped, outcome.pages_dropped) {
         let discovered = depths
             .lock()
@@ -304,10 +320,57 @@ async fn crawl_seed(
             &fetched,
             start,
             seed.max_pages,
-            |url| website.is_allowed_robots(url),
+            |url| website.is_allowed_robots(url) && robots.allows(url),
         );
     }
     outcome
+}
+
+/// The site's own rules, read out of the engine's parse of its `robots.txt`.
+///
+/// The file is fetched here rather than by the crawl, and it is still fetched once: driving
+/// `configure_robots_parser` before `crawl()` sets the parser's `mtime`, and the engine's own
+/// setup skips a file it already has. Doing it here is what makes the rules available before
+/// the first page rather than after the last, and it also covers a case the engine's setup
+/// skips outright, a crawl limited to a single page, which is a crawl `docs/cli.md` promises
+/// respects `robots.txt` like any other.
+///
+/// Only the matching is redone. The groups, the comments, the percent-decoding and the empty
+/// `Disallow:` are the engine's reading of the file, and re-reading them here would be a
+/// second opinion about what the file says rather than about what one of its rules matches.
+async fn robots_rules(website: &mut Website) -> RobotRules {
+    let (client, _control) = website.setup_base();
+    website.configure_robots_parser(&client).await;
+    let Some(parser) = website.get_robots_parser().as_deref() else {
+        return RobotRules::everything_allowed();
+    };
+    // The states of the file that are not rules, a `robots.txt` the host answered 401 or 403
+    // for and one it answered a 4xx for, are deliberately not read here. Measured against a
+    // loopback server answering 403 for its own `robots.txt`: the engine screens its own seed
+    // through `is_allowed_robots` before fetching it, so a run archives nothing at all and
+    // this is never asked. Reading the flags anyway would be a second copy of a decision that
+    // has no case left to decide.
+    let groups = parser
+        .get_entries()
+        .iter()
+        .chain(std::iter::once(parser.get_base_entry()))
+        .map(group_of)
+        .collect();
+    RobotRules::for_agent(groups, USER_AGENT)
+}
+
+/// One parsed group, as this project's own matcher wants it. The engine keeps the groups that
+/// name a crawler apart from the one that names `*`, which it holds as a base entry; both are
+/// ordinary groups here, since which of them applies is the question the matcher answers.
+fn group_of(entry: &Entry) -> Group {
+    Group {
+        agents: entry.useragents.clone(),
+        rules: entry
+            .rulelines
+            .iter()
+            .map(|line| Rule::new(line.path.clone(), line.allowance))
+            .collect(),
+    }
 }
 
 /// Whether `CrawlStop::Exhausted` is a claim this run can actually stand behind, which is the
@@ -869,6 +932,7 @@ fn usable_url(url: &str, allow_private_addresses: bool) -> Result<String, String
 
 #[cfg(test)]
 mod tests {
+    use spider::packages::robotparser::parser::RobotFileParser;
     use spider::tokio::sync::broadcast;
 
     use super::*;
@@ -1727,5 +1791,36 @@ mod tests {
     fn a_page_with_no_base_element_at_all_is_not_flagged() {
         let page = page_with_html("<html><head></head><body><a href=\"/a\">a</a></body></html>");
         assert!(!page_declares_an_absolute_base_href(&page));
+    }
+
+    /// What makes combining groups reachable rather than theoretical: the parse this project
+    /// is handed keeps two groups naming the same crawler apart, so a matcher reading only
+    /// the first archives every path the second refuses. Driven through the engine's own
+    /// parser and the same mapping `robots_rules` uses, which is everything between the file
+    /// and the answer except the request that fetched it.
+    #[test]
+    fn two_groups_naming_this_crawler_are_parsed_apart_and_both_govern() {
+        let mut parser = RobotFileParser::new();
+        parser.parse_str(
+            "User-agent: archeion\nDisallow: /first\n\n\
+             User-agent: *\nDisallow: /general\n\n\
+             User-agent: Archeion\nDisallow: /second\n",
+        );
+        assert_eq!(
+            parser.get_entries().len(),
+            2,
+            "the parser stopped keeping repeated groups for one agent apart"
+        );
+
+        let groups = parser
+            .get_entries()
+            .iter()
+            .chain(std::iter::once(parser.get_base_entry()))
+            .map(group_of)
+            .collect();
+        let rules = RobotRules::for_agent(groups, USER_AGENT);
+        assert!(!rules.allows("https://example.test/first"));
+        assert!(!rules.allows("https://example.test/second"));
+        assert!(rules.allows("https://example.test/general"));
     }
 }

@@ -496,6 +496,149 @@ fn answer_with_a_robots_rule(mut stream: TcpStream) -> std::io::Result<()> {
     stream.flush()
 }
 
+/// A `robots.txt` written the way real ones are, with a wildcard in the middle of a pattern
+/// and an anchor at the end of another. The crawl engine's own matcher reads a `Disallow`
+/// with an interior wildcard as a literal prefix no path begins with, so it fetches every
+/// matching page; what this pins is that none of them is archived, and that the plain
+/// prefixes beside them are not traded away to get there.
+const ROBOTS_TXT_WITH_WILDCARDS: &str = "User-agent: *\n\
+    Disallow: /p/*/comment/*\n\
+    Allow: /p/an-essay/comment/pinned\n\
+    Disallow: /subscribe\n\
+    Disallow: /action/\n\
+    Disallow: /*.pdf$\n";
+const WILDCARD_SEED_PAGE: &str = r#"<html><head><title>Home</title></head><body>
+    <a href="/p/an-essay">an essay</a>
+    <a href="/p/an-essay/comment/298986227">a comment on it</a>
+    <a href="/p/an-essay/comment/pinned">the comment the site pinned</a>
+    <a href="/subscribe">subscribe</a>
+    <a href="/action/follow">follow</a>
+    <a href="/report.pdf">the report</a>
+    <a href="/report.pdf.html">the report, as a page</a>
+    </body></html>"#;
+
+/// The defect itself: a pattern with a wildcard anywhere but at its end, honoured end to end
+/// through the binary and the real engine. The four refused addresses are each a shape the
+/// rules cover differently, and `/report.pdf.html` is there because an anchored pattern that
+/// swallowed it would be refusing more than the site asked for.
+///
+/// `/p/an-essay/comment/pinned` is the precedence half of RFC 9309 asked of the run rather
+/// than of the matcher alone: it is covered by the wildcard `Disallow` and by a longer
+/// `Allow`, and the longer one wins. It is observable here because it is the one shape both
+/// matchers reach, the engine reading the `Allow` as an exact path and never matching the
+/// wildcard at all. Read first rule first, as the engine reads a file, the page would be
+/// refused and this would fail.
+#[test]
+fn a_disallow_with_an_interior_wildcard_keeps_its_paths_out_of_the_archive() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let port = serve_a_site_whose_rules_use_wildcards();
+    let seed = format!("http://127.0.0.1:{port}/");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(&seed)
+        .args([
+            "--max-pages",
+            "10",
+            "--max-depth",
+            "1",
+            "--concurrency",
+            "4",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(stderr_of(&output), "");
+    assert!(
+        stdout_of(&output).contains("links lost    0"),
+        "{}",
+        stdout_of(&output)
+    );
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    let archived = |path: &str| {
+        let url = CanonicalUrl::parse(&format!("{seed}{path}")).expect("valid url");
+        !archive
+            .list_captures(&url)
+            .expect("captures are listed")
+            .is_empty()
+    };
+    assert!(archived("p/an-essay"), "a page no rule covers was not kept");
+    assert!(
+        archived("report.pdf.html"),
+        "an anchored rule refused a path that does not end where it says"
+    );
+    assert!(
+        archived("p/an-essay/comment/pinned"),
+        "the longer Allow lost to the wildcard Disallow it sits under"
+    );
+    assert!(
+        !archived("p/an-essay/comment/298986227"),
+        "a path refused by a wildcard in the middle of a pattern was archived"
+    );
+    assert!(!archived("subscribe"), "a plain prefix stopped being read");
+    assert!(
+        !archived("action/follow"),
+        "a plain prefix ending in a slash stopped being read"
+    );
+    assert!(
+        !archived("report.pdf"),
+        "a rule anchored with a dollar did not refuse the path it ends on"
+    );
+}
+
+fn serve_a_site_whose_rules_use_wildcards() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || answer_with_wildcard_robots_rules(stream));
+        }
+    });
+    port
+}
+
+fn answer_with_wildcard_robots_rules(mut stream: TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    let page = |title: &str| {
+        format!("<html><head><title>{title}</title></head><body>a page</body></html>")
+    };
+    let (media_type, body): (&str, Vec<u8>) = match path.as_str() {
+        "/robots.txt" => ("text/plain", ROBOTS_TXT_WITH_WILDCARDS.as_bytes().to_vec()),
+        "/" => (
+            "text/html; charset=utf-8",
+            WILDCARD_SEED_PAGE.as_bytes().to_vec(),
+        ),
+        _ => ("text/html; charset=utf-8", page(&path).into_bytes()),
+    };
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {media_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()
+}
+
 /// The other way a discovered link can look lost without being lost: not a rule that
 /// refused it, but a spelling the two sides of the comparison read differently. Two shapes
 /// pages in the wild actually write: an entity inside an href rather than the character it

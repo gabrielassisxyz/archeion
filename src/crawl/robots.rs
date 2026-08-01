@@ -56,30 +56,36 @@ impl RobotRules {
         Self { rules: Vec::new() }
     }
 
-    /// The group that governs `user_agent`, chosen the way RFC 9309 chooses one: the group
-    /// naming this crawler's product token if the file has one, the `*` group otherwise, and
-    /// only that group's rules. A file with neither states nothing about this crawler.
+    /// The rules that govern `user_agent`, chosen the way RFC 9309 chooses them: every group
+    /// naming this crawler's product token if the file has any, the `*` groups otherwise, and
+    /// nothing else. A file with neither states nothing about this crawler.
     ///
-    /// One group, not the union of the two. A file that names this crawler has already said
-    /// what it wants from it, and reading the general rules on top of the specific ones would
-    /// let `User-agent: *` overrule a line written for this crawler by name.
+    /// One kind of group, not the union of the two. A file that names this crawler has already
+    /// said what it wants from it, and reading the general rules on top of the specific ones
+    /// would let `User-agent: *` overrule a line written for this crawler by name.
+    ///
+    /// Within a kind the groups are combined rather than raced, because a file is free to
+    /// state the same agent twice and the second group is as much about this crawler as the
+    /// first: taking whichever came first would archive everything the other one refused. A
+    /// named group carrying no rules still counts as the file having named this crawler, which
+    /// is why an empty result is not the same question as no named group at all.
     pub(super) fn for_agent(groups: Vec<Group>, user_agent: &str) -> Self {
         let token = product_token(user_agent);
-        let mut general: Option<Group> = None;
+        let mut named: Option<Vec<Rule>> = None;
+        let mut general: Vec<Rule> = Vec::new();
         for group in groups {
             if group
                 .agents
                 .iter()
                 .any(|agent| agent.eq_ignore_ascii_case(&token))
             {
-                return Self { rules: group.rules };
-            }
-            if general.is_none() && group.agents.iter().any(|agent| agent == "*") {
-                general = Some(group);
+                named.get_or_insert_default().extend(group.rules);
+            } else if group.agents.iter().any(|agent| agent == "*") {
+                general.extend(group.rules);
             }
         }
         Self {
-            rules: general.map(|group| group.rules).unwrap_or_default(),
+            rules: named.unwrap_or(general),
         }
     }
 
@@ -290,6 +296,101 @@ mod tests {
         );
         assert!(rules.allows("https://example.test/public"));
         assert!(!rules.allows("https://example.test/private"));
+    }
+
+    /// A file is free to state the same agent twice, in whatever spelling, and both groups are
+    /// about this crawler. Reading only the first refuses `/first` and archives `/second`, in
+    /// plain sight of a line saying not to.
+    #[test]
+    fn every_group_naming_this_crawler_is_read_and_not_only_the_first() {
+        let rules = RobotRules::for_agent(
+            vec![
+                Group {
+                    agents: vec!["archeion".to_owned()],
+                    rules: vec![Rule::new("/first".to_owned(), false)],
+                },
+                Group {
+                    agents: vec!["*".to_owned()],
+                    rules: vec![Rule::new("/general".to_owned(), false)],
+                },
+                Group {
+                    agents: vec!["Archeion".to_owned()],
+                    rules: vec![Rule::new("/second".to_owned(), false)],
+                },
+            ],
+            "archeion/0.1.0 (+https://example.test)",
+        );
+        assert!(!rules.allows("https://example.test/first"));
+        assert!(!rules.allows("https://example.test/second"));
+        // Combined with each other, not with the general group, which still does not reach a
+        // file that has named this crawler.
+        assert!(rules.allows("https://example.test/general"));
+    }
+
+    /// Precedence is decided over the combined rules rather than inside whichever group a
+    /// pattern was written in, so an `Allow` in one group outranks a shorter `Disallow` in
+    /// another exactly as it would if the site had written both under one heading.
+    #[test]
+    fn a_permission_in_one_group_outranks_a_shorter_refusal_in_another() {
+        let rules = RobotRules::for_agent(
+            vec![
+                Group {
+                    agents: vec!["archeion".to_owned()],
+                    rules: vec![Rule::new("/p/".to_owned(), false)],
+                },
+                Group {
+                    agents: vec!["archeion".to_owned()],
+                    rules: vec![Rule::new("/p/keep/".to_owned(), true)],
+                },
+            ],
+            "archeion/0.1.0 (+https://example.test)",
+        );
+        assert!(!rules.allows("https://example.test/p/anything"));
+        assert!(rules.allows("https://example.test/p/keep/one"));
+    }
+
+    /// Naming this crawler and stating nothing under it is a file saying it refuses this
+    /// crawler nothing, which is not the same as a file that never mentioned it: the general
+    /// rules meant for everyone else stay out of it.
+    #[test]
+    fn a_group_naming_this_crawler_and_stating_no_rule_still_keeps_the_general_group_out() {
+        let rules = RobotRules::for_agent(
+            vec![
+                Group {
+                    agents: vec!["archeion".to_owned()],
+                    rules: Vec::new(),
+                },
+                Group {
+                    agents: vec!["*".to_owned()],
+                    rules: vec![Rule::new("/".to_owned(), false)],
+                },
+            ],
+            "archeion/0.1.0 (+https://example.test)",
+        );
+        assert!(rules.allows("https://example.test/anything"));
+    }
+
+    /// The same combination on the general side. No crawl reaches this, since the engine's
+    /// parser keeps one `*` group and drops the rest before this is ever called, but a caller
+    /// building groups itself would otherwise meet the defect above under another name.
+    #[test]
+    fn every_general_group_is_read_when_no_group_names_this_crawler() {
+        let rules = RobotRules::for_agent(
+            vec![
+                Group {
+                    agents: vec!["*".to_owned()],
+                    rules: vec![Rule::new("/first".to_owned(), false)],
+                },
+                Group {
+                    agents: vec!["*".to_owned()],
+                    rules: vec![Rule::new("/second".to_owned(), false)],
+                },
+            ],
+            "archeion/0.1.0 (+https://example.test)",
+        );
+        assert!(!rules.allows("https://example.test/first"));
+        assert!(!rules.allows("https://example.test/second"));
+        assert!(rules.allows("https://example.test/third"));
     }
 
     /// The general group is what a file that has never heard of this crawler leaves it, and

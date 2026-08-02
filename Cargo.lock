@@ -120,7 +120,7 @@ dependencies = [
  "htmd",
  "html-escape",
  "jiff",
- "lol_html",
+ "lol_html 3.0.1",
  "pulldown-cmark",
  "quick-xml",
  "serde",
@@ -1594,6 +1594,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "lol_html"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5adbb62638edf7e6bc88835cd3ea388bdd53382af42045da0e414ea78aa0c91a"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cssparser 0.36.0",
+ "encoding_rs",
+ "foldhash 0.2.0",
+ "hashbrown 0.17.1",
+ "memchr",
+ "mime",
+ "precomputed-hash",
+ "selectors 0.37.0",
+ "thiserror",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2669,7 +2688,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "log",
- "lol_html",
+ "lol_html 2.9.0",
  "memchr",
  "num_cpus",
  "percent-encoding",

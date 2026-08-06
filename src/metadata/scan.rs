@@ -90,140 +90,135 @@ fn scan_writes<'a>(
 
     {
         let mut rewriter = HtmlRewriter::new(
-            Settings {
-                element_content_handlers: vec![
-                    // First wins, as everywhere else here. A document with a second `<html>`
-                    // tag is malformed markup that template concatenation produces by
-                    // accident and a hostile page can produce on purpose, and assigning
-                    // unconditionally let the later one either replace the language or, when
-                    // it carried no `lang` at all, erase it.
-                    element!("html", |el| {
-                        let mut scanner = scanner.borrow_mut();
-                        if scanner.page.language.is_none() {
-                            scanner.page.language = el.get_attribute("lang").map(decode_entities);
-                        }
-                        Ok(())
-                    }),
-                    // Matching on `head > title` would have missed every page that leaves the
-                    // `<head>` tag out and lets the parser imply it, which is legal and
-                    // common, because a token stream has no implied elements to match. What
-                    // that would have excluded is handled by the next handler instead.
-                    element!("title", |_| {
-                        scanner.borrow_mut().see_title_start();
-                        Ok(())
-                    }),
-                    // The `<title>` of an inline graphic is that graphic's accessible name,
-                    // not the page's, and a logo in the header of a page whose own title
-                    // comes later would otherwise win on document order. An ancestor is the
-                    // only thing that separates the two: the namespace does not, because
-                    // this element is an HTML integration point and the parser reports it in
-                    // the HTML namespace exactly as it reports the page's own title.
-                    //
-                    // It runs after the handler above and undoes it, which is why the order
-                    // of this list is not incidental.
-                    element!("svg title", |_| {
-                        scanner.borrow_mut().reject_title();
-                        Ok(())
-                    }),
-                    text!("title", |chunk| {
-                        scanner.borrow_mut().see_title(chunk.as_str());
-                        Ok(())
-                    }),
-                    element!("meta", |el| {
-                        scanner.borrow_mut().see_meta(
-                            el.get_attribute("name")
-                                .or_else(|| el.get_attribute("property"))
-                                .map(decode_entities),
-                            el.get_attribute("content").map(decode_entities),
-                        );
-                        Ok(())
-                    }),
-                    element!("base[href]", |el| {
-                        let mut scanner = scanner.borrow_mut();
-                        // The first one wins, which is what a browser does with the second.
-                        if scanner.page.base_href.is_none() {
-                            scanner.page.base_href = el.get_attribute("href").map(decode_entities);
-                        }
-                        Ok(())
-                    }),
-                    element!("link[href]", |el| {
-                        scanner.borrow_mut().see_link_tag(
-                            el.get_attribute("rel").map(decode_entities),
-                            el.get_attribute("href").map(decode_entities),
-                        );
-                        Ok(())
-                    }),
-                    element!("a[href]", |el| {
-                        scanner.borrow_mut().see_anchor(
-                            el.get_attribute("href").map(decode_entities),
-                            el.get_attribute("rel").map(decode_entities),
-                        );
-                        Ok(())
-                    }),
-                    element!("script", |el| {
-                        let mut scanner = scanner.borrow_mut();
-                        if let Some(src) = el.get_attribute("src").map(decode_entities) {
-                            scanner.see_asset(src, AssetKind::Script);
-                        }
-                        // Compared here rather than in the selector because the attribute is
-                        // written in whatever case the page's generator felt like, and a CSS
-                        // attribute match is case sensitive.
-                        scanner.inside_json_ld = el
-                            .get_attribute("type")
-                            .map(decode_entities)
-                            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case(JSON_LD_TYPE));
-                        Ok(())
-                    }),
-                    text!("script", |chunk| {
-                        scanner
-                            .borrow_mut()
-                            .see_json_ld(chunk.as_str(), chunk.last_in_text_node());
-                        Ok(())
-                    }),
-                    element!("img", |el| {
-                        let mut scanner = scanner.borrow_mut();
-                        if let Some(src) = el.get_attribute("src").map(decode_entities) {
-                            scanner.see_asset(src, AssetKind::Image);
-                        }
-                        scanner.see_srcset(el.get_attribute("srcset"));
-                        Ok(())
-                    }),
-                    // A `<source>` names an image inside `<picture>` and a media file inside
-                    // `<video>` or `<audio>`, and a token stream cannot see which parent it
-                    // is under. The attribute is the tell: the picture form carries
-                    // `srcset`, the media form carries `src`.
-                    element!("source", |el| {
-                        let mut scanner = scanner.borrow_mut();
-                        if let Some(src) = el.get_attribute("src").map(decode_entities) {
-                            scanner.see_asset(src, AssetKind::Media);
-                        }
-                        scanner.see_srcset(el.get_attribute("srcset"));
-                        Ok(())
-                    }),
-                    element!("video", |el| {
-                        let mut scanner = scanner.borrow_mut();
-                        if let Some(src) = el.get_attribute("src").map(decode_entities) {
-                            scanner.see_asset(src, AssetKind::Media);
-                        }
-                        if let Some(poster) = el.get_attribute("poster").map(decode_entities) {
-                            scanner.see_asset(poster, AssetKind::Image);
-                        }
-                        Ok(())
-                    }),
-                    element!("audio[src]", |el| {
-                        if let Some(src) = el.get_attribute("src").map(decode_entities) {
-                            scanner.borrow_mut().see_asset(src, AssetKind::Media);
-                        }
-                        Ok(())
-                    }),
-                ],
-                memory_settings: MemorySettings {
-                    max_allowed_memory_usage: MAX_PARSER_MEMORY_BYTES,
-                    ..MemorySettings::new()
-                },
-                strict: false,
-                ..Settings::new()
-            },
+            Settings::new()
+                .with_memory_settings(
+                    MemorySettings::new().with_max_allowed_memory_usage(MAX_PARSER_MEMORY_BYTES),
+                )
+                .with_strict(false)
+                // First wins, as everywhere else here. A document with a second `<html>`
+                // tag is malformed markup that template concatenation produces by
+                // accident and a hostile page can produce on purpose, and assigning
+                // unconditionally let the later one either replace the language or, when
+                // it carried no `lang` at all, erase it.
+                .append_element_content_handler(element!("html", |el| {
+                    let mut scanner = scanner.borrow_mut();
+                    if scanner.page.language.is_none() {
+                        scanner.page.language = el.get_attribute("lang").map(decode_entities);
+                    }
+                    Ok(())
+                }))
+                // Matching on `head > title` would have missed every page that leaves the
+                // `<head>` tag out and lets the parser imply it, which is legal and
+                // common, because a token stream has no implied elements to match. What
+                // that would have excluded is handled by the next handler instead.
+                .append_element_content_handler(element!("title", |_| {
+                    scanner.borrow_mut().see_title_start();
+                    Ok(())
+                }))
+                // The `<title>` of an inline graphic is that graphic's accessible name,
+                // not the page's, and a logo in the header of a page whose own title
+                // comes later would otherwise win on document order. An ancestor is the
+                // only thing that separates the two: the namespace does not, because
+                // this element is an HTML integration point and the parser reports it in
+                // the HTML namespace exactly as it reports the page's own title.
+                //
+                // It runs after the handler above and undoes it, which is why the order
+                // these are appended in is not incidental.
+                .append_element_content_handler(element!("svg title", |_| {
+                    scanner.borrow_mut().reject_title();
+                    Ok(())
+                }))
+                .append_element_content_handler(text!("title", |chunk| {
+                    scanner.borrow_mut().see_title(chunk.as_str());
+                    Ok(())
+                }))
+                .append_element_content_handler(element!("meta", |el| {
+                    scanner.borrow_mut().see_meta(
+                        el.get_attribute("name")
+                            .or_else(|| el.get_attribute("property"))
+                            .map(decode_entities),
+                        el.get_attribute("content").map(decode_entities),
+                    );
+                    Ok(())
+                }))
+                .append_element_content_handler(element!("base[href]", |el| {
+                    let mut scanner = scanner.borrow_mut();
+                    // The first one wins, which is what a browser does with the second.
+                    if scanner.page.base_href.is_none() {
+                        scanner.page.base_href = el.get_attribute("href").map(decode_entities);
+                    }
+                    Ok(())
+                }))
+                .append_element_content_handler(element!("link[href]", |el| {
+                    scanner.borrow_mut().see_link_tag(
+                        el.get_attribute("rel").map(decode_entities),
+                        el.get_attribute("href").map(decode_entities),
+                    );
+                    Ok(())
+                }))
+                .append_element_content_handler(element!("a[href]", |el| {
+                    scanner.borrow_mut().see_anchor(
+                        el.get_attribute("href").map(decode_entities),
+                        el.get_attribute("rel").map(decode_entities),
+                    );
+                    Ok(())
+                }))
+                .append_element_content_handler(element!("script", |el| {
+                    let mut scanner = scanner.borrow_mut();
+                    if let Some(src) = el.get_attribute("src").map(decode_entities) {
+                        scanner.see_asset(src, AssetKind::Script);
+                    }
+                    // Compared here rather than in the selector because the attribute is
+                    // written in whatever case the page's generator felt like, and a CSS
+                    // attribute match is case sensitive.
+                    scanner.inside_json_ld = el
+                        .get_attribute("type")
+                        .map(decode_entities)
+                        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case(JSON_LD_TYPE));
+                    Ok(())
+                }))
+                .append_element_content_handler(text!("script", |chunk| {
+                    scanner
+                        .borrow_mut()
+                        .see_json_ld(chunk.as_str(), chunk.last_in_text_node());
+                    Ok(())
+                }))
+                .append_element_content_handler(element!("img", |el| {
+                    let mut scanner = scanner.borrow_mut();
+                    if let Some(src) = el.get_attribute("src").map(decode_entities) {
+                        scanner.see_asset(src, AssetKind::Image);
+                    }
+                    scanner.see_srcset(el.get_attribute("srcset"));
+                    Ok(())
+                }))
+                // A `<source>` names an image inside `<picture>` and a media file inside
+                // `<video>` or `<audio>`, and a token stream cannot see which parent it
+                // is under. The attribute is the tell: the picture form carries
+                // `srcset`, the media form carries `src`.
+                .append_element_content_handler(element!("source", |el| {
+                    let mut scanner = scanner.borrow_mut();
+                    if let Some(src) = el.get_attribute("src").map(decode_entities) {
+                        scanner.see_asset(src, AssetKind::Media);
+                    }
+                    scanner.see_srcset(el.get_attribute("srcset"));
+                    Ok(())
+                }))
+                .append_element_content_handler(element!("video", |el| {
+                    let mut scanner = scanner.borrow_mut();
+                    if let Some(src) = el.get_attribute("src").map(decode_entities) {
+                        scanner.see_asset(src, AssetKind::Media);
+                    }
+                    if let Some(poster) = el.get_attribute("poster").map(decode_entities) {
+                        scanner.see_asset(poster, AssetKind::Image);
+                    }
+                    Ok(())
+                }))
+                .append_element_content_handler(element!("audio[src]", |el| {
+                    if let Some(src) = el.get_attribute("src").map(decode_entities) {
+                        scanner.borrow_mut().see_asset(src, AssetKind::Media);
+                    }
+                    Ok(())
+                })),
             // The rewritten output is the input, and this is a reader: dropping it is what
             // keeps the cost of a large page the size of its tokens rather than of itself.
             |_: &[u8]| {},

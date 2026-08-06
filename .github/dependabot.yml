@@ -7,6 +7,15 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # A major is the only bump worth a pull request here, because the tag in the workflow
+    # already resolves to every release below the next one. Proposing an exact minor pin
+    # asks to replace a reference that keeps working with one that stops, and it arrives
+    # every week for as long as the action is maintained.
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-patch
 
   - package-ecosystem: cargo
     directory: /

@@ -30,7 +30,7 @@ jiff = { version = "0.2.35", default-features = false, features = ["std", "serde
 # extraction looks at is a tag and an attribute, and a page arriving from the open web is
 # hostile input whose parse must stay bounded: this one never holds more of the document
 # than the token it is on, while a tree would cost the whole page in memory.
-lol_html = "3.0"
+lol_html = "3.0.1"
 # A CommonMark reader, used for two things. Export locates already rendered link destinations
 # by byte offset and rewrites only those spans, leaving the original Markdown alone. Readability
 # reads a document a site served as Markdown, which is why the `html` feature is on: the events

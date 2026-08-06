@@ -245,11 +245,11 @@ mod tests {
         assert_eq!(value_of(page.title), None);
     }
 
-    /// The same rule, on a graphic that describes itself before it names itself. `<desc>`
-    /// and `<title>` are both HTML integration points, and the parser used to stop matching
-    /// selectors at the second of two in a row, so this `<title>` reached no handler at all
-    /// and the right answer came out of a parser bug rather than out of the rule above. It
-    /// is the rule that answers now, and this is the case that says so.
+    /// The same rule, on a graphic that describes itself before it names itself. What this
+    /// pins is that deleting the `svg title` handler turns this into the logo's name, which
+    /// until lol_html 3.0 it would not have: the parser stopped matching selectors at the
+    /// second of two consecutive integration points, so this `<title>` reached no handler
+    /// and the answer came out of that rather than out of the rule.
     #[test]
     fn a_graphic_that_describes_itself_before_naming_itself_still_has_no_page_title() {
         let page = extract_html(

@@ -128,6 +128,14 @@ fn scan_writes<'a>(
                     scanner.borrow_mut().reject_title();
                     Ok(())
                 }))
+                // A formula names itself the same way and needs saying twice, because a
+                // selector matches a tag name and never a namespace: the one above cannot
+                // reach a `<title>` with no `<svg>` over it, and the page's own handler
+                // reaches this one exactly as it reaches the page's title.
+                .append_element_content_handler(element!("math title", |_| {
+                    scanner.borrow_mut().reject_title();
+                    Ok(())
+                }))
                 .append_element_content_handler(text!("title", |chunk| {
                     scanner.borrow_mut().see_title(chunk.as_str());
                     Ok(())

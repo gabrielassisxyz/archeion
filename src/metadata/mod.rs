@@ -245,6 +245,22 @@ mod tests {
         assert_eq!(value_of(page.title), None);
     }
 
+    /// The same rule, on a graphic that describes itself before it names itself. `<desc>`
+    /// and `<title>` are both HTML integration points, and the parser used to stop matching
+    /// selectors at the second of two in a row, so this `<title>` reached no handler at all
+    /// and the right answer came out of a parser bug rather than out of the rule above. It
+    /// is the rule that answers now, and this is the case that says so.
+    #[test]
+    fn a_graphic_that_describes_itself_before_naming_itself_still_has_no_page_title() {
+        let page = extract_html(
+            r#"<head><meta name="description" content="An article about bread."></head>
+               <body><header><svg><desc>A wheat sheaf</desc>
+               <title>Recipes Weekly logo</title></svg></header>
+               <h1>How to bake bread</h1></body>"#,
+        );
+        assert_eq!(value_of(page.title), None);
+    }
+
     #[test]
     fn the_author_prefers_the_form_that_names_a_person() {
         let page = extract_html(

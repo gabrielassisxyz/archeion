@@ -1119,9 +1119,9 @@ dependencies = [
 
 [[package]]
 name = "htmd"
-version = "0.5.4"
+version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7eee9b00ee2e599b4f86507157e3db786e7a3319fc225f0e9584151dbea2291d"
+checksum = "a5a1c7113c831fec68cbd79cd8bf281a84e5b6943f51473dc266b0b88a6a017e"
 dependencies = [
  "html5ever 0.38.0",
  "markup5ever_rcdom",
@@ -2648,9 +2648,9 @@ dependencies = [
 
 [[package]]
 name = "spider"
-version = "2.52.12"
+version = "2.52.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c79c3f26013e3dbe4d05c2397d23aacae2f334c10894c2973f3bf7442fdedc2"
+checksum = "18bd778c8efd2f7d43e407674d58036a17a66d53c4defbfa6d706c50c0393163"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -2694,9 +2694,9 @@ dependencies = [
 
 [[package]]
 name = "spider_agent_types"
-version = "2.52.12"
+version = "2.53.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c6f221fd48d09bf7a586ef467c547daad64cbbc002fc82d3b5f8692c05279c4"
+checksum = "bad3a0e77f15c70dd3125bf4690c7caea43ae325af93d7ac0442ab02ba3ff42c"
 dependencies = [
  "aho-corasick",
  "llm_models_spider",

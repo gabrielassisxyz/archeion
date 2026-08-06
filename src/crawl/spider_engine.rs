@@ -748,22 +748,20 @@ const MAX_BASE_HREF_SCAN_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 fn page_declares_an_absolute_base_href(page: &Page) -> bool {
     let mut found = false;
     let mut rewriter = HtmlRewriter::new(
-        Settings {
-            element_content_handlers: vec![element!("base[href]", |el| {
+        Settings::new()
+            .with_memory_settings(
+                MemorySettings::new()
+                    .with_max_allowed_memory_usage(MAX_BASE_HREF_SCAN_MEMORY_BYTES),
+            )
+            .with_strict(false)
+            .append_element_content_handler(element!("base[href]", |el| {
                 if !found {
                     found = el
                         .get_attribute("href")
                         .is_some_and(|href| Url::parse(&href).is_ok());
                 }
                 Ok(())
-            })],
-            memory_settings: MemorySettings {
-                max_allowed_memory_usage: MAX_BASE_HREF_SCAN_MEMORY_BYTES,
-                ..MemorySettings::new()
-            },
-            strict: false,
-            ..Settings::new()
-        },
+            })),
         // The rewritten output is the input, and this only ever reads: dropping it keeps
         // the cost of a large page the size of its tokens rather than of itself.
         |_: &[u8]| {},

@@ -245,6 +245,40 @@ mod tests {
         assert_eq!(value_of(page.title), None);
     }
 
+    /// A formula names itself the same way a graphic does, and the ancestor that says so is
+    /// a different one. `<mtext>` is here because it is an integration point too, so a
+    /// `<title>` under it is reported in the HTML namespace exactly as a bare one is.
+    #[test]
+    fn a_page_with_only_a_formula_title_has_no_title() {
+        for markup in [
+            "<math><title>Recipes Weekly logo</title></math>",
+            "<math><mtext><title>Recipes Weekly logo</title></mtext></math>",
+        ] {
+            let page = extract_html(&format!(
+                r#"<head><meta name="description" content="An article about bread."></head>
+                   <body><header>{markup}</header>
+                   <h1>How to bake bread</h1></body>"#
+            ));
+            assert_eq!(value_of(page.title), None, "for {markup}");
+        }
+    }
+
+    /// The same rule, on a graphic that describes itself before it names itself. What this
+    /// pins is that deleting the `svg title` handler turns this into the logo's name, which
+    /// until lol_html 3.0 it would not have: the parser stopped matching selectors at the
+    /// second of two consecutive integration points, so this `<title>` reached no handler
+    /// and the answer came out of that rather than out of the rule.
+    #[test]
+    fn a_graphic_that_describes_itself_before_naming_itself_still_has_no_page_title() {
+        let page = extract_html(
+            r#"<head><meta name="description" content="An article about bread."></head>
+               <body><header><svg><desc>A wheat sheaf</desc>
+               <title>Recipes Weekly logo</title></svg></header>
+               <h1>How to bake bread</h1></body>"#,
+        );
+        assert_eq!(value_of(page.title), None);
+    }
+
     #[test]
     fn the_author_prefers_the_form_that_names_a_person() {
         let page = extract_html(

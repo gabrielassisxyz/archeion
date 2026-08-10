@@ -243,18 +243,23 @@ mod tests {
     }
 
     /// The protocol gives `*` and `$` meaning inside a pattern and gives nothing else any, so a
-    /// character a regular expression would read as syntax is an ordinary character here. This
-    /// is the half of the rejected approach that would have been silently wrong rather than
-    /// visibly so: the engine's `regex` feature compiles the pattern as a regular expression,
-    /// where `.` matches anything and `+` repeats what precedes it, and a site's rules would
-    /// then refuse a set of paths nobody wrote down. Asserted against `pattern_matches` rather
-    /// than through `allows`, because what is being pinned is the reading of the pattern.
+    /// character a regular expression would read as syntax is an ordinary character here.
+    ///
+    /// What this pins is this matcher, not the dependency. Nothing here reaches the engine, and
+    /// adding its `regex` feature leaves every test in this file green. A wholesale swap to
+    /// regular expressions is caught two cases up, by the `$` that this code does branch on;
+    /// what is left for this one is a partial translation that gives `*` and `$` their meaning
+    /// and forgets to escape the rest. The literal after a wildcard is where that would show,
+    /// since that one is matched by `contains` rather than by stripping a prefix.
+    ///
+    /// The last assertion is the one that is not about metacharacters at all: without it a
+    /// matcher that refused everything would satisfy the three above.
     #[test]
     fn a_regular_expression_metacharacter_is_an_ordinary_character() {
-        assert!(pattern_matches("/a.c", "/a.c"));
         assert!(!pattern_matches("/a.c", "/abc"));
-        assert!(pattern_matches("/p+", "/p+q"));
+        assert!(!pattern_matches("/p/*/a.c", "/p/x/abc"));
         assert!(!pattern_matches("/p+", "/ppq"));
+        assert!(pattern_matches("/p/*/a.c", "/p/x/a.c"));
     }
 
     #[test]

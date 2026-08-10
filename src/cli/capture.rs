@@ -10,9 +10,9 @@ use std::error::Error;
 use std::fmt::{self, Display, Write as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use archeion::capture::{CaptureError, CaptureRun, capture_seed, capture_sitemap};
+use archeion::capture::{CaptureError, CaptureRun, RunSoFar, capture_seed, capture_sitemap};
 use archeion::crawl::{
     CrawlEngine, CrawlStop, DEFAULT_MAX_RESPONSE_BYTES, SMALLEST_MAX_RESPONSE_BYTES, Seed,
     SessionCookie, SpiderEngine,
@@ -265,6 +265,11 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
     let (rules, unused_rules) = SiteRules::read(&archive.extraction_rules_path());
     warn(unused_rules.iter().map(ToString::to_string));
 
+    // Stamped before the first phase rather than inside either one, because `--deadline` bounds
+    // the run and the run is what starts here. A phase reading its own clock measures how long
+    // that phase took, which is the same number only when there is one phase.
+    let run_started = Instant::now();
+
     // A sitemap exists for a site whose pages do not link one another, so crawling such a site
     // anyway spends the run's budget on the listing, navigation and comment pages the sitemap
     // was reached for in order to skip, and files the pages both phases find twice. Asking for
@@ -285,28 +290,33 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
     // A disk that already refused one write will refuse the next, so the sitemap phase is
     // skipped once the ordinary crawl already failed for that reason: there is nothing left
     // to spend more requests archiving into.
-    let (sitemap_report, sitemap_warning) = if failure.is_none() {
-        sitemap_phase(
-            &args,
-            &engine,
-            &archive,
-            &seed,
-            &rules,
-            &mut run,
-            &mut failure,
-        )
+    // The `from_sitemap` half is the phase's own precondition, checked here as well so that a
+    // run without one does not pay for the snapshot below: on a fifty thousand page crawl that
+    // is a set of that many strings copied and dropped unread.
+    let sitemap = if failure.is_none() && args.from_sitemap.is_some() {
+        // Snapshotted before the phase starts, because that is what the phase has to answer
+        // to: the pages the crawl already filed come out of the same ceiling, the addresses
+        // it filed are the ones not worth buying twice, and the clock is the run's.
+        let archived = run.archived_urls.clone();
+        let so_far = RunSoFar {
+            started: run_started,
+            pages_written: run.captures_written,
+            archived: &archived,
+        };
+        sitemap_phase(&args, &engine, &archive, &seed, &rules, &mut run, so_far)
     } else {
-        (None, None)
+        SitemapOutcome::default()
     };
+    failure = failure.or(sitemap.failure);
 
-    let report = report_of(&args, &seed, &run, created, sitemap_report);
+    let report = report_of(&args, &seed, &run, created, sitemap.report);
     let output = if json {
         format!("{}\n", serde_json::to_string(&report)?)
     } else {
         human_report(&report, run.stopped)
     };
     write_stdout(&output)?;
-    warn(sitemap_warning.into_iter().chain(losses(&run)));
+    warn(sitemap.warning.into_iter().chain(losses(&run)));
 
     if let Some(source) = failure {
         return Err(source.into());
@@ -395,6 +405,10 @@ fn traverses_from_the_seed(args: &CaptureArgs) -> bool {
 /// was not read, which leaves the operator a run to repeat rather than a silent half job. A
 /// write failure inside this phase is the one thing that still matters to the caller, and it
 /// is folded into the same run rather than reported on its own.
+///
+/// The captures land in `run`, which is the run both phases share. Everything else the phase
+/// produced comes back in `SitemapOutcome`, the write failure included: a phase that took the
+/// failure as an out parameter needed an eighth argument to also be told when the run began.
 fn sitemap_phase(
     args: &CaptureArgs,
     engine: &dyn CrawlEngine,
@@ -402,11 +416,17 @@ fn sitemap_phase(
     seed: &Seed,
     rules: &SiteRules,
     run: &mut CaptureRun,
-    failure: &mut Option<StorageError>,
-) -> (Option<SitemapReport>, Option<String>) {
+    so_far: RunSoFar<'_>,
+) -> SitemapOutcome {
     let Some(requested) = &args.from_sitemap else {
-        return (None, None);
+        return SitemapOutcome::default();
     };
+    // A run that has already spent its budget has nothing to learn from a listing, and reading
+    // one is a request the host answers for nothing. Reachable only since the two phases share
+    // the budget: a phase that started its own count always had pages to spend.
+    if so_far.nothing_left_to_spend(seed) {
+        return SitemapOutcome::default();
+    }
     let (listing, warning) = match read_sitemap(engine, seed, requested.as_deref()) {
         Ok(listing) => (Some(listing), None),
         Err(error) => (None, Some(error.to_string())),
@@ -422,37 +442,50 @@ fn sitemap_phase(
         urls.extend(listing.urls.iter().cloned());
     }
     if urls.is_empty() {
-        return (None, warning);
+        return SitemapOutcome {
+            warning,
+            ..SitemapOutcome::default()
+        };
     }
     // Given explicitly, the same depth that already bounds the ordinary crawl now also
     // bounds how far a sitemap URL is traversed from; left alone, a sitemap URL is fetched
     // on its own, since a depth bound has no meaning for a page nobody linked to.
     let follow_links = args.max_depth.is_some();
     let report = listing.as_ref().map(SitemapReport::from);
-    let already_archived = run.archived_urls.clone();
-    match capture_sitemap(
-        engine,
-        archive,
-        seed,
-        rules,
-        &urls,
-        follow_links,
-        &already_archived,
-    ) {
+    match capture_sitemap(engine, archive, seed, rules, &urls, follow_links, so_far) {
         Ok(sitemap_run) => {
             run.merge(sitemap_run);
-            (report, warning)
+            SitemapOutcome {
+                report,
+                warning,
+                failure: None,
+            }
         }
         Err(CaptureError::Storage { source, run: extra }) => {
             run.merge(*extra);
-            *failure = Some(source);
-            (report, warning)
+            SitemapOutcome {
+                report,
+                warning,
+                failure: Some(source),
+            }
         }
-        Err(CaptureError::Crawl(error)) => (
+        Err(CaptureError::Crawl(error)) => SitemapOutcome {
             report,
-            Some(format!("the sitemap's URLs could not be crawled: {error}")),
-        ),
+            warning: Some(format!("the sitemap's URLs could not be crawled: {error}")),
+            failure: None,
+        },
     }
+}
+
+/// What the sitemap phase leaves behind once its captures are folded into the run.
+#[derive(Debug, Default)]
+struct SitemapOutcome {
+    report: Option<SitemapReport>,
+    /// Something the operator should read but that does not end the run: a sitemap that could
+    /// not be found, parsed, or crawled.
+    warning: Option<String>,
+    /// A refused write, which is the one thing here the caller acts on rather than prints.
+    failure: Option<StorageError>,
 }
 
 /// What `--from-sitemap` found, kept small on purpose: a sitemap listing 247 URLs against a

@@ -219,6 +219,55 @@ pub fn capture_seed(
     Ok(run)
 }
 
+/// What earlier phases of the same run already did, which is what a later phase has to know to
+/// keep the run's bounds the run's rather than its own.
+///
+/// `--max-pages` and `--deadline` bound a run, not one phase of it, and a run has two phases
+/// whenever `--max-depth` is given beside `--from-sitemap`. Each phase measuring from its own
+/// zero is how a run given fifty pages archived a hundred and a run given ten minutes took
+/// twenty, while reporting the bound it was asked for.
+///
+/// The addresses travel here beside the counts because they answer the same question about the
+/// same earlier phases, and because a phase that had to be handed them separately is a phase
+/// somebody can hand one of the two and forget the other.
+#[derive(Debug, Clone, Copy)]
+pub struct RunSoFar<'a> {
+    /// When the run began, which is not when the phase reading this began.
+    pub started: Instant,
+    /// Pages the earlier phases of this run filed.
+    pub pages_written: usize,
+    /// The canonical addresses already filed, so a listed URL the crawl reached is not bought
+    /// a second time.
+    pub archived: &'a HashSet<String>,
+}
+
+impl<'a> RunSoFar<'a> {
+    /// A phase that is the run's first, so the run begins with it and nothing is spent yet.
+    pub fn nothing_yet(archived: &'a HashSet<String>) -> Self {
+        Self {
+            started: Instant::now(),
+            pages_written: 0,
+            archived,
+        }
+    }
+
+    /// Everything this run has filed, the phase now running included.
+    fn pages_written_including(&self, run: &CaptureRun) -> usize {
+        self.pages_written + run.captures_written
+    }
+
+    /// Whether the run can still archive anything, asked before a phase starts.
+    ///
+    /// Once the budget is shared, a phase can begin with none of it left, and the work a phase
+    /// does before its first budget check is a request of its own: reading a sitemap costs a
+    /// `robots.txt` and a listing from a host that cannot answer into this run any more. Asked
+    /// through the same function the phase itself stops on, because two opinions about one
+    /// bound is how a run came to report the wrong one.
+    pub fn nothing_left_to_spend(&self, seed: &Seed) -> bool {
+        bound_reached(seed, self.pages_written, self.started).is_some()
+    }
+}
+
 /// Fetches every URL a sitemap listed, additionally to whatever the ordinary crawl from the
 /// seed already found.
 ///
@@ -236,8 +285,9 @@ pub fn capture_seed(
 /// stylesheet referenced by both an ordinarily reached page and a sitemap-listed one is asked
 /// for once per phase rather than once for the whole run. That costs the host one extra
 /// request for a handful of shared files, not a correctness problem, and sharing the cache
-/// across two independently started phases was not worth the extra plumbing for what the two
-/// sites this was measured against would ever trigger.
+/// across two separately built passes was not worth the extra plumbing for what the two sites
+/// this was measured against would ever trigger. The budget is the opposite case and is shared:
+/// see `RunSoFar`.
 pub fn capture_sitemap(
     engine: &dyn CrawlEngine,
     archive: &Archive,
@@ -245,21 +295,29 @@ pub fn capture_sitemap(
     rules: &SiteRules,
     urls: &[String],
     follow_links: bool,
-    already_archived: &HashSet<String>,
+    so_far: RunSoFar<'_>,
 ) -> Result<CaptureRun, CaptureError> {
     let mut run = CaptureRun::default();
     let mut write_failure: Option<StorageError> = None;
-    let started = Instant::now();
+    // The run's own instant rather than this phase's, because a deadline bounds the run. Taken
+    // here it would restart the clock, and the subresource pass below reads the same field for
+    // the same reason.
+    //
+    // Two of the three places it lands are pinned by tests. The third is `AssetCapture`, and no
+    // test sees it: the loop guard below reads the same instant, so any clock that would refuse
+    // a subresource has already refused the page holding it, and the two only come apart while
+    // a deadline expires inside one page's own subresource pass. See the hurdle table.
+    let started = so_far.started;
     let mut assets = AssetCapture::new(engine, archive, seed, started);
 
     let mut asked_the_host_for_something = false;
 
     for url in urls {
-        if let Some(bound) = bound_reached(seed, &run, started) {
+        if let Some(bound) = bound_reached(seed, so_far.pages_written_including(&run), started) {
             run.stopped = bound;
             break;
         }
-        if already_filed(url, already_archived, &run) {
+        if already_filed(url, so_far.archived, &run) {
             continue;
         }
         // The wait belongs here because this is the only phase that asks a host for page
@@ -290,7 +348,8 @@ pub fn capture_sitemap(
         // the moment it says so is the moment before asking rather than the top of the loop.
         if asked_the_host_for_something {
             pace(seed.delay);
-            if let Some(bound) = bound_reached(seed, &run, started) {
+            if let Some(bound) = bound_reached(seed, so_far.pages_written_including(&run), started)
+            {
                 run.stopped = bound;
                 break;
             }
@@ -299,7 +358,7 @@ pub fn capture_sitemap(
         if follow_links {
             let mut sub_seed = seed.clone();
             sub_seed.url = url.clone();
-            sub_seed.max_pages = remaining_pages(seed, &run);
+            sub_seed.max_pages = remaining_pages(seed, so_far.pages_written_including(&run));
             sub_seed.deadline = remaining_deadline(seed, started);
             // A seed the engine will not dial costs this one URL, not the rest of the list:
             // the same host answered for every other entry, so one address the engine
@@ -391,17 +450,19 @@ fn pace(delay: Duration) {
     }
 }
 
-/// Which of this phase's bounds is spent, if either: the page count already written against
-/// the seed's own ceiling, or the seed's wall clock against how long this phase has run. Read
-/// plainly rather than with the margin the engine gets, because what is left over here is a
-/// prefix of a URL list rather than pages already in flight that a late guard has to hand over.
+/// Which of the run's bounds is spent, if either: everything the run has written against the
+/// seed's own ceiling, or the seed's wall clock against how long the run has gone on. Both are
+/// the run's and not the phase's, which is why the count arrives as a total and the instant
+/// arrives from the caller. Read plainly rather than with the margin the engine gets, because
+/// what is left over here is a prefix of a URL list rather than pages already in flight that a
+/// late guard has to hand over.
 ///
 /// It answers which one rather than that one of them was, because the caller writes the answer
 /// into the run's stop reason and the two lead somewhere different. A single boolean here had
 /// both bounds reporting the deadline, so a run given `--deadline none` printed that its
 /// deadline ran out.
-fn bound_reached(seed: &Seed, run: &CaptureRun, started: Instant) -> Option<CrawlStop> {
-    if run.captures_written >= seed.max_pages as usize {
+fn bound_reached(seed: &Seed, pages_written: usize, started: Instant) -> Option<CrawlStop> {
+    if pages_written >= seed.max_pages as usize {
         return Some(CrawlStop::PageCeilingReached);
     }
     seed.deadline
@@ -412,8 +473,8 @@ fn bound_reached(seed: &Seed, run: &CaptureRun, started: Instant) -> Option<Craw
 /// What is left of the run's page count, for a sub-crawl started from a sitemap URL. Floored
 /// at one rather than let a fully spent budget reach the engine as a zero, which it would read
 /// as no limit at all instead of none left.
-fn remaining_pages(seed: &Seed, run: &CaptureRun) -> u32 {
-    let written = u32::try_from(run.captures_written).unwrap_or(u32::MAX);
+fn remaining_pages(seed: &Seed, pages_written: usize) -> u32 {
+    let written = u32::try_from(pages_written).unwrap_or(u32::MAX);
     seed.max_pages.saturating_sub(written).max(1)
 }
 
@@ -739,6 +800,11 @@ mod tests {
         /// Every URL fetched on its own, in order. A file shared by two pages should cost one
         /// request, and a count is the only way a test can say so.
         fetched: RefCell<Vec<String>>,
+        /// Every seed this engine was asked to crawl. A sub-crawl started from a sitemap URL
+        /// carries what is left of the run's budget, and the numbers on that seed are the only
+        /// place a test can see the sharing happen: nothing the engine does with them is
+        /// visible to a fake that has no clock and no page limit of its own.
+        crawled: RefCell<Vec<Seed>>,
     }
 
     impl ScriptedCrawlEngine {
@@ -749,6 +815,7 @@ mod tests {
                 outcome: CrawlOutcome::default(),
                 answers: RefCell::new(Vec::new()),
                 fetched: RefCell::new(Vec::new()),
+                crawled: RefCell::new(Vec::new()),
             }
         }
 
@@ -771,6 +838,12 @@ mod tests {
         fn urls_fetched(&self) -> Vec<String> {
             self.fetched.borrow().clone()
         }
+
+        /// The seeds this engine was handed, which is where a sub-crawl's share of the run's
+        /// budget is readable.
+        fn seeds_crawled(&self) -> Vec<Seed> {
+            self.crawled.borrow().clone()
+        }
     }
 
     impl CrawlEngine for ScriptedCrawlEngine {
@@ -782,9 +855,10 @@ mod tests {
 
         fn crawl(
             &self,
-            _seed: &Seed,
+            seed: &Seed,
             on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
         ) -> Result<CrawlOutcome, CrawlError> {
+            self.crawled.borrow_mut().push(seed.clone());
             for page in &self.pages {
                 let answer = on_page(page.clone());
                 self.answers.borrow_mut().push(answer);
@@ -2090,7 +2164,7 @@ mod tests {
             &SiteRules::default(),
             &urls,
             false,
-            &HashSet::new(),
+            RunSoFar::nothing_yet(&HashSet::new()),
         )
         .expect("a fake engine and a fresh archive do not fail a write");
 
@@ -2137,7 +2211,7 @@ mod tests {
             &SiteRules::default(),
             &urls,
             false,
-            &already,
+            RunSoFar::nothing_yet(&already),
         )
         .expect("a fake engine and a fresh archive do not fail a write");
 
@@ -2209,7 +2283,7 @@ mod tests {
             &SiteRules::default(),
             &urls,
             false,
-            &HashSet::new(),
+            RunSoFar::nothing_yet(&HashSet::new()),
         )
         .expect("a fake engine and a fresh archive do not fail a write");
 
@@ -2248,7 +2322,7 @@ mod tests {
             &SiteRules::default(),
             &urls,
             false,
-            &HashSet::new(),
+            RunSoFar::nothing_yet(&HashSet::new()),
         )
         .expect("a fake engine and a fresh archive do not fail a write");
 
@@ -2281,7 +2355,7 @@ mod tests {
             &SiteRules::default(),
             &urls,
             false,
-            &HashSet::new(),
+            RunSoFar::nothing_yet(&HashSet::new()),
         )
         .expect("a fake engine and a fresh archive do not fail a write");
 
@@ -2291,6 +2365,170 @@ mod tests {
             "a budget already spent asks the host for nothing"
         );
         assert_eq!(run.stopped, CrawlStop::DeadlineReached);
+    }
+
+    /// A ceiling bounds the run, and a run is both phases when `--max-depth` is given beside
+    /// `--from-sitemap`. The sitemap phase counted only what it had filed itself, so a run told
+    /// to archive fifty pages archived fifty in the crawl and fifty more from the listing, and
+    /// reported the ceiling it had been asked for while doubling it.
+    #[test]
+    fn the_sitemap_phase_spends_only_the_pages_the_crawl_left() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut seed = Seed::new("https://example.com/");
+        seed.max_pages = 3;
+        seed.deadline = None;
+        let urls: Vec<String> = (0..4)
+            .map(|i| format!("https://example.com/p/{i}"))
+            .collect();
+        let engine = ScriptedCrawlEngine::new(Vec::new()).serving(
+            urls.iter()
+                .map(|url| page(url, 200, "<html><body><p>prose</p></body></html>"))
+                .collect(),
+        );
+
+        let run = capture_sitemap(
+            &engine,
+            &archive,
+            &seed,
+            &SiteRules::default(),
+            &urls,
+            false,
+            RunSoFar {
+                started: Instant::now(),
+                pages_written: 2,
+                archived: &HashSet::new(),
+            },
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(
+            run.captures_written, 1,
+            "two of the three pages were spent before this phase began"
+        );
+        assert_eq!(engine.urls_fetched().len(), 1);
+        assert_eq!(run.stopped, CrawlStop::PageCeilingReached);
+    }
+
+    /// The clock half of the same rule. A phase reading `Instant::now()` for itself starts the
+    /// deadline over, so a run given ten minutes spent ten crawling and then ten more on the
+    /// listing. What makes this the run's clock and not the phase's is that the instant arrives
+    /// from the caller.
+    #[test]
+    fn the_sitemap_phase_measures_the_deadline_from_when_the_run_began() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut seed = Seed::new("https://example.com/");
+        seed.deadline = Some(Duration::from_millis(50));
+        let urls: Vec<String> = (0..4)
+            .map(|i| format!("https://example.com/p/{i}"))
+            .collect();
+        let engine = ScriptedCrawlEngine::new(Vec::new()).serving(
+            urls.iter()
+                .map(|url| page(url, 200, "<html><body><p>prose</p></body></html>"))
+                .collect(),
+        );
+
+        // A run whose earlier phase already outlasted the deadline. Subtracted rather than
+        // slept, so the test costs nothing and cannot flake on a busy machine.
+        let began = Instant::now() - Duration::from_millis(200);
+        let run = capture_sitemap(
+            &engine,
+            &archive,
+            &seed,
+            &SiteRules::default(),
+            &urls,
+            false,
+            RunSoFar {
+                started: began,
+                pages_written: 0,
+                archived: &HashSet::new(),
+            },
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(
+            engine.urls_fetched().len(),
+            0,
+            "the run's deadline had already passed before this phase started"
+        );
+        assert_eq!(run.stopped, CrawlStop::DeadlineReached);
+    }
+
+    /// The two tests above stop at the loop that decides whether to ask for the next URL. This
+    /// is the other place the shared budget lands: `--max-depth` makes each listed URL a seed of
+    /// its own, and what bounds that sub-crawl is the seed handed to the engine. Reading the
+    /// phase's own count there gave every sub-crawl the whole ceiling, so a listed URL that
+    /// linked three more archived four pages of a run that had one left.
+    #[test]
+    fn a_sub_crawl_is_handed_only_the_pages_the_run_has_left() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut seed = Seed::new("https://example.com/");
+        seed.max_pages = 3;
+        seed.deadline = None;
+        let engine = ScriptedCrawlEngine::new(Vec::new());
+
+        capture_sitemap(
+            &engine,
+            &archive,
+            &seed,
+            &SiteRules::default(),
+            &["https://example.com/listed".to_owned()],
+            true,
+            RunSoFar {
+                started: Instant::now(),
+                pages_written: 2,
+                archived: &HashSet::new(),
+            },
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        let crawled = engine.seeds_crawled();
+        assert_eq!(crawled.len(), 1, "the listed URL was crawled once");
+        assert_eq!(
+            crawled[0].max_pages, 1,
+            "two of the run's three pages were spent before this phase began"
+        );
+    }
+
+    /// The clock half of the seed handed to a sub-crawl. A phase reading `Instant::now()` here
+    /// hands each listed URL the whole deadline again, so a run given ten minutes that spent
+    /// nine crawling gives its first sub-crawl another ten.
+    #[test]
+    fn a_sub_crawl_is_handed_only_the_clock_the_run_has_left() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut seed = Seed::new("https://example.com/");
+        seed.deadline = Some(Duration::from_secs(10));
+        let engine = ScriptedCrawlEngine::new(Vec::new());
+
+        // Nine of the ten seconds are already gone. Subtracted rather than slept: the gap
+        // between what is left and what a fresh clock would hand over is a full order of
+        // magnitude, so no machine is slow enough to blur the two.
+        let began = Instant::now() - Duration::from_secs(9);
+        capture_sitemap(
+            &engine,
+            &archive,
+            &seed,
+            &SiteRules::default(),
+            &["https://example.com/listed".to_owned()],
+            true,
+            RunSoFar {
+                started: began,
+                pages_written: 0,
+                archived: &HashSet::new(),
+            },
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        let crawled = engine.seeds_crawled();
+        assert_eq!(crawled.len(), 1, "the listed URL was crawled once");
+        let handed = crawled[0].deadline.expect("the run had a deadline");
+        assert!(
+            handed < Duration::from_secs(2),
+            "a sub-crawl of a run with one second left was handed {handed:?}"
+        );
     }
 
     /// A redirect the archive stored rather than followed is not a refusal, and counting it as
@@ -2340,7 +2578,7 @@ mod tests {
             &SiteRules::default(),
             &urls,
             true,
-            &HashSet::new(),
+            RunSoFar::nothing_yet(&HashSet::new()),
         )
         .expect("a fake engine and a fresh archive do not fail a write");
 

@@ -242,6 +242,21 @@ mod tests {
         assert!(rules.allows("https://example.test/pricelist"));
     }
 
+    /// The protocol gives `*` and `$` meaning inside a pattern and gives nothing else any, so a
+    /// character a regular expression would read as syntax is an ordinary character here. This
+    /// is the half of the rejected approach that would have been silently wrong rather than
+    /// visibly so: the engine's `regex` feature compiles the pattern as a regular expression,
+    /// where `.` matches anything and `+` repeats what precedes it, and a site's rules would
+    /// then refuse a set of paths nobody wrote down. Asserted against `pattern_matches` rather
+    /// than through `allows`, because what is being pinned is the reading of the pattern.
+    #[test]
+    fn a_regular_expression_metacharacter_is_an_ordinary_character() {
+        assert!(pattern_matches("/a.c", "/a.c"));
+        assert!(!pattern_matches("/a.c", "/abc"));
+        assert!(pattern_matches("/p+", "/p+q"));
+        assert!(!pattern_matches("/p+", "/ppq"));
+    }
+
     #[test]
     fn the_longer_of_two_matching_patterns_decides() {
         let rules = rules(&[("/p/", false), ("/p/keep/", true)]);

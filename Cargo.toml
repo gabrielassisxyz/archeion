@@ -53,6 +53,14 @@ sha2 = "0.11.0"
 # opposite of a crawler that says who it is. `disk_native_tls` pulls a SQL driver this
 # archive has no use for, and with it a crate under an advisory that has no fixed version.
 # Removing any entry below changes how the engine crawls, so remove one on purpose.
+#
+# `regex` is the entry to not add back. It reads as the fix for a `robots.txt` pattern carrying
+# a wildcard anywhere but at its end, because it switches in a second matcher, and it is not:
+# that matcher compiles the pattern as a regular expression without translating `robots.txt`
+# syntax first, so `/p/*/comment/` asks for `/p` followed by any number of slashes and still
+# refuses no comment page. It also matches unanchored, which turns `Disallow: /subscribe` into a
+# refusal of every path containing that word, and it ignores `Allow` lines entirely. The fix
+# that shipped is this project's own matcher in `src/crawl/robots.rs`.
 spider = { version = "2.52.12", default-features = false, features = [
     "adaptive_concurrency",
     "auto_throttle",

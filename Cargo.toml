@@ -53,6 +53,11 @@ sha2 = "0.11.0"
 # opposite of a crawler that says who it is. `disk_native_tls` pulls a SQL driver this
 # archive has no use for, and with it a crate under an advisory that has no fixed version.
 # Removing any entry below changes how the engine crawls, so remove one on purpose.
+#
+# `regex` is the feature not to reach for. It is not in the list below and never has been, and
+# it reads as the fix for a `robots.txt` pattern whose wildcard is not its last character, since
+# it switches the engine to a second matcher. That matcher is wrong in its own direction, which
+# `src/crawl/robots.rs` sets out at length; this project's own matcher is what shipped instead.
 spider = { version = "2.52.12", default-features = false, features = [
     "adaptive_concurrency",
     "auto_throttle",

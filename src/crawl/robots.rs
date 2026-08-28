@@ -26,7 +26,12 @@ pub(super) struct Rule {
 }
 
 impl Rule {
+    /// `pattern` is expected undecoded, exactly as `robots.txt` spelled it: normalizing it
+    /// here, once, is what lets every caller, the vendored parser's grouping and every test
+    /// in this file alike, hand over a raw rule value without knowing the representation the
+    /// matcher below needs.
     pub(super) fn new(pattern: String, allowed: bool) -> Self {
+        let pattern = normalize_percent_encoding(&pattern);
         Self {
             // A `Disallow:` with nothing after it is the one line that means the opposite of
             // the word on it: RFC 9309 reads an empty pattern as refusing nothing. It still
@@ -139,10 +144,57 @@ fn product_token(user_agent: &str) -> String {
 /// aimed at a query string are ordinary on real sites.
 fn path_and_query(url: &str) -> Option<String> {
     let parsed = Url::parse(url).ok()?;
-    Some(match parsed.query() {
+    let raw = match parsed.query() {
         Some(query) => format!("{}?{query}", parsed.path()),
         None => parsed.path().to_owned(),
-    })
+    };
+    Some(normalize_percent_encoding(&raw))
+}
+
+/// The representation RFC 9309 section 2.2.2 compares in, applied to one side of a
+/// comparison at a time: every octet outside ASCII, and every ASCII octet in RFC 3986's
+/// reserved set, stays (or becomes) percent-encoded; a percent-encoded ASCII octet outside
+/// that reserved set is decoded to the literal character it names. A literal ASCII character
+/// that was never percent-encoded to begin with is left exactly as written, which is what
+/// keeps `*` and `$` meaningful as this module's own operators once normalization has run:
+/// only a `%2A` or a `%24` goes through this untouched, never a bare `*` or `$`.
+fn normalize_percent_encoding(value: &str) -> String {
+    fn is_unreserved(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+    }
+
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let decoded = bytes.get(i + 1..i + 3).and_then(|hex| {
+                std::str::from_utf8(hex)
+                    .ok()
+                    .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+            });
+            if let Some(byte) = decoded {
+                if is_unreserved(byte) {
+                    out.push(byte as char);
+                } else {
+                    out.push_str(&format!("%{byte:02X}"));
+                }
+                i += 3;
+                continue;
+            }
+        }
+        // A raw byte above ASCII is one half (or more) of a multi-byte UTF-8 character that
+        // was written into the file literally rather than escaped; percent-encoding it here,
+        // one octet at a time, is what makes it compare equal to the same character spelled
+        // with `%XX` triplets, which is the only spelling a URI's own path ever carries it in.
+        if bytes[i].is_ascii() {
+            out.push(bytes[i] as char);
+        } else {
+            out.push_str(&format!("%{:02X}", bytes[i]));
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Whether one pattern matches one path.
@@ -463,5 +515,47 @@ mod tests {
     #[test]
     fn a_url_that_does_not_parse_is_not_refused() {
         assert!(rules(&[("/", false)]).allows("not a url"));
+    }
+
+    /// RFC 9309 section 2.2.2's under-refusal case: a non-ASCII octet stays percent-encoded
+    /// on both sides of the comparison, whichever spelling the rule and the request each
+    /// happened to use, rather than the rule's spelling winning only when it matches the
+    /// request's byte for byte.
+    #[test]
+    fn a_literal_and_a_percent_encoded_spelling_of_a_non_ascii_path_are_both_governed() {
+        let literal_rule = rules(&[("/café", false)]);
+        assert!(!literal_rule.allows("https://example.test/café"));
+        assert!(!literal_rule.allows("https://example.test/caf%C3%A9"));
+
+        let encoded_rule = rules(&[("/caf%C3%A9", false)]);
+        assert!(!encoded_rule.allows("https://example.test/café"));
+        assert!(!encoded_rule.allows("https://example.test/caf%C3%A9"));
+    }
+
+    #[test]
+    fn an_encoded_unreserved_character_compares_equal_to_its_decoded_spelling() {
+        let rules = rules(&[("/%41bc", false)]);
+        assert!(!rules.allows("https://example.test/Abc"));
+        assert!(!rules.allows("https://example.test/%41bc"));
+    }
+
+    /// The over-refusal case: `%2A` and `%24` in a rule are the octets `*` and `$` name, not
+    /// the operators, so they must not start matching what the literal operators match.
+    #[test]
+    fn an_encoded_reserved_wildcard_or_anchor_character_stays_literal() {
+        let wildcard_rule = rules(&[("/a*c", false)]);
+        assert!(!wildcard_rule.allows("https://example.test/abc"));
+
+        let escaped_wildcard_rule = rules(&[("/a%2Ac", false)]);
+        assert!(!escaped_wildcard_rule.allows("https://example.test/a%2Ac"));
+        assert!(escaped_wildcard_rule.allows("https://example.test/abc"));
+
+        let anchor_rule = rules(&[("/x$", false)]);
+        assert!(!anchor_rule.allows("https://example.test/x"));
+        assert!(anchor_rule.allows("https://example.test/xy"));
+
+        let escaped_anchor_rule = rules(&[("/x%24", false)]);
+        assert!(!escaped_anchor_rule.allows("https://example.test/x%24"));
+        assert!(escaped_anchor_rule.allows("https://example.test/x"));
     }
 }

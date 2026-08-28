@@ -20,6 +20,7 @@ use lol_html::{HtmlRewriter, MemorySettings, Settings, element};
 use spider::configuration::RedirectPolicy;
 use spider::packages::robotparser::parser::Entry;
 use spider::page::Page;
+use spider::reqwest::Client;
 use spider::reqwest::header::{CONTENT_LENGTH, COOKIE, HeaderMap, HeaderValue, SET_COOKIE};
 use spider::tokio::runtime::{Builder, Runtime};
 use spider::tokio::sync::broadcast::Receiver;
@@ -77,41 +78,54 @@ const MAX_REDIRECTS: usize = 7;
 /// configuration and data", and what it carries forward that this project has no other way
 /// to rebuild is the robots parser inside it.
 ///
+/// The raw, undecoded rule lines `robots_rules` sometimes recovers from a second fetch (see
+/// its own doc comment) are kept in the same slot rather than a second one: they are only
+/// ever valid for the same origin the cached `Website` was fetched for, and folding them
+/// together is what keeps that scope from being able to drift apart into two independent
+/// answers about which origin is current.
+///
 /// One slot is enough. A run works through one host at a time: a `Seed` is one host by
 /// construction, and `capture_sitemap`'s own sub-crawls, the case this exists for, already
 /// refuse a listed URL on another host before it ever reaches this engine.
+/// An origin, the `Website` last configured for it, and whatever raw rule lines
+/// `robots_rules` recovered for it, if any rule needed them.
+type CachedForOrigin = (String, Website, Option<Vec<RawRuleLine>>);
+
 #[derive(Default)]
 pub struct SpiderEngine {
-    reused: Mutex<Option<(String, Website)>>,
+    reused: Mutex<Option<CachedForOrigin>>,
 }
 
 impl SpiderEngine {
-    /// The `Website` last configured for this seed's origin, or a fresh one when there is
-    /// none or it was configured for a different one.
+    /// The `Website` last configured for this seed's origin, and whatever raw rule lines were
+    /// recovered for it, or a fresh `Website` and no lines when there is no entry or it was
+    /// configured for a different origin.
     ///
     /// A `robots.txt` read for one origin is not permission to skip reading another's, so a
     /// cache entry for a different origin is dropped rather than carried into a crawl it was
     /// never fetched for.
-    fn cached_for(&self, start: &str) -> Website {
+    fn cached_for(&self, start: &str) -> (Website, Option<Vec<RawRuleLine>>) {
         let origin = origin_of(start);
         let mut slot = self
             .reused
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match slot.take() {
-            Some((cached_origin, website)) if cached_origin == origin => website,
-            _ => Website::new(start),
+            Some((cached_origin, website, raw_lines)) if cached_origin == origin => {
+                (website, raw_lines)
+            }
+            _ => (Website::new(start), None),
         }
     }
 
-    /// Files a `Website` under the origin it was just crawled for, for the next seed on this
-    /// engine to ask for.
-    fn keep(&self, start: &str, website: Website) {
+    /// Files a `Website` and its raw rule lines under the origin they were just crawled for,
+    /// for the next seed on this engine to ask for.
+    fn keep(&self, start: &str, website: Website, raw_lines: Option<Vec<RawRuleLine>>) {
         let mut slot = self
             .reused
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *slot = Some((origin_of(start), website));
+        *slot = Some((origin_of(start), website, raw_lines));
     }
 }
 
@@ -137,9 +151,15 @@ impl CrawlEngine for SpiderEngine {
         apply_response_byte_ceiling();
         let start = usable_seed_url(seed)?;
         let runtime = Runtime::new().map_err(|source| CrawlError::EngineUnavailable { source })?;
-        let mut website = self.cached_for(&start);
-        let outcome = runtime.block_on(crawl_seed(&start, seed, &mut website, on_page));
-        self.keep(&start, website);
+        let (mut website, mut raw_lines_cache) = self.cached_for(&start);
+        let outcome = runtime.block_on(crawl_seed(
+            &start,
+            seed,
+            &mut website,
+            &mut raw_lines_cache,
+            on_page,
+        ));
+        self.keep(&start, website, raw_lines_cache);
         Ok(outcome)
     }
 
@@ -282,6 +302,7 @@ async fn crawl_seed(
     start: &str,
     seed: &Seed,
     website: &mut Website,
+    raw_lines_cache: &mut Option<Vec<RawRuleLine>>,
     on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
 ) -> CrawlOutcome {
     // Shared with `hop_depth_guard` through `configure_for_seed`, and read again below once
@@ -289,7 +310,7 @@ async fn crawl_seed(
     // whether or not the engine ever came back to fetch it.
     let depths: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     configure_for_seed(website, start, seed, Arc::clone(&depths));
-    let robots = robots_rules(website).await;
+    let robots = robots_rules(website, raw_lines_cache).await;
     // The engine fetches while the caller writes to disk, so the queue between them has to
     // absorb the difference. Sizing it to the fetch concurrency alone drops pages the
     // moment a write is slower than a fetch; sizing it to the page limit would hold a
@@ -387,16 +408,24 @@ async fn crawl_seed(
 
 /// The site's own rules, read out of the engine's parse of its `robots.txt`.
 ///
-/// The file is fetched here rather than by the crawl, and it is still fetched once: driving
-/// `configure_robots_parser` before `crawl()` sets the parser's `mtime`, and the engine's own
-/// setup skips a file it already has. Doing it here is what makes the rules available before
-/// the first page rather than after the last, and it also covers a case the engine's setup
-/// skips outright, a crawl limited to a single page, which is a crawl `docs/cli.md` promises
-/// respects `robots.txt` like any other.
+/// The file is fetched here rather than by the crawl, which is what makes the rules available
+/// before the first page rather than after the last, and it also covers a case the engine's
+/// setup skips outright, a crawl limited to a single page, which is a crawl `docs/cli.md`
+/// promises respects `robots.txt` like any other.
 ///
-/// Only the matching is redone. The groups, the comments, the percent-decoding and the empty
-/// `Disallow:` are the engine's reading of the file, and re-reading them here would be a
-/// second opinion about what the file says rather than about what one of its rules matches.
+/// The groups and the empty `Disallow:` are still the engine's reading of the file, and
+/// re-reading them here would be a second opinion about what the file says rather than about
+/// what one of its rules matches. Every rule's pattern is not, in the one case the vendored
+/// parser's own decode cannot be trusted for: it applies `percent_decode` to a rule's value
+/// unconditionally, which collapses a literal `*` or `$` and an escaped `%2A` or `%24` onto
+/// the same character before this ever sees either one. `needs_raw_rules` is what keeps that
+/// correction from costing every crawl a second request for a file that never used either
+/// character to begin with: a rule with neither operator has nothing for `raw_rule_lines` to
+/// recover. `raw_lines_cache` bounds it further, to at most one extra request per origin
+/// rather than one per call: `SpiderEngine` already reuses one `Website` across a sitemap
+/// phase's sub-crawls so the vendored parser's own fetch happens once, and without this cache
+/// the correction above would ask for the file again on every sub-crawl that shares it, which
+/// is the same waste that reuse exists to remove, reintroduced through this fetch instead.
 ///
 /// `configure_robots_parser` only ever reads `Crawl-delay` into the website's own delay the
 /// first time it runs for a given parser, guarded on the parser's `mtime`: a `Website` this
@@ -407,7 +436,10 @@ async fn crawl_seed(
 /// under the operator's delay instead of the site's from its second listed URL on. Deriving
 /// it is a pure read of data the parser already holds, so doing it unconditionally costs
 /// nothing on the call that did just fetch the file.
-async fn robots_rules(website: &mut Website) -> RobotRules {
+async fn robots_rules(
+    website: &mut Website,
+    raw_lines_cache: &mut Option<Vec<RawRuleLine>>,
+) -> RobotRules {
     let (client, _control) = website.setup_base();
     website.configure_robots_parser(&client).await;
     let (groups, crawl_delay) = {
@@ -420,11 +452,27 @@ async fn robots_rules(website: &mut Website) -> RobotRules {
         // screens its own seed through `is_allowed_robots` before fetching it, so a run
         // archives nothing at all and this is never asked. Reading the flags anyway would be
         // a second copy of a decision that has no case left to decide.
-        let groups = parser
+        let entries: Vec<&Entry> = parser
             .get_entries()
             .iter()
             .chain(std::iter::once(parser.get_base_entry()))
-            .map(group_of)
+            .collect();
+        let raw_lines: Vec<RawRuleLine> = if needs_raw_rules(&entries) {
+            match raw_lines_cache.as_ref() {
+                Some(cached) => cached.clone(),
+                None => {
+                    let fetched = raw_rule_lines(&client, website.get_url_parsed()).await;
+                    *raw_lines_cache = Some(fetched.clone());
+                    fetched
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let mut raw_lines = raw_lines.into_iter();
+        let groups = entries
+            .into_iter()
+            .map(|entry| group_of(entry, &mut raw_lines))
             .collect();
         let crawl_delay = parser.get_crawl_delay(&website.configuration.user_agent);
         (groups, crawl_delay)
@@ -435,16 +483,142 @@ async fn robots_rules(website: &mut Website) -> RobotRules {
     RobotRules::for_agent(groups, USER_AGENT)
 }
 
+/// Whether any already-decoded rule could have come from an escaped `%2A` or `%24`: the
+/// vendored parser's decode is the identity function on every other octet this matcher
+/// treats specially, so a pattern with neither character present, decoded or otherwise,
+/// cannot have lost anything a second fetch would recover.
+fn needs_raw_rules(entries: &[&Entry]) -> bool {
+    entries
+        .iter()
+        .flat_map(|entry| &entry.rulelines)
+        .any(|line| line.path.contains(['*', '$']))
+}
+
+/// One `Allow:` or `Disallow:` line exactly as `robots.txt` spelled its value, read before
+/// anything decodes it. Cloned rather than borrowed out of `SpiderEngine`'s per-origin cache,
+/// since each `robots_rules` call consumes its own iterator over the lines to correlate them
+/// against that call's own rules, and the cache has to stay intact for the next one.
+#[derive(Clone)]
+struct RawRuleLine {
+    raw_pattern: String,
+    allowed: bool,
+}
+
+/// The same `robots.txt` the vendored parser already read, fetched again through the same
+/// client so `group_of` can hand the matcher a rule's undecoded spelling instead of the
+/// vendor's fully percent-decoded one. A second request is the cost of that, paid only when
+/// `needs_raw_rules` found a reason to: the vendored parser's `path` field is the only thing
+/// it publishes for a rule, decoding already applied and irreversible, so there is no way to
+/// recover an escaped octet from it after the fact.
+///
+/// Scanning here is deliberately shallow, a comment stripped, a line trimmed, a keyword
+/// matched case-insensitively, rather than a second copy of the vendored parser's grouping.
+/// It does not need to be a full parse: `group_of` below only consumes a candidate whose
+/// fully-decoded value and allowance match the vendored `RuleLine` it is currently reading,
+/// so a line this scan wrongly includes (one before any `User-agent:` line, or one from a
+/// second `User-agent: *` group the vendored parser already drops) is simply never claimed by
+/// anything and costs nothing.
+///
+/// A fetch that fails, or a response that is not valid UTF-8, leaves the caller with no raw
+/// lines at all: `group_of` then falls back to the vendor's decoded spelling for every rule,
+/// which is the behavior this bead found and not a new failure this introduces.
+async fn raw_rule_lines(client: &Client, base_url: &Option<Box<Url>>) -> Vec<RawRuleLine> {
+    let Some(base_url) = base_url.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(robots_url) = base_url.join("/robots.txt") else {
+        return Vec::new();
+    };
+    let Ok(response) = client.get(robots_url).send().await else {
+        return Vec::new();
+    };
+    let Ok(text) = response.text().await else {
+        return Vec::new();
+    };
+
+    let mut seen_user_agent = false;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let line = match line.find('#') {
+            Some(hash) => &line[..hash],
+            None => line,
+        }
+        .trim();
+        let Some(colon) = line.find(':') else {
+            continue;
+        };
+        let keyword = line[..colon].trim();
+        let value = line[colon + 1..].trim();
+        if keyword.eq_ignore_ascii_case("user-agent") {
+            seen_user_agent = true;
+        } else if seen_user_agent && keyword.eq_ignore_ascii_case("disallow") {
+            lines.push(RawRuleLine {
+                raw_pattern: value.to_owned(),
+                allowed: false,
+            });
+        } else if seen_user_agent && keyword.eq_ignore_ascii_case("allow") {
+            lines.push(RawRuleLine {
+                raw_pattern: value.to_owned(),
+                allowed: true,
+            });
+        }
+    }
+    lines
+}
+
+/// What the vendored parser's own `percent_decode` reduces a rule's raw value to, applied the
+/// same way here so a candidate from `raw_rule_lines` can be matched against the `RuleLine`
+/// the vendored parser produced from it. This is not the RFC 9309 representation the matcher
+/// wants; it is the lossy one the matcher does not, and it exists only to recognize which
+/// raw line a decoded `RuleLine` came from.
+fn vendor_percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let decoded = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match decoded {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
 /// One parsed group, as this project's own matcher wants it. The engine keeps the groups that
 /// name a crawler apart from the one that names `*`, which it holds as a base entry; both are
 /// ordinary groups here, since which of them applies is the question the matcher answers.
-fn group_of(entry: &Entry) -> Group {
+///
+/// `raw_lines` is consumed in file order and never rewound: for each of `entry`'s rules, it is
+/// advanced past every candidate that does not decode to that rule's own path and allowance,
+/// and the first one that does is what the pattern is built from. An empty `raw_lines` (no
+/// second fetch happened, or none is left) falls back to the vendored parser's own decoded
+/// path, unchanged from before this module normalized anything.
+fn group_of(entry: &Entry, raw_lines: &mut impl Iterator<Item = RawRuleLine>) -> Group {
     Group {
         agents: entry.useragents.clone(),
         rules: entry
             .rulelines
             .iter()
-            .map(|line| Rule::new(line.path.clone(), line.allowance))
+            .map(|line| {
+                let raw = raw_lines.find(|candidate| {
+                    candidate.allowed == line.allowance
+                        && vendor_percent_decode(&candidate.raw_pattern) == line.path
+                });
+                let pattern =
+                    raw.map_or_else(|| line.path.clone(), |candidate| candidate.raw_pattern);
+                Rule::new(pattern, line.allowance)
+            })
             .collect(),
     }
 }
@@ -1912,11 +2086,12 @@ mod tests {
             "the parser stopped keeping repeated groups for one agent apart"
         );
 
+        let mut raw_lines = std::iter::empty();
         let groups = parser
             .get_entries()
             .iter()
             .chain(std::iter::once(parser.get_base_entry()))
-            .map(group_of)
+            .map(|entry| group_of(entry, &mut raw_lines))
             .collect();
         let rules = RobotRules::for_agent(groups, USER_AGENT);
         assert!(!rules.allows("https://example.test/first"));
@@ -1973,9 +2148,10 @@ mod tests {
             let mut seed = Seed::new(&start);
             seed.delay = Duration::from_millis(0);
             let mut website = Website::new(&start);
+            let mut raw_lines_cache = None;
 
             configure_for_seed(&mut website, &start, &seed, empty_depths());
-            robots_rules(&mut website).await;
+            robots_rules(&mut website, &mut raw_lines_cache).await;
             assert_eq!(
                 website.configuration.delay, 3000,
                 "the site's own crawl delay was not read on the first, fetching call"
@@ -1985,7 +2161,7 @@ mod tests {
             // cached `Website` back for it: the same reset-then-reread sequence, on a parser
             // that is already read and therefore skips the fetch this time.
             configure_for_seed(&mut website, &start, &seed, empty_depths());
-            robots_rules(&mut website).await;
+            robots_rules(&mut website, &mut raw_lines_cache).await;
             assert_eq!(
                 website.configuration.delay, 3000,
                 "a reused sub-crawl fell back to the seed's own delay instead of the site's"

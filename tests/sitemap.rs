@@ -621,6 +621,14 @@ fn a_sitemap_run_with_no_explicit_depth_keeps_its_own_robots_txt_request_pattern
 /// `src/crawl/robots.rs`), so what refuses `/posts/2` afterward is this project's own
 /// re-matching of the cached parser's rules against every sub-crawl the reuse hands it, not
 /// only the one that happened to trigger the read.
+///
+/// The count below is two rather than one because this `robots.txt` is exactly the shape
+/// `src/crawl/robots.rs`'s own percent-encoding fix has to treat as suspect: a rule
+/// containing `*` might have gotten there from an escaped `%2A`, which the vendored parser's
+/// decode cannot be told apart from a literal one, so recovering the file's raw, undecoded
+/// bytes is the only way to know which. That recovery is its own request, bounded to at most
+/// once per origin exactly as the `Website` reuse above bounds the vendored fetch, so the
+/// total here is the two together and not one growing with the number of sub-crawls.
 #[test]
 fn a_url_the_reused_engine_s_robots_file_disallows_is_still_refused() {
     let dir = TempDir::new().expect("temp dir");
@@ -661,8 +669,9 @@ fn a_url_the_reused_engine_s_robots_file_disallows_is_still_refused() {
     );
     assert_eq!(
         site.requests_for("/robots.txt"),
-        1,
-        "the reuse across sub-crawls asked for robots.txt more than once"
+        2,
+        "the vendored fetch and the raw-encoding recovery should each run at most once, \
+         not once per sub-crawl"
     );
 
     let archive = Archive::open_existing(&archive_path).expect("the archive exists");
@@ -684,4 +693,73 @@ fn a_url_the_reused_engine_s_robots_file_disallows_is_still_refused() {
             .is_empty(),
         "a URL the reused engine's robots.txt disallowed was archived anyway"
     );
+}
+
+/// The regression a merge with the percent-encoding fix (`src/crawl/robots.rs`) could
+/// reintroduce. That fix reads `robots.txt` a second time, past the vendored parser's own
+/// decode, whenever a rule contains `*` or `$`, since only the file's raw bytes tell an
+/// escaped `%2A` apart from a literal `*`. `robots_rules` runs once per sub-crawl, so without
+/// its own bound that second request would cost one per listed URL on top of the vendored
+/// one, which is exactly the traffic the `Website` reuse above exists to remove, reopened
+/// through this fetch instead. It is bound to at most one recovery per origin, the same scope
+/// the `Website` cache uses, so the total here stays at two no matter how many URLs the
+/// sitemap lists.
+#[test]
+fn a_wildcard_robots_rule_costs_at_most_one_extra_request_across_a_sitemap_run() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let (listener, site) = Site::bind();
+    let posts = ["/posts/1", "/posts/2", "/posts/3", "/posts/4", "/posts/5"];
+    let listed: Vec<String> = posts.iter().map(|path| site.url(path)).collect();
+    let mut routes = vec![
+        route("/index.html", "text/html; charset=utf-8", LONE_PAGE),
+        route(
+            "/robots.txt",
+            "text/plain",
+            "User-agent: *\nDisallow: /never/*/matches\n",
+        ),
+        route("/sitemap.xml", "application/xml", urlset(&listed)),
+    ];
+    for path in posts {
+        routes.push(route(path, "text/html; charset=utf-8", LONE_PAGE));
+    }
+    site.serve(listener, routes);
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(site.url("/index.html"))
+        .args(["--max-pages", "10", "--max-depth", "1"])
+        .args(["--concurrency", "4", "--max-retries", "0"])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .args(["--from-sitemap", &site.url("/sitemap.xml")])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stdout_of(&output).contains("archived 6 capture(s)"),
+        "{}",
+        stdout_of(&output)
+    );
+    let robots_requests = site.requests_for("/robots.txt");
+    assert!(
+        robots_requests <= 2,
+        "a wildcard rule cost more than one vendored fetch plus one raw-encoding recovery \
+         across the sitemap's five sub-crawls: {robots_requests} requests"
+    );
+
+    // Every listed URL is still archived, so the request count above cannot have passed by
+    // way of a crawl that skipped the sub-crawls rather than sharing their robots.txt cost.
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    for path in posts {
+        let url = CanonicalUrl::parse(&site.url(path)).expect("valid url");
+        assert!(
+            !archive
+                .list_captures(&url)
+                .expect("captures are listed")
+                .is_empty(),
+            "{path} was not archived, so the request count above could have passed by doing nothing"
+        );
+    }
 }

@@ -67,7 +67,62 @@ const RESPONSE_BYTE_CEILING: &str = "SPIDER_MAX_SIZE_BYTES";
 /// How long a redirect chain may get before the URL is abandoned.
 const MAX_REDIRECTS: usize = 7;
 
-pub struct SpiderEngine;
+/// A crawl engine that remembers the last `Website` it configured, keyed by the origin it
+/// was built for.
+///
+/// Each URL a sitemap lists becomes its own seed once `--max-depth` is given, and every seed
+/// used to crawl behind a `Website` built from scratch, none of which had ever read this
+/// host's `robots.txt` before: a sitemap of a few hundred posts turned into as many requests
+/// for the same small file. `Website::set_url` documents itself as the way to "re-use
+/// configuration and data", and what it carries forward that this project has no other way
+/// to rebuild is the robots parser inside it.
+///
+/// One slot is enough. A run works through one host at a time: a `Seed` is one host by
+/// construction, and `capture_sitemap`'s own sub-crawls, the case this exists for, already
+/// refuse a listed URL on another host before it ever reaches this engine.
+#[derive(Default)]
+pub struct SpiderEngine {
+    reused: Mutex<Option<(String, Website)>>,
+}
+
+impl SpiderEngine {
+    /// The `Website` last configured for this seed's origin, or a fresh one when there is
+    /// none or it was configured for a different one.
+    ///
+    /// A `robots.txt` read for one origin is not permission to skip reading another's, so a
+    /// cache entry for a different origin is dropped rather than carried into a crawl it was
+    /// never fetched for.
+    fn cached_for(&self, start: &str) -> Website {
+        let origin = origin_of(start);
+        let mut slot = self
+            .reused
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.take() {
+            Some((cached_origin, website)) if cached_origin == origin => website,
+            _ => Website::new(start),
+        }
+    }
+
+    /// Files a `Website` under the origin it was just crawled for, for the next seed on this
+    /// engine to ask for.
+    fn keep(&self, start: &str, website: Website) {
+        let mut slot = self
+            .reused
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some((origin_of(start), website));
+    }
+}
+
+/// The scope a cached `Website` is good for. `robots.txt` is a per-origin promise, so a
+/// `Website` built for one scheme, host and port is never handed to a seed on another: that
+/// would carry an answer the site actually being crawled was never asked for.
+fn origin_of(url: &str) -> String {
+    Url::parse(url)
+        .map(|parsed| parsed.origin().ascii_serialization())
+        .unwrap_or_else(|_| url.to_owned())
+}
 
 impl CrawlEngine for SpiderEngine {
     fn check_seed(&self, seed: &Seed) -> Result<(), CrawlError> {
@@ -82,7 +137,10 @@ impl CrawlEngine for SpiderEngine {
         apply_response_byte_ceiling();
         let start = usable_seed_url(seed)?;
         let runtime = Runtime::new().map_err(|source| CrawlError::EngineUnavailable { source })?;
-        Ok(runtime.block_on(crawl_seed(&start, seed, on_page)))
+        let mut website = self.cached_for(&start);
+        let outcome = runtime.block_on(crawl_seed(&start, seed, &mut website, on_page));
+        self.keep(&start, website);
+        Ok(outcome)
     }
 
     fn fetch(&self, url: &str, seed: &Seed) -> PageEvent {
@@ -223,14 +281,15 @@ pub unsafe fn settle_response_byte_ceiling(bytes: usize) {
 async fn crawl_seed(
     start: &str,
     seed: &Seed,
+    website: &mut Website,
     on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
 ) -> CrawlOutcome {
-    // Shared with `hop_depth_guard` through `configured_website`, and read again below once
+    // Shared with `hop_depth_guard` through `configure_for_seed`, and read again below once
     // the crawl ends: every same-host link the guard judged inside `max_depth` lands here,
     // whether or not the engine ever came back to fetch it.
     let depths: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
-    let mut website = configured_website(start, seed, Arc::clone(&depths));
-    let robots = robots_rules(&mut website).await;
+    configure_for_seed(website, start, seed, Arc::clone(&depths));
+    let robots = robots_rules(website).await;
     // The engine fetches while the caller writes to disk, so the queue between them has to
     // absorb the difference. Sizing it to the fetch concurrency alone drops pages the
     // moment a write is slower than a fetch; sizing it to the page limit would hold a
@@ -338,24 +397,41 @@ async fn crawl_seed(
 /// Only the matching is redone. The groups, the comments, the percent-decoding and the empty
 /// `Disallow:` are the engine's reading of the file, and re-reading them here would be a
 /// second opinion about what the file says rather than about what one of its rules matches.
+///
+/// `configure_robots_parser` only ever reads `Crawl-delay` into the website's own delay the
+/// first time it runs for a given parser, guarded on the parser's `mtime`: a `Website` this
+/// engine is reusing across a sitemap phase's sub-crawls skips that assignment on every call
+/// after the first, since the parser is still the one already read. `configure_for_seed`
+/// resets the delay to the seed's own `--delay` before every call here, so without
+/// rederiving `Crawl-delay` from the parser directly below, a reused sub-crawl would run
+/// under the operator's delay instead of the site's from its second listed URL on. Deriving
+/// it is a pure read of data the parser already holds, so doing it unconditionally costs
+/// nothing on the call that did just fetch the file.
 async fn robots_rules(website: &mut Website) -> RobotRules {
     let (client, _control) = website.setup_base();
     website.configure_robots_parser(&client).await;
-    let Some(parser) = website.get_robots_parser().as_deref() else {
-        return RobotRules::everything_allowed();
+    let (groups, crawl_delay) = {
+        let Some(parser) = website.get_robots_parser().as_deref() else {
+            return RobotRules::everything_allowed();
+        };
+        // The states of the file that are not rules, a `robots.txt` the host answered 401 or
+        // 403 for and one it answered a 4xx for, are deliberately not read here. Measured
+        // against a loopback server answering 403 for its own `robots.txt`: the engine
+        // screens its own seed through `is_allowed_robots` before fetching it, so a run
+        // archives nothing at all and this is never asked. Reading the flags anyway would be
+        // a second copy of a decision that has no case left to decide.
+        let groups = parser
+            .get_entries()
+            .iter()
+            .chain(std::iter::once(parser.get_base_entry()))
+            .map(group_of)
+            .collect();
+        let crawl_delay = parser.get_crawl_delay(&website.configuration.user_agent);
+        (groups, crawl_delay)
     };
-    // The states of the file that are not rules, a `robots.txt` the host answered 401 or 403
-    // for and one it answered a 4xx for, are deliberately not read here. Measured against a
-    // loopback server answering 403 for its own `robots.txt`: the engine screens its own seed
-    // through `is_allowed_robots` before fetching it, so a run archives nothing at all and
-    // this is never asked. Reading the flags anyway would be a second copy of a decision that
-    // has no case left to decide.
-    let groups = parser
-        .get_entries()
-        .iter()
-        .chain(std::iter::once(parser.get_base_entry()))
-        .map(group_of)
-        .collect();
+    if let Some(delay) = crawl_delay {
+        website.with_delay(u64::try_from(delay.as_millis().min(60_000)).unwrap_or(u64::MAX));
+    }
     RobotRules::for_agent(groups, USER_AGENT)
 }
 
@@ -518,7 +594,27 @@ fn configured_website(
     depths: Arc<Mutex<HashMap<String, usize>>>,
 ) -> Website {
     let mut website = Website::new(start);
+    configure_for_seed(&mut website, start, seed, depths);
     website
+}
+
+/// Applies a seed's policy onto a `Website`, fresh or already carrying an earlier seed's
+/// configuration from a previous call `SpiderEngine::crawl` made on it.
+///
+/// Every setter here replaces what it configures rather than merging with what was already
+/// there, which is what makes it safe to run again on a `Website` the engine is reusing
+/// across seeds that share a host: the previous seed's concurrency, delay, retries or cookie
+/// header do not survive alongside the new one. `set_url` runs first and is not left to
+/// `Website::new`, since a reused instance already carries the URL of the seed before this
+/// one.
+fn configure_for_seed(
+    website: &mut Website,
+    start: &str,
+    seed: &Seed,
+    depths: Arc<Mutex<HashMap<String, usize>>>,
+) {
+    website
+        .set_url(start)
         .with_limit(seed.max_pages)
         // The engine's own depth budget counts path segments of the candidate URL, which
         // is a different question from distance in hops: a chain of one-segment URLs
@@ -564,22 +660,28 @@ fn configured_website(
     // fetch around the subresource or listed URL being acquired. A cookie that belongs to
     // another origin is simply not configured, so the run asks for that page anonymously
     // rather than refusing it.
-    if let Some(mut cookie) = seed
+    //
+    // Set unconditionally, `None` included, rather than left alone when there is nothing to
+    // carry: a `Website` this engine is reusing may still hold a header from the seed before
+    // this one, and leaving it would send this seed's requests under a credential it was
+    // never given.
+    let headers = seed
         .session_cookie
         .as_ref()
         .and_then(|cookie| cookie.value_for(start))
         // A value with a character no header can carry is refused by the command line before a
         // run starts, so this only ever declines one a caller assembled by hand.
         .and_then(|value| HeaderValue::from_str(value).ok())
-    {
-        // The guarantee that a credential is never printed stops resting on no logger existing:
-        // a sensitive value prints as `Sensitive` from anything that formats the map.
-        cookie.set_sensitive(true);
-        let mut headers = HeaderMap::new();
-        headers.insert(COOKIE, cookie);
-        website.with_headers(Some(headers));
-    }
-    website
+        .map(|mut cookie| {
+            // The guarantee that a credential is never printed stops resting on no logger
+            // existing: a sensitive value prints as `Sensitive` from anything that formats
+            // the map.
+            cookie.set_sensitive(true);
+            let mut headers = HeaderMap::new();
+            headers.insert(COOKIE, cookie);
+            headers
+        });
+    website.with_headers(headers);
 }
 
 /// Answers, for a page the engine just fetched, whether the crawl should follow that
@@ -1045,7 +1147,7 @@ mod tests {
             "data:text/css,body{}",
             "/style.css",
         ] {
-            match SpiderEngine.fetch(refused, &Seed::new("https://example.com/")) {
+            match SpiderEngine::default().fetch(refused, &Seed::new("https://example.com/")) {
                 PageEvent::NoResponse(failure) => assert_eq!(failure.url, refused),
                 PageEvent::Response(response) => {
                     panic!("{refused} was fetched and answered {}", response.status)
@@ -1820,5 +1922,82 @@ mod tests {
         assert!(!rules.allows("https://example.test/first"));
         assert!(!rules.allows("https://example.test/second"));
         assert!(rules.allows("https://example.test/general"));
+    }
+
+    /// Answers every request on this connection with a fixed `robots.txt` body, which is all
+    /// a test of the parser reuse below needs from a server: what matters is how many times
+    /// it is asked, never what else it is asked for.
+    fn answer_robots_txt(mut stream: std::net::TcpStream, body: &str) -> std::io::Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        line.clear();
+        while reader.read_line(&mut line)? > 2 {
+            line.clear();
+        }
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes())?;
+        stream.write_all(body.as_bytes())?;
+        stream.flush()
+    }
+
+    /// The regression the first attempt at this reuse left behind. `configure_robots_parser`
+    /// reads `Crawl-delay` into the website's own delay only the first time it runs for a
+    /// given parser (it guards on the parser's `mtime`), so a `Website` carrying an already
+    /// read parser skips that assignment on every later call, exactly the call
+    /// `configure_for_seed` makes before it, resetting the delay to the seed's own, on every
+    /// sub-crawl `SpiderEngine::crawl` hands the cached `Website` back for.
+    #[test]
+    fn a_reused_sub_crawl_still_honours_the_site_s_crawl_delay() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let addr = listener.local_addr().expect("the bound address");
+        let requests = Arc::new(Mutex::new(0usize));
+        let served = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                *served
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+                let _ = answer_robots_txt(stream, "User-agent: *\nAllow: /\nCrawl-delay: 3\n");
+            }
+        });
+        let start = format!("http://{addr}/");
+
+        let runtime = Runtime::new().expect("a runtime for the test");
+        runtime.block_on(async {
+            let mut seed = Seed::new(&start);
+            seed.delay = Duration::from_millis(0);
+            let mut website = Website::new(&start);
+
+            configure_for_seed(&mut website, &start, &seed, empty_depths());
+            robots_rules(&mut website).await;
+            assert_eq!(
+                website.configuration.delay, 3000,
+                "the site's own crawl delay was not read on the first, fetching call"
+            );
+
+            // The second seed on this origin, exactly as `SpiderEngine::crawl` hands the
+            // cached `Website` back for it: the same reset-then-reread sequence, on a parser
+            // that is already read and therefore skips the fetch this time.
+            configure_for_seed(&mut website, &start, &seed, empty_depths());
+            robots_rules(&mut website).await;
+            assert_eq!(
+                website.configuration.delay, 3000,
+                "a reused sub-crawl fell back to the seed's own delay instead of the site's"
+            );
+        });
+
+        assert_eq!(
+            *requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            1,
+            "the parser reuse this regression depends on was not exercised"
+        );
     }
 }

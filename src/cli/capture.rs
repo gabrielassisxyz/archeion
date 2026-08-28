@@ -255,7 +255,7 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
     // a run that was never going to fetch anything, and creating a directory for it leaves
     // an empty archive on the path that was typed wrong, which is exactly the case the line
     // announcing a new archive exists to make visible.
-    let engine = SpiderEngine;
+    let engine = SpiderEngine::default();
     engine.check_seed(&seed)?;
     let (archive, created) = open_or_create(&args.archive)?;
     // A rule file that cannot be used costs the extractions it would have improved and not

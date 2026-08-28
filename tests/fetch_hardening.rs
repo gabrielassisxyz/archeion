@@ -33,7 +33,7 @@ fn a_redirect_into_the_metadata_service_is_refused_and_nothing_of_it_is_archived
     let port = serve_one_redirect_to(METADATA_URL);
 
     let run = capture_seed(
-        &SpiderEngine,
+        &SpiderEngine::default(),
         &archive,
         &local_seed(port),
         &SiteRules::default(),
@@ -72,7 +72,7 @@ fn a_seed_pointed_at_the_metadata_service_never_reaches_a_socket() {
     let archive = Archive::open(dir.path()).expect("the archive opens");
 
     let error = capture_seed(
-        &SpiderEngine,
+        &SpiderEngine::default(),
         &archive,
         &Seed::new(METADATA_URL),
         &SiteRules::default(),

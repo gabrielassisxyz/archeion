@@ -97,6 +97,128 @@ fn a_page_is_archived_with_the_files_it_referenced_fetched_for_real() {
     );
 }
 
+/// The widest candidate points off loopback entirely, at port 1, which needs privileges
+/// nothing in this suite has and which nothing can therefore be listening on. The address is
+/// fixed rather than a socket this test bound and released, for the reason
+/// `capture_from_a_closed_port` in `tests/cli_capture.rs` is: a released ephemeral port can be
+/// reused by anything else on the machine before the fetch reaches it, and the failure would
+/// then look like the fallback being wrong rather than like a port coming back to life.
+const SRCSET_PAGE: &str = r#"<html><head><title>A responsive page</title></head>
+    <body><img srcset="http://127.0.0.1:1/wide.jpg 1600w, /narrow.jpg 800w"></body></html>"#;
+const NARROW_JPEG: &[u8] = b"\xff\xd8\xff\xe0a narrower rendition of the same photograph";
+
+/// `arch-3ff`, end to end: the pass that would recover a lost rendition runs above the crawl
+/// adapter, so nothing about a connection a real client actually refuses to make is visible
+/// to a scripted engine. Nothing answers the widest candidate at all, the way a transformation
+/// network that has not generated it yet would leave a request with no response, and the
+/// narrower one is served normally.
+#[test]
+fn a_widest_srcset_candidate_nothing_answers_leaves_the_narrower_one_archived() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = Archive::open(dir.path()).expect("the archive opens");
+    let site = SrcsetSite::start();
+
+    let run = capture_seed(
+        &SpiderEngine::default(),
+        &archive,
+        &site.seed(),
+        &SiteRules::default(),
+    )
+    .expect("the run completes");
+
+    assert_eq!(run.captures_written, 1, "{run:#?}");
+    assert_eq!(run.assets_stored, 1, "{run:#?}");
+    assert_eq!(run.assets_missed, 1, "{run:#?}");
+    assert_eq!(
+        run.asset_fetches, 2,
+        "the widest candidate and its one fallback, and nothing past that: {run:#?}"
+    );
+
+    let url = CanonicalUrl::parse(&site.url("/index.html")).expect("valid url");
+    let captures = archive.list_captures(&url).expect("captures are listed");
+    let capture = archive
+        .read_capture(&url, &captures[0])
+        .expect("the capture reads back");
+
+    assert_eq!(capture.assets.len(), 1, "{:?}", capture.assets);
+    assert_eq!(capture.assets[0].final_url, site.url("/narrow.jpg"));
+    assert!(
+        capture.assets[0].is_fallback,
+        "the rendition kept because the widest could not be fetched is marked as one"
+    );
+    assert_eq!(
+        capture
+            .assets_missed
+            .iter()
+            .map(|missed| missed.url.as_str())
+            .collect::<Vec<_>>(),
+        ["http://127.0.0.1:1/wide.jpg"],
+        "the widest candidate's own miss is still named"
+    );
+}
+
+/// A site on loopback that offers one picture at two sizes, one of which nothing answers.
+struct SrcsetSite {
+    port: u16,
+}
+
+impl SrcsetSite {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("the bound address").port();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let _ = answer_srcset(stream);
+            }
+        });
+        Self { port }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    fn seed(&self) -> Seed {
+        let mut seed = Seed::new(self.url("/index.html"));
+        seed.allow_private_addresses = true;
+        seed.max_pages = 4;
+        seed.concurrency = 1;
+        seed.max_retries = 0;
+        seed.deadline = Some(Duration::from_secs(15));
+        seed
+    }
+}
+
+fn answer_srcset(mut stream: TcpStream) -> std::io::Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    let (status, media_type, body): (&str, &str, &[u8]) = match path.as_str() {
+        "/robots.txt" => ("404 Not Found", "text/plain", b""),
+        "/index.html" => ("200 OK", "text/html; charset=utf-8", SRCSET_PAGE.as_bytes()),
+        "/narrow.jpg" => ("200 OK", "image/jpeg", NARROW_JPEG),
+        _ => ("404 Not Found", "text/plain", b"not here"),
+    };
+
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {media_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
 /// A site on loopback, and the record of what was asked of it.
 struct Site {
     port: u16,

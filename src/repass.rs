@@ -4,7 +4,7 @@
 //! itself recorded as missed. The page responses remain authoritative; metadata, articles and
 //! late assets are the derived layer this pass is allowed to replace.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::CanonicalUrl;
@@ -155,27 +155,48 @@ fn recover_assets(
     assets: &mut AssetCapture<'_>,
     run: &mut RepassRun,
 ) -> Result<(), StorageError> {
-    let kinds = kinds_by_url(metadata);
+    let roles = roles_by_url(metadata);
     let mut retryable = Vec::new();
+    // Addresses queued here rather than reached through `of_page`'s own fallback handling,
+    // since they are asked for on their own and never as a widest candidate's fallback: the
+    // widest itself is not re-queued, so there is nothing for that handling to attach to.
+    let mut queued_as_fallback: HashSet<String> = HashSet::new();
     for missed in &capture.assets_missed {
-        if !retryable_miss(&missed.reason) {
-            run.assets_not_retried += 1;
+        // An image when the record does not name the address, which is what every retry was
+        // handed over as until the roles were read back at all. A record re-derived under a
+        // later extractor can name fewer references than the capture missed, a `srcset`'s
+        // narrower renditions being the case in hand, and a lookup that came up empty is not
+        // evidence that a page's picture belongs behind its script bundles.
+        let role = roles.get(missed.url.as_str()).copied();
+        let kind = role.map_or(AssetKind::Image, |asset| asset.kind);
+        if retryable_miss(&missed.reason) {
+            retryable.push(ReferencedAsset {
+                url: missed.url.clone(),
+                kind,
+                fallback: role.and_then(|asset| asset.fallback.clone()),
+            });
             continue;
         }
-        retryable.push(ReferencedAsset {
-            url: missed.url.clone(),
-            // An image when the record does not name the address, which is what every retry
-            // was handed over as until the roles were read back at all. A record re-derived
-            // under a later extractor can name fewer references than the capture missed, a
-            // `srcset`'s narrower renditions being the case in hand, and a lookup that came up
-            // empty is not evidence that a page's picture belongs behind its script bundles.
-            kind: kinds
-                .get(missed.url.as_str())
-                .copied()
-                .unwrap_or(AssetKind::Image),
-        });
+        run.assets_not_retried += 1;
+        // `retryable_miss` says asking this address again will not change, so the address
+        // itself is not queued. What is queued instead, when the current metadata names one,
+        // is the narrower rendition the same `srcset` offered: a fresh address this pass has
+        // never asked for, rather than a repeat of the one that just failed.
+        if let Some(fallback) = role.and_then(|asset| asset.fallback.clone()) {
+            queued_as_fallback.insert(fallback.clone());
+            retryable.push(ReferencedAsset {
+                url: fallback,
+                kind,
+                fallback: None,
+            });
+        }
     }
-    let captured = assets.of_page(&retryable)?;
+    let mut captured = assets.of_page(&retryable)?;
+    for asset in &mut captured.stored {
+        if queued_as_fallback.contains(&asset.requested_url) {
+            asset.is_fallback = true;
+        }
+    }
     run.assets_recovered += captured.stored.len();
     run.assets_still_missing += captured.missed.len();
     archive.add_recovered_assets(url, &capture.id, &captured.stored, &captured.missed)
@@ -185,13 +206,13 @@ fn recover_assets(
 ///
 /// Built once per capture rather than searched per miss: a page may reference two thousand
 /// addresses and miss hundreds of them, and a scan per miss is that product.
-fn kinds_by_url(metadata: Option<&PageMetadata>) -> HashMap<&str, AssetKind> {
+fn roles_by_url(metadata: Option<&PageMetadata>) -> HashMap<&str, &ReferencedAsset> {
     metadata
         .map(|metadata| {
             metadata
                 .assets
                 .iter()
-                .map(|asset| (asset.url.as_str(), asset.kind))
+                .map(|asset| (asset.url.as_str(), asset))
                 .collect()
         })
         .unwrap_or_default()

@@ -204,6 +204,10 @@ impl Archive {
             status: new.status,
             media_type: new.media_type.clone(),
             body: self.write_body(&new.body)?,
+            // A caller that stored this as a fallback rendition says so itself, after the
+            // fact: whether an address was the widest a `srcset` offered is not something
+            // the bytes that came back can answer.
+            is_fallback: false,
         })
     }
 

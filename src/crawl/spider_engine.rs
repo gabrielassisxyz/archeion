@@ -20,6 +20,7 @@ use lol_html::{HtmlRewriter, MemorySettings, Settings, element};
 use spider::configuration::RedirectPolicy;
 use spider::packages::robotparser::parser::Entry;
 use spider::page::Page;
+use spider::reqwest::Client;
 use spider::reqwest::header::{CONTENT_LENGTH, COOKIE, HeaderMap, HeaderValue, SET_COOKIE};
 use spider::tokio::runtime::{Builder, Runtime};
 use spider::tokio::sync::broadcast::Receiver;
@@ -328,16 +329,20 @@ async fn crawl_seed(
 
 /// The site's own rules, read out of the engine's parse of its `robots.txt`.
 ///
-/// The file is fetched here rather than by the crawl, and it is still fetched once: driving
-/// `configure_robots_parser` before `crawl()` sets the parser's `mtime`, and the engine's own
-/// setup skips a file it already has. Doing it here is what makes the rules available before
-/// the first page rather than after the last, and it also covers a case the engine's setup
-/// skips outright, a crawl limited to a single page, which is a crawl `docs/cli.md` promises
-/// respects `robots.txt` like any other.
+/// The file is fetched here rather than by the crawl, which is what makes the rules available
+/// before the first page rather than after the last, and it also covers a case the engine's
+/// setup skips outright, a crawl limited to a single page, which is a crawl `docs/cli.md`
+/// promises respects `robots.txt` like any other.
 ///
-/// Only the matching is redone. The groups, the comments, the percent-decoding and the empty
-/// `Disallow:` are the engine's reading of the file, and re-reading them here would be a
-/// second opinion about what the file says rather than about what one of its rules matches.
+/// The groups and the empty `Disallow:` are still the engine's reading of the file, and
+/// re-reading them here would be a second opinion about what the file says rather than about
+/// what one of its rules matches. Every rule's pattern is not, in the one case the vendored
+/// parser's own decode cannot be trusted for: it applies `percent_decode` to a rule's value
+/// unconditionally, which collapses a literal `*` or `$` and an escaped `%2A` or `%24` onto
+/// the same character before this ever sees either one. `needs_raw_rules` is what keeps that
+/// correction from costing every crawl a second request for a file that never used either
+/// character to begin with: `tests/asset_capture.rs` pins that a plain `robots.txt` is asked
+/// for once, and a rule with neither operator has nothing for `raw_rule_lines` to recover.
 async fn robots_rules(website: &mut Website) -> RobotRules {
     let (client, _control) = website.setup_base();
     website.configure_robots_parser(&client).await;
@@ -350,25 +355,157 @@ async fn robots_rules(website: &mut Website) -> RobotRules {
     // through `is_allowed_robots` before fetching it, so a run archives nothing at all and
     // this is never asked. Reading the flags anyway would be a second copy of a decision that
     // has no case left to decide.
-    let groups = parser
+    let entries: Vec<&Entry> = parser
         .get_entries()
         .iter()
         .chain(std::iter::once(parser.get_base_entry()))
-        .map(group_of)
+        .collect();
+    let raw_lines = if needs_raw_rules(&entries) {
+        raw_rule_lines(&client, website.get_url_parsed()).await
+    } else {
+        Vec::new()
+    };
+    let mut raw_lines = raw_lines.into_iter();
+    let groups = entries
+        .into_iter()
+        .map(|entry| group_of(entry, &mut raw_lines))
         .collect();
     RobotRules::for_agent(groups, USER_AGENT)
+}
+
+/// Whether any already-decoded rule could have come from an escaped `%2A` or `%24`: the
+/// vendored parser's decode is the identity function on every other octet this matcher
+/// treats specially, so a pattern with neither character present, decoded or otherwise,
+/// cannot have lost anything a second fetch would recover.
+fn needs_raw_rules(entries: &[&Entry]) -> bool {
+    entries
+        .iter()
+        .flat_map(|entry| &entry.rulelines)
+        .any(|line| line.path.contains(['*', '$']))
+}
+
+/// One `Allow:` or `Disallow:` line exactly as `robots.txt` spelled its value, read before
+/// anything decodes it.
+struct RawRuleLine {
+    raw_pattern: String,
+    allowed: bool,
+}
+
+/// The same `robots.txt` the vendored parser already read, fetched again through the same
+/// client so `group_of` can hand the matcher a rule's undecoded spelling instead of the
+/// vendor's fully percent-decoded one. A second request is the cost of that, paid only when
+/// `needs_raw_rules` found a reason to: the vendored parser's `path` field is the only thing
+/// it publishes for a rule, decoding already applied and irreversible, so there is no way to
+/// recover an escaped octet from it after the fact.
+///
+/// Scanning here is deliberately shallow, a comment stripped, a line trimmed, a keyword
+/// matched case-insensitively, rather than a second copy of the vendored parser's grouping.
+/// It does not need to be a full parse: `group_of` below only consumes a candidate whose
+/// fully-decoded value and allowance match the vendored `RuleLine` it is currently reading,
+/// so a line this scan wrongly includes (one before any `User-agent:` line, or one from a
+/// second `User-agent: *` group the vendored parser already drops) is simply never claimed by
+/// anything and costs nothing.
+///
+/// A fetch that fails, or a response that is not valid UTF-8, leaves the caller with no raw
+/// lines at all: `group_of` then falls back to the vendor's decoded spelling for every rule,
+/// which is the behavior this bead found and not a new failure this introduces.
+async fn raw_rule_lines(client: &Client, base_url: &Option<Box<Url>>) -> Vec<RawRuleLine> {
+    let Some(base_url) = base_url.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(robots_url) = base_url.join("/robots.txt") else {
+        return Vec::new();
+    };
+    let Ok(response) = client.get(robots_url).send().await else {
+        return Vec::new();
+    };
+    let Ok(text) = response.text().await else {
+        return Vec::new();
+    };
+
+    let mut seen_user_agent = false;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let line = match line.find('#') {
+            Some(hash) => &line[..hash],
+            None => line,
+        }
+        .trim();
+        let Some(colon) = line.find(':') else {
+            continue;
+        };
+        let keyword = line[..colon].trim();
+        let value = line[colon + 1..].trim();
+        if keyword.eq_ignore_ascii_case("user-agent") {
+            seen_user_agent = true;
+        } else if seen_user_agent && keyword.eq_ignore_ascii_case("disallow") {
+            lines.push(RawRuleLine {
+                raw_pattern: value.to_owned(),
+                allowed: false,
+            });
+        } else if seen_user_agent && keyword.eq_ignore_ascii_case("allow") {
+            lines.push(RawRuleLine {
+                raw_pattern: value.to_owned(),
+                allowed: true,
+            });
+        }
+    }
+    lines
+}
+
+/// What the vendored parser's own `percent_decode` reduces a rule's raw value to, applied the
+/// same way here so a candidate from `raw_rule_lines` can be matched against the `RuleLine`
+/// the vendored parser produced from it. This is not the RFC 9309 representation the matcher
+/// wants; it is the lossy one the matcher does not, and it exists only to recognize which
+/// raw line a decoded `RuleLine` came from.
+fn vendor_percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let decoded = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match decoded {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_default()
 }
 
 /// One parsed group, as this project's own matcher wants it. The engine keeps the groups that
 /// name a crawler apart from the one that names `*`, which it holds as a base entry; both are
 /// ordinary groups here, since which of them applies is the question the matcher answers.
-fn group_of(entry: &Entry) -> Group {
+///
+/// `raw_lines` is consumed in file order and never rewound: for each of `entry`'s rules, it is
+/// advanced past every candidate that does not decode to that rule's own path and allowance,
+/// and the first one that does is what the pattern is built from. An empty `raw_lines` (no
+/// second fetch happened, or none is left) falls back to the vendored parser's own decoded
+/// path, unchanged from before this module normalized anything.
+fn group_of(entry: &Entry, raw_lines: &mut impl Iterator<Item = RawRuleLine>) -> Group {
     Group {
         agents: entry.useragents.clone(),
         rules: entry
             .rulelines
             .iter()
-            .map(|line| Rule::new(line.path.clone(), line.allowance))
+            .map(|line| {
+                let raw = raw_lines.find(|candidate| {
+                    candidate.allowed == line.allowance
+                        && vendor_percent_decode(&candidate.raw_pattern) == line.path
+                });
+                let pattern =
+                    raw.map_or_else(|| line.path.clone(), |candidate| candidate.raw_pattern);
+                Rule::new(pattern, line.allowance)
+            })
             .collect(),
     }
 }
@@ -1810,11 +1947,12 @@ mod tests {
             "the parser stopped keeping repeated groups for one agent apart"
         );
 
+        let mut raw_lines = std::iter::empty();
         let groups = parser
             .get_entries()
             .iter()
             .chain(std::iter::once(parser.get_base_entry()))
-            .map(group_of)
+            .map(|entry| group_of(entry, &mut raw_lines))
             .collect();
         let rules = RobotRules::for_agent(groups, USER_AGENT);
         assert!(!rules.allows("https://example.test/first"));

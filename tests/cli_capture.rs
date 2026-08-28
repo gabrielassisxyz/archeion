@@ -639,6 +639,116 @@ fn answer_with_wildcard_robots_rules(mut stream: TcpStream) -> std::io::Result<(
     stream.flush()
 }
 
+const ROBOTS_TXT_WITH_A_PERCENT_ENCODED_WILDCARD: &str =
+    "User-agent: *\nDisallow: /file-%2A.html\n";
+const PERCENT_ENCODED_WILDCARD_SEED_PAGE: &str = r#"<html><head><title>Home</title></head><body>
+    <a href="/file-%2A.html">the literal path the rule names</a>
+    <a href="/file-anything.html">a path only a wildcard misreading would catch</a>
+    </body></html>"#;
+
+/// The over-refusal this bead exists to close: the vendored parser's own percent-decode
+/// collapses `%2A` into the wildcard operator's character before this project's matcher ever
+/// sees the rule, so a `Disallow` written against one literal path started refusing every
+/// path the operator would have matched. Driven end to end through the binary and the real
+/// engine, past the vendored parser's decode, which is where the collapse happens; a unit
+/// test against the matcher alone would not exercise it.
+#[test]
+fn a_percent_encoded_wildcard_in_a_disallow_rule_refuses_only_the_literal_path() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let port = serve_a_site_whose_robots_escapes_a_wildcard();
+    let seed = format!("http://127.0.0.1:{port}/");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(&seed)
+        .args([
+            "--max-pages",
+            "10",
+            "--max-depth",
+            "1",
+            "--concurrency",
+            "4",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(stderr_of(&output), "");
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    let archived = |path: &str| {
+        let url = CanonicalUrl::parse(&format!("{seed}{path}")).expect("valid url");
+        !archive
+            .list_captures(&url)
+            .expect("captures are listed")
+            .is_empty()
+    };
+    assert!(
+        !archived("file-%2A.html"),
+        "the literal path the rule names was archived anyway"
+    );
+    assert!(
+        archived("file-anything.html"),
+        "a percent-encoded wildcard was read as the operator and over-refused an unrelated path"
+    );
+}
+
+fn serve_a_site_whose_robots_escapes_a_wildcard() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || answer_with_an_escaped_wildcard_robots_rule(stream));
+        }
+    });
+    port
+}
+
+fn answer_with_an_escaped_wildcard_robots_rule(mut stream: TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    let page = |title: &str| {
+        format!("<html><head><title>{title}</title></head><body>a page</body></html>")
+    };
+    let (media_type, body): (&str, Vec<u8>) = match path.as_str() {
+        "/robots.txt" => (
+            "text/plain",
+            ROBOTS_TXT_WITH_A_PERCENT_ENCODED_WILDCARD
+                .as_bytes()
+                .to_vec(),
+        ),
+        "/" => (
+            "text/html; charset=utf-8",
+            PERCENT_ENCODED_WILDCARD_SEED_PAGE.as_bytes().to_vec(),
+        ),
+        _ => ("text/html; charset=utf-8", page(&path).into_bytes()),
+    };
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {media_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()
+}
+
 /// The other way a discovered link can look lost without being lost: not a rule that
 /// refused it, but a spelling the two sides of the comparison read differently. Two shapes
 /// pages in the wild actually write: an entity inside an href rather than the character it

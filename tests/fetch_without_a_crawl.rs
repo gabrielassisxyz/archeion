@@ -39,7 +39,7 @@ fn a_fetch_with_no_crawl_before_it_reaches_the_server() {
     // So a fetch that cannot send fails this test rather than hanging the suite.
     seed.request_timeout = Duration::from_secs(10);
 
-    let event = SpiderEngine.fetch(&url, &seed);
+    let event = SpiderEngine::default().fetch(&url, &seed);
 
     match event {
         PageEvent::Response(response) => {

@@ -51,7 +51,7 @@ pub fn repass(
     let options = RepassOptions {
         allow_private_addresses,
     };
-    let (run, failure) = match repass_archive(&SpiderEngine, &archive, &rules, options) {
+    let (run, failure) = match repass_archive(&SpiderEngine::default(), &archive, &rules, options) {
         Ok(run) => (run, None),
         Err(RepassError::Storage { source, run }) => (*run, Some(source)),
     };

@@ -10,10 +10,11 @@
 //! against a fake host in `src/sitemap.rs`, without paying for a round trip through a real
 //! server to say the same thing.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Output};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use archeion::CanonicalUrl;
@@ -47,6 +48,9 @@ struct Route {
 /// turn would hold every later request behind whichever connection was opened first.
 struct Site {
     port: u16,
+    /// How many times each path was asked for, kept so a test can assert on a request count
+    /// rather than only on what the response contained.
+    counts: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl Site {
@@ -55,21 +59,39 @@ impl Site {
     fn bind() -> (TcpListener, Self) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
         let port = listener.local_addr().expect("the bound address").port();
-        (listener, Self { port })
+        (
+            listener,
+            Self {
+                port,
+                counts: Arc::new(Mutex::new(HashMap::new())),
+            },
+        )
     }
 
-    fn serve(listener: TcpListener, routes: Vec<Route>) {
+    fn serve(&self, listener: TcpListener, routes: Vec<Route>) {
         let routes = Arc::new(routes);
+        let counts = Arc::clone(&self.counts);
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let routes = Arc::clone(&routes);
-                thread::spawn(move || answer(stream, &routes));
+                let counts = Arc::clone(&counts);
+                thread::spawn(move || answer(stream, &routes, &counts));
             }
         });
     }
 
     fn url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    /// How many requests this server has answered for `path` so far.
+    fn requests_for(&self, path: &str) -> usize {
+        self.counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(path)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -82,7 +104,11 @@ fn route(path: &'static str, media_type: &'static str, body: impl Into<String>) 
     }
 }
 
-fn answer(mut stream: TcpStream, routes: &[Route]) -> std::io::Result<()> {
+fn answer(
+    mut stream: TcpStream,
+    routes: &[Route],
+    counts: &Mutex<HashMap<String, usize>>,
+) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
@@ -98,6 +124,11 @@ fn answer(mut stream: TcpStream, routes: &[Route]) -> std::io::Result<()> {
         .nth(1)
         .unwrap_or_default()
         .to_owned();
+    *counts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(path.clone())
+        .or_insert(0) += 1;
     let found = routes.iter().find(|route| route.path == path);
     let (status, media_type, body): (&str, &str, &str) = match found {
         Some(route) => (route.status, route.media_type, &route.body),
@@ -172,7 +203,7 @@ fn a_sitemap_lists_pages_nothing_links_to_and_all_of_them_are_archived() {
     for path in posts {
         routes.push(route(path, "text/html; charset=utf-8", LONE_PAGE));
     }
-    Site::serve(listener, routes);
+    site.serve(listener, routes);
 
     let output = capture_command(&archive_path, &site.url("/index.html"))
         .arg("--from-sitemap")
@@ -213,7 +244,7 @@ fn with_no_directive_the_fallback_sitemap_is_read() {
     let archive_path = dir.path().join("collection");
     let (listener, site) = Site::bind();
     let listed = vec![site.url("/posts/only")];
-    Site::serve(
+    site.serve(
         listener,
         vec![
             route("/index.html", "text/html; charset=utf-8", LONE_PAGE),
@@ -253,7 +284,7 @@ fn a_url_on_another_host_is_refused_and_the_rest_are_archived() {
         "https://elsewhere.example/stolen".to_owned(),
         site.url("/posts/b"),
     ];
-    Site::serve(
+    site.serve(
         listener,
         vec![
             route("/index.html", "text/html; charset=utf-8", LONE_PAGE),
@@ -297,7 +328,7 @@ fn an_unparseable_sitemap_is_warned_about_and_the_seed_is_still_archived() {
     let dir = TempDir::new().expect("temp dir");
     let archive_path = dir.path().join("collection");
     let (listener, site) = Site::bind();
-    Site::serve(
+    site.serve(
         listener,
         vec![
             route("/index.html", "text/html; charset=utf-8", LONE_PAGE),
@@ -365,7 +396,7 @@ fn a_ceiling_is_the_whole_run_s_and_not_each_phase_s() {
     for path in ["/s/1", "/s/2", "/s/3"] {
         routes.push(route(path, "text/html; charset=utf-8", LONE_PAGE));
     }
-    Site::serve(listener, routes);
+    site.serve(listener, routes);
 
     let output = archeion()
         .arg("capture")
@@ -417,7 +448,7 @@ fn a_sub_crawl_from_a_listed_url_is_bounded_by_what_the_run_has_left() {
     for path in ["/s/1a", "/s/1b", "/s/1c"] {
         routes.push(route(path, "text/html; charset=utf-8", LONE_PAGE));
     }
-    Site::serve(listener, routes);
+    site.serve(listener, routes);
 
     let output = archeion()
         .arg("capture")
@@ -459,7 +490,7 @@ fn a_run_with_nothing_left_to_spend_does_not_ask_for_a_sitemap() {
     for path in ["/s/1", "/s/2", "/s/3"] {
         routes.push(route(path, "text/html; charset=utf-8", LONE_PAGE));
     }
-    Site::serve(listener, routes);
+    site.serve(listener, routes);
 
     let output = archeion()
         .arg("capture")
@@ -483,4 +514,252 @@ fn a_run_with_nothing_left_to_spend_does_not_ask_for_a_sitemap() {
         "the listing was read by a run that could not archive a page of it: {}",
         stdout_of(&output)
     );
+}
+
+/// Each listed URL becomes its own seed once `--max-depth` is given, and each seed used to
+/// crawl behind a freshly built engine that had never read this host's `robots.txt` before,
+/// so a sitemap of five posts cost the host five requests for the same small file on top of
+/// the one the ordinary crawl of the seed already made. The engine is reused across seeds
+/// that share a host instead, which is what a run over any number of listed URLs owes the
+/// host once and never again.
+#[test]
+fn a_sitemap_run_with_an_explicit_depth_reads_robots_txt_once_for_every_listed_url() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let (listener, site) = Site::bind();
+    let posts = ["/posts/1", "/posts/2", "/posts/3", "/posts/4", "/posts/5"];
+    let listed: Vec<String> = posts.iter().map(|path| site.url(path)).collect();
+    let mut routes = vec![
+        route("/index.html", "text/html; charset=utf-8", LONE_PAGE),
+        route("/robots.txt", "text/plain", "User-agent: *\nAllow: /\n"),
+        route("/sitemap.xml", "application/xml", urlset(&listed)),
+    ];
+    for path in posts {
+        routes.push(route(path, "text/html; charset=utf-8", LONE_PAGE));
+    }
+    site.serve(listener, routes);
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(site.url("/index.html"))
+        .args(["--max-pages", "10", "--max-depth", "1"])
+        .args(["--concurrency", "4", "--max-retries", "0"])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .args(["--from-sitemap", &site.url("/sitemap.xml")])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stdout_of(&output).contains("archived 6 capture(s)"),
+        "{}",
+        stdout_of(&output)
+    );
+    assert_eq!(
+        site.requests_for("/robots.txt"),
+        1,
+        "the crawl of the seed and its five sub-crawls did not share one robots.txt request"
+    );
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    for path in posts {
+        let url = CanonicalUrl::parse(&site.url(path)).expect("valid url");
+        assert!(
+            !archive
+                .list_captures(&url)
+                .expect("captures are listed")
+                .is_empty(),
+            "{path} was not archived, even though the request count assumed it was"
+        );
+    }
+}
+
+/// The companion to the test above: a run given no `--max-depth` fetches each listed URL
+/// through `engine.fetch`, not `engine.crawl`, and that path was never the one asking the
+/// engine's own crawler to read `robots.txt` in the first place, before this change or after
+/// it. The one request counted here is `read_sitemap`'s own, made to find the `Sitemap:`
+/// directive, which this run leaves untouched.
+#[test]
+fn a_sitemap_run_with_no_explicit_depth_keeps_its_own_robots_txt_request_pattern() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let (listener, site) = Site::bind();
+    let posts = ["/posts/1", "/posts/2", "/posts/3"];
+    let listed: Vec<String> = posts.iter().map(|path| site.url(path)).collect();
+    let mut routes = vec![
+        route("/index.html", "text/html; charset=utf-8", LONE_PAGE),
+        route("/robots.txt", "text/plain", "User-agent: *\nAllow: /\n"),
+        route("/sitemap.xml", "application/xml", urlset(&listed)),
+    ];
+    for path in posts {
+        routes.push(route(path, "text/html; charset=utf-8", LONE_PAGE));
+    }
+    site.serve(listener, routes);
+
+    let output = capture_command(&archive_path, &site.url("/index.html"))
+        .arg("--from-sitemap")
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stdout_of(&output).contains("archived 4 capture(s)"),
+        "{}",
+        stdout_of(&output)
+    );
+    assert_eq!(
+        site.requests_for("/robots.txt"),
+        1,
+        "a run with no explicit depth changed how often it reads robots.txt"
+    );
+}
+
+/// The reuse above only ever skips a repeated fetch of the file; it must not skip refusing
+/// what the file, read once, already said. The `Disallow` here carries an interior wildcard,
+/// which the engine's own matcher reads as a literal and therefore fetches anyway (see
+/// `src/crawl/robots.rs`), so what refuses `/posts/2` afterward is this project's own
+/// re-matching of the cached parser's rules against every sub-crawl the reuse hands it, not
+/// only the one that happened to trigger the read.
+///
+/// The count below is two rather than one because this `robots.txt` is exactly the shape
+/// `src/crawl/robots.rs`'s own percent-encoding fix has to treat as suspect: a rule
+/// containing `*` might have gotten there from an escaped `%2A`, which the vendored parser's
+/// decode cannot be told apart from a literal one, so recovering the file's raw, undecoded
+/// bytes is the only way to know which. That recovery is its own request, bounded to at most
+/// once per origin exactly as the `Website` reuse above bounds the vendored fetch, so the
+/// total here is the two together and not one growing with the number of sub-crawls.
+#[test]
+fn a_url_the_reused_engine_s_robots_file_disallows_is_still_refused() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let (listener, site) = Site::bind();
+    let posts = ["/posts/1", "/posts/2", "/posts/3", "/posts/4"];
+    let listed: Vec<String> = posts.iter().map(|path| site.url(path)).collect();
+    let mut routes = vec![
+        route("/index.html", "text/html; charset=utf-8", LONE_PAGE),
+        route(
+            "/robots.txt",
+            "text/plain",
+            "User-agent: *\nDisallow: /pos*/2\n",
+        ),
+        route("/sitemap.xml", "application/xml", urlset(&listed)),
+    ];
+    for path in posts {
+        routes.push(route(path, "text/html; charset=utf-8", LONE_PAGE));
+    }
+    site.serve(listener, routes);
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(site.url("/index.html"))
+        .args(["--max-pages", "10", "--max-depth", "1"])
+        .args(["--concurrency", "4", "--max-retries", "0"])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .args(["--from-sitemap", &site.url("/sitemap.xml")])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stdout_of(&output).contains("archived 4 capture(s)"),
+        "{}",
+        stdout_of(&output)
+    );
+    assert_eq!(
+        site.requests_for("/robots.txt"),
+        2,
+        "the vendored fetch and the raw-encoding recovery should each run at most once, \
+         not once per sub-crawl"
+    );
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    for path in ["/posts/1", "/posts/3", "/posts/4"] {
+        let url = CanonicalUrl::parse(&site.url(path)).expect("valid url");
+        assert!(
+            !archive
+                .list_captures(&url)
+                .expect("captures are listed")
+                .is_empty(),
+            "{path} was allowed by robots.txt and should have been archived"
+        );
+    }
+    let disallowed = CanonicalUrl::parse(&site.url("/posts/2")).expect("valid url");
+    assert!(
+        archive
+            .list_captures(&disallowed)
+            .expect("captures are listed")
+            .is_empty(),
+        "a URL the reused engine's robots.txt disallowed was archived anyway"
+    );
+}
+
+/// The regression a merge with the percent-encoding fix (`src/crawl/robots.rs`) could
+/// reintroduce. That fix reads `robots.txt` a second time, past the vendored parser's own
+/// decode, whenever a rule contains `*` or `$`, since only the file's raw bytes tell an
+/// escaped `%2A` apart from a literal `*`. `robots_rules` runs once per sub-crawl, so without
+/// its own bound that second request would cost one per listed URL on top of the vendored
+/// one, which is exactly the traffic the `Website` reuse above exists to remove, reopened
+/// through this fetch instead. It is bound to at most one recovery per origin, the same scope
+/// the `Website` cache uses, so the total here stays at two no matter how many URLs the
+/// sitemap lists.
+#[test]
+fn a_wildcard_robots_rule_costs_at_most_one_extra_request_across_a_sitemap_run() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let (listener, site) = Site::bind();
+    let posts = ["/posts/1", "/posts/2", "/posts/3", "/posts/4", "/posts/5"];
+    let listed: Vec<String> = posts.iter().map(|path| site.url(path)).collect();
+    let mut routes = vec![
+        route("/index.html", "text/html; charset=utf-8", LONE_PAGE),
+        route(
+            "/robots.txt",
+            "text/plain",
+            "User-agent: *\nDisallow: /never/*/matches\n",
+        ),
+        route("/sitemap.xml", "application/xml", urlset(&listed)),
+    ];
+    for path in posts {
+        routes.push(route(path, "text/html; charset=utf-8", LONE_PAGE));
+    }
+    site.serve(listener, routes);
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(site.url("/index.html"))
+        .args(["--max-pages", "10", "--max-depth", "1"])
+        .args(["--concurrency", "4", "--max-retries", "0"])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .args(["--from-sitemap", &site.url("/sitemap.xml")])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stdout_of(&output).contains("archived 6 capture(s)"),
+        "{}",
+        stdout_of(&output)
+    );
+    let robots_requests = site.requests_for("/robots.txt");
+    assert!(
+        robots_requests <= 2,
+        "a wildcard rule cost more than one vendored fetch plus one raw-encoding recovery \
+         across the sitemap's five sub-crawls: {robots_requests} requests"
+    );
+
+    // Every listed URL is still archived, so the request count above cannot have passed by
+    // way of a crawl that skipped the sub-crawls rather than sharing their robots.txt cost.
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    for path in posts {
+        let url = CanonicalUrl::parse(&site.url(path)).expect("valid url");
+        assert!(
+            !archive
+                .list_captures(&url)
+                .expect("captures are listed")
+                .is_empty(),
+            "{path} was not archived, so the request count above could have passed by doing nothing"
+        );
+    }
 }

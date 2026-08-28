@@ -39,8 +39,13 @@ fn a_page_is_archived_with_the_files_it_referenced_fetched_for_real() {
     let archive = Archive::open(dir.path()).expect("the archive opens");
     let site = Site::start();
 
-    let run = capture_seed(&SpiderEngine, &archive, &site.seed(), &SiteRules::default())
-        .expect("the run completes");
+    let run = capture_seed(
+        &SpiderEngine::default(),
+        &archive,
+        &site.seed(),
+        &SiteRules::default(),
+    )
+    .expect("the run completes");
 
     assert_eq!(run.captures_written, 1, "{run:#?}");
     assert_eq!(run.assets_stored, 2, "{run:#?}");

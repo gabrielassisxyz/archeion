@@ -508,7 +508,7 @@ The same `rules` rule applies here as on an article or refusal. It is `heuristic
 
 `rules` names how the prose in this record was obtained: `heuristic` when nothing was said about the host or when what was said matched nothing on this page, `site:<host>` when a rule actually reached it, and `served` when nothing scored anything because the response already was the prose. It stays one string across all three, because every reader that filters on it compares it to a string and turning it into an object would break all of them for nothing. A value this extractor cannot account for is refused rather than read as `heuristic`, which would claim a page was read with nothing said about it, and that refusal is what keeps a reader written before `served` existed from misreading one of those records rather than turning one away.
 
-A record for a document the site published looks like this. It carries no excerpt and no byline because nothing derived them, no declaration because a Markdown document has no JSON-LD for anything to read, and its two counts are equal because the document is the whole page:
+A record for a document the site published looks like this. `excerpt` and `byline` are `null` because nothing derived them, `accessible_for_free` is `null` because a Markdown document has no JSON-LD for anything to read, and its two counts are equal because the document is the whole page:
 
 ```json
 {
@@ -520,6 +520,9 @@ A record for a document the site published looks like this. It carries no excerp
     "article_chars": 6120,
     "page_chars": 6120
   },
+  "excerpt": null,
+  "byline": null,
+  "accessible_for_free": null,
   "cost": {
     "document_bytes": 7104,
     "peak_open_elements": 6

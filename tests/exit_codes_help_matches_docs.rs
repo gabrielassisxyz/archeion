@@ -13,9 +13,9 @@ fn archeion() -> Command {
 
 /// A code's description is one or more causes. A trailing `, or <last cause>` is the
 /// enumeration this project writes when a code can happen for more than one reason; anything
-/// else is a single cause, and a comma inside it (a clarifying aside, not a second reason) is
-/// not a second entry. Splitting on that distinction, rather than on every comma, is what
-/// keeps this from flagging `docs/cli.md`'s terser code-0 row against `--help`'s fuller one.
+/// else is a single cause, and the whole description is that cause, comma or no comma. There
+/// is no branch here that stops comparing partway through a description: a clause added to
+/// either side, anywhere, changes what this returns.
 fn causes(description: &str) -> Vec<String> {
     let description = description.trim();
     if description.contains(", or ") {
@@ -30,14 +30,7 @@ fn causes(description: &str) -> Vec<String> {
         }
         parts
     } else {
-        vec![
-            description
-                .split(',')
-                .next()
-                .unwrap_or(description)
-                .trim()
-                .to_string(),
-        ]
+        vec![description.to_string()]
     }
 }
 

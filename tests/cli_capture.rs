@@ -14,6 +14,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Output};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -755,13 +756,15 @@ fn answer_with_an_escaped_wildcard_robots_rule(mut stream: TcpStream) -> std::io
 /// stands for, and a non-ASCII character percent-encoded rather than written literally.
 /// Both still have to end up archived and unreported.
 ///
-/// This does not assert what either linked page's canonical URL comes out as. The engine's
-/// own link extraction turns out not to decode the entity before it is joined into a URL,
-/// which is a real defect and not this one: it mis-parses the query string rather than
-/// losing the link, and both sides of the comparison this guard runs are wrong about the
-/// address in exactly the same way, so nothing here disagrees with anything else. What is
-/// asserted is the part that is this bead's to answer: both links are still followed, still
-/// archived, and never reported as ones the crawl discovered and did not fetch.
+/// This does not assert what either linked page's canonical URL comes out as. `push_link`
+/// still joins the entity-carrying href into a URL before anything decodes it; what
+/// `arch-42q` added is a second resolution of the same href, decoded, that `hop_depth_guard`
+/// records instead of the undecoded one and that `rewrite_escaped_href` hands the engine in
+/// place of the address it resolved, so the two sides of the comparison this guard runs
+/// agree on the corrected spelling rather than agreeing on the wrong one. What is asserted
+/// here is the part that predates that fix and stays true regardless: both links are still
+/// followed, still archived, and never reported as ones the crawl discovered and did not
+/// fetch.
 #[test]
 fn a_link_whose_href_spells_its_query_string_with_an_entity_is_archived_and_not_reported_lost() {
     let dir = TempDir::new().expect("temp dir");
@@ -798,6 +801,168 @@ fn a_link_whose_href_spells_its_query_string_with_an_entity_is_archived_and_not_
         "{}",
         stdout_of(&output)
     );
+}
+
+/// A loopback site that remembers the path and query of every request it answered, so a
+/// test can assert what the server actually received rather than what the archive ended up
+/// holding once canonicalization has already folded a decoded and an undecoded spelling of
+/// the same address into one item. `Site` above has no reason to do this: nothing else in
+/// this file needs to tell one request from a second one on the same path.
+struct RecordingSite {
+    port: u16,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl RecordingSite {
+    /// `index_body` is served for `/index.html`; any other path answers with a page fixed
+    /// enough to prove it was reached without saying anything about which address reached
+    /// it, since the address itself is what the test is asking about.
+    fn start(index_body: &'static str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("the bound address").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_thread = requests.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let requests = requests_for_thread.clone();
+                thread::spawn(move || answer_and_record(stream, index_body, requests));
+            }
+        });
+        Self { port, requests }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    /// Every request line seen so far whose path starts with `prefix`, in arrival order.
+    fn requests_for(&self, prefix: &str) -> Vec<String> {
+        self.requests
+            .lock()
+            .expect("the request log")
+            .iter()
+            .filter(|line| line.starts_with(prefix))
+            .cloned()
+            .collect()
+    }
+}
+
+fn answer_and_record(
+    mut stream: TcpStream,
+    index_body: &str,
+    requests: Arc<Mutex<Vec<String>>>,
+) -> std::io::Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    requests.lock().expect("the request log").push(path.clone());
+    let (status, body): (&str, &[u8]) = if path == "/robots.txt" {
+        ("404 Not Found", b"")
+    } else if path == "/index.html" {
+        ("200 OK", index_body.as_bytes())
+    } else {
+        (
+            "200 OK",
+            b"<html><head><title>Post</title></head><body>found</body></html>",
+        )
+    };
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
+/// Drives a real crawl against a page whose only link spells the query separator with
+/// `separator`, one of the three character references the HTML standard defines for `&`,
+/// and asserts what the server actually saw: one request, carrying the query the page
+/// meant rather than the escape or the fragment a URL parser cuts it into. `push_link`
+/// resolves the href before anything decodes it, so before `arch-42q` the server received
+/// either the escape verbatim or a query truncated at a `#` that was never part of the
+/// page's own address; this is `hop_depth_guard`'s `corrected_resolution` and
+/// `rewrite_escaped_href` proven at the socket rather than read back out of the archive.
+fn a_character_reference_in_the_query_separator_reaches_the_server_decoded(separator: &str) {
+    let index = format!(
+        r#"<html><head><title>Index</title></head>
+        <body><a href="/post?x=1{separator}y=2">the post</a></body></html>"#
+    );
+    let index: &'static str = Box::leak(index.into_boxed_str());
+    let site = RecordingSite::start(index);
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(site.url("/index.html"))
+        .args([
+            "--max-pages",
+            "4",
+            "--max-depth",
+            "1",
+            "--concurrency",
+            "1",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stdout_of(&output).contains("archived 2 capture(s)"),
+        "{}",
+        stdout_of(&output)
+    );
+    assert!(
+        stdout_of(&output).contains("links lost    0"),
+        "{}",
+        stdout_of(&output)
+    );
+
+    assert_eq!(
+        site.requests_for("/post"),
+        vec!["/post?x=1&y=2".to_string()],
+        "the request(s) the server received for the {separator:?} spelling"
+    );
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    let post = CanonicalUrl::parse(&site.url("/post?x=1&y=2")).expect("valid url");
+    assert_eq!(
+        archive
+            .list_captures(&post)
+            .expect("captures are listed")
+            .len(),
+        1,
+        "the post should be filed as a single item regardless of how its link spelled `&`"
+    );
+}
+
+#[test]
+fn an_escaped_ampersand_in_the_query_separator_reaches_the_server_decoded() {
+    a_character_reference_in_the_query_separator_reaches_the_server_decoded("&amp;");
+}
+
+#[test]
+fn a_decimal_character_reference_in_the_query_separator_reaches_the_server_decoded() {
+    a_character_reference_in_the_query_separator_reaches_the_server_decoded("&#38;");
+}
+
+#[test]
+fn a_hex_character_reference_in_the_query_separator_reaches_the_server_decoded() {
+    a_character_reference_in_the_query_separator_reaches_the_server_decoded("&#x26;");
 }
 
 /// The mirror of the case above and the one seen on real sites: an absolute self link

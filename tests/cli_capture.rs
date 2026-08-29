@@ -870,16 +870,35 @@ fn recovery_answered_with_a_status_the_crawl_would_have_retried_stays_lost() {
         "the retry budget was not spent: one attempt plus two retries is three requests"
     );
 
-    // Still archived, because a capture is what the server answered: `filter_and_forward`
-    // gates on this project's own robots decision, not on the status recovery already
-    // refused to call a success.
+    // Not archived, and this is the one place recovery and the refusal rule have to agree:
+    // recovery declining to call a 429 a success is a decision about the link, and the
+    // refusal rule not filing it as an item is a decision about the response. A page the
+    // host refused is not an item whichever door it arrived through, so a recovery that
+    // ends in one leaves the address owed rather than a seventeen byte capture behind.
     let archive = Archive::open_existing(&archive_path).expect("the archive exists");
     assert!(
-        !archive
+        archive
             .list_captures(&only_url)
             .expect("captures are listed")
             .is_empty(),
-        "the 429 response itself was not stored"
+        "the 429 was filed as an item rather than left owed"
+    );
+    let owed = archive.read_owed().expect("the owed record reads back");
+    assert_eq!(
+        owed.iter()
+            .map(|address| address.url.as_str())
+            .collect::<Vec<_>>(),
+        vec![only_url.as_str()],
+        "the address recovery gave up on is what the archive says it is owed: {owed:?}"
+    );
+    // One, not the three requests above: recovery retries inside itself and hands the
+    // boundary only the attempt it gave up on, so this counts refusals the archive saw
+    // rather than refusals the host sent.
+    assert_eq!(
+        report["responses_refused"]["429"],
+        1,
+        "the refusal recovery gave up on is still counted as one: {}",
+        stdout_of(&output)
     );
 }
 

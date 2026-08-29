@@ -888,6 +888,9 @@ pub fn owed_addresses(run: &CaptureRun) -> Vec<OwedAddress> {
         unreadable_articles: _,
         pages_dropped: _,
         links_never_followed,
+        // A count of links this run got back, so nothing here is owed: a link recovered was
+        // fetched, and one recovery failed to fetch is in `links_never_followed` above.
+        links_recovered: _,
         assets_stored: _,
         assets_missed: _,
         asset_fetches: _,

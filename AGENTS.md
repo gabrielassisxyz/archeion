@@ -114,6 +114,22 @@
 3. Security risks flagged, if a sensitive surface was touched.
 4. This spec updated if behavior, setup or the release flow changed, and any hurdle it gained is classified rather than merely appended.
 
+## Invariants a change must not break
+
+A task says what the code must start doing. This list says what it must not stop doing, and it exists because that is where the expensive defects come from: a change satisfies every one of its own acceptance criteria and breaks something next to it, which no proof written from those criteria can see. Every entry below has been broken at least once by a change that was correct on its own terms.
+
+**Execution policy.** A run never asks for more pages than `--max-pages`, on any path that reaches a host, including one that fetches outside the crawl frontier. A run never asks for anything after its deadline. Between requests it waits the longer of the operator's `--delay` and the host's own `Crawl-delay`, on every path, and the fact that a pass happens to make its calls one at a time is not a delay. The retry budget and the response byte ceiling apply wherever a request is made.
+
+**Report honesty.** A run never exits zero while a link it discovered, and this project's own rules allow, went unfetched. `stopped` names the bound that actually ended the run, never a different one. Every field the `--json` report already carries keeps its name and its meaning, because a consumer outside this repository parses it; fields may be added.
+
+**Storage.** An item is a page that was served. A capture record is never rewritten after it is filed, since the capture id describes the record. Nothing above the archive walk grows a case for an item that is not a page. The format version moves only for a change an older build could not read.
+
+**Guards.** Every address entering the frontier, by whichever door, passes what a seed passes: the private-address refusal, the redirect screen, the response byte ceiling and the robots decision. A new door is a new place all four have to hold.
+
+**Extraction.** The extractor version moves when articles read differently than before, because a repass is what applies the change to captures already on disk. A selector from a rule file is compiled when the file is read, never where a parse failure would panic.
+
+A task naming a surface above states, before it is claimed, which of these its blast radius can reach, and proves each one it names the same way it proves an acceptance criterion. The `Common hurdles` table below is where the reasoning behind most of them lives.
+
 ## Common hurdles
 
 | hurdle | class | gate |

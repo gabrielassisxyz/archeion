@@ -926,7 +926,11 @@ fn capture_refuses_a_user_agent_carrying_a_control_character() {
         .arg(&archive_path)
         .arg("http://127.0.0.1:1/")
         .args(["--deadline", "5s", "--allow-private-addresses"])
-        .args(["--user-agent", "bad\r\nX-Injected: 1"])
+        .args([
+            "--user-agent",
+            "bad
+X-Injected: 1",
+        ])
         .output()
         .expect("the binary runs");
 
@@ -993,91 +997,104 @@ fn capture_accepts_a_user_agent_carrying_a_non_ascii_character() {
 }
 
 /// A `robots.txt` naming this run's own identity and a `*` group that disagrees with it:
-/// RFC 9309 reads whichever group names the requester and never the other one, so whether
-/// the one linked page is refused turns entirely on the identity the run announced.
+/// RFC 9309 reads whichever group names the requester and never the other one, so whether a
+/// path either one mentions is refused turns entirely on the identity the run announced.
 ///
-/// The seed links to exactly one page rather than one per group. The vendored engine's own
-/// frontier occasionally drops one of two links discovered on the same page before either
-/// is fetched, a race in its own concurrent link handling this project does not own and
-/// cannot fix from this side of the boundary; one discovered link removes the collision
-/// entirely without weakening what this pins, since a single path answered two different
-/// ways across the two runs already shows which group governed each one.
+/// Each crawl below is pointed at a page linking to exactly one target rather than at one
+/// page linking to both. The vendored engine's own frontier occasionally drops one of two
+/// links discovered on the same page before either is fetched, a race in its own concurrent
+/// link handling this project does not own and cannot fix from this side of the boundary.
+/// Two seed pages, `/from-special` and `/from-general`, keep every crawl below to one
+/// discovered link while still reaching both targets, which is what lets this cover both
+/// halves of the claim: that the named group's own rule is obeyed, and that a path outside
+/// it still falls to `*` or to nothing exactly as before this flag existed.
 const ROBOTS_TXT_NAMING_ONE_AGENT: &str = "User-agent: archive-bot\n\
     Disallow: /special-only\n\n\
     User-agent: *\n\
     Disallow: /general-only\n";
-const NAMED_AGENT_ROBOTS_SEED_PAGE: &str = r#"<html><head><title>Home</title></head><body>
+const FROM_SPECIAL_SEED_PAGE: &str = r#"<html><head><title>From special</title></head><body>
+    <a href="/special-only">the named group's rule</a>
+    </body></html>"#;
+const FROM_GENERAL_SEED_PAGE: &str = r#"<html><head><title>From general</title></head><body>
     <a href="/general-only">the wildcard's rule</a>
     </body></html>"#;
 
 /// `--user-agent` reaches the robots matcher, not only the HTTP client: run under the
-/// identity a `robots.txt` names, this crawl is judged against that named group rather than
-/// against `*`, and the same run given no override falls back to `*` exactly as it did
-/// before this flag existed.
+/// identity a `robots.txt` names, a crawl is judged against that named group's own rule
+/// rather than against `*`, a path the named group does not mention still falls to `*`, and
+/// the same two paths swap verdicts when the run falls back to the compiled default exactly
+/// as it did before this flag existed.
 #[test]
 fn captures_robots_group_named_for_the_configured_user_agent() {
     let dir = TempDir::new().expect("temp dir");
-    let seed = format!(
-        "http://127.0.0.1:{}/",
-        serve_a_site_naming_one_agent_in_robots()
-    );
-    let archived = |archive_path: &std::path::Path| {
-        let archive = Archive::open_existing(archive_path).expect("the archive exists");
-        let url = CanonicalUrl::parse(&format!("{seed}general-only")).expect("valid url");
+    let port = serve_a_site_naming_one_agent_in_robots();
+
+    let run = |case: &str, from: &str, target: &str, agent: Option<&str>| -> bool {
+        let seed = format!("http://127.0.0.1:{port}/{from}");
+        let archive_path = dir.path().join(case);
+        let mut command = archeion();
+        command.arg("capture").arg(&archive_path).arg(&seed).args([
+            "--max-pages",
+            "10",
+            "--max-depth",
+            "1",
+            "--concurrency",
+            "1",
+            "--max-retries",
+            "0",
+        ]);
+        if let Some(agent) = agent {
+            command.args(["--user-agent", agent]);
+        }
+        let output = command
+            .args(["--deadline", "30s", "--allow-private-addresses"])
+            .output()
+            .expect("the binary runs");
+        assert!(output.status.success(), "{case}: {}", stderr_of(&output));
+
+        let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+        let url =
+            CanonicalUrl::parse(&format!("http://127.0.0.1:{port}/{target}")).expect("valid url");
         !archive
             .list_captures(&url)
             .expect("captures are listed")
             .is_empty()
     };
 
-    let named_agent_archive = dir.path().join("named-agent");
-    let output = archeion()
-        .arg("capture")
-        .arg(&named_agent_archive)
-        .arg(&seed)
-        .args([
-            "--max-pages",
-            "10",
-            "--max-depth",
-            "1",
-            "--concurrency",
-            "1",
-            "--max-retries",
-            "0",
-            "--user-agent",
-            "archive-bot/9.0",
-        ])
-        .args(["--deadline", "30s", "--allow-private-addresses"])
-        .output()
-        .expect("the binary runs");
-    assert!(output.status.success(), "{}", stderr_of(&output));
     assert!(
-        archived(&named_agent_archive),
-        "the named group's own rule, which does not cover this path, governed instead of it \
-         being left to the wildcard"
+        !run(
+            "named-agent-on-its-own-rule",
+            "from-special",
+            "special-only",
+            Some("archive-bot/9.0"),
+        ),
+        "the named group's own Disallow rule was not applied under the identity it names"
     );
-
-    let default_archive = dir.path().join("default-agent");
-    let output = archeion()
-        .arg("capture")
-        .arg(&default_archive)
-        .arg(&seed)
-        .args([
-            "--max-pages",
-            "10",
-            "--max-depth",
-            "1",
-            "--concurrency",
-            "1",
-            "--max-retries",
-            "0",
-        ])
-        .args(["--deadline", "30s", "--allow-private-addresses"])
-        .output()
-        .expect("the binary runs");
-    assert!(output.status.success(), "{}", stderr_of(&output));
     assert!(
-        !archived(&default_archive),
+        run(
+            "named-agent-outside-its-rule",
+            "from-general",
+            "general-only",
+            Some("archive-bot/9.0"),
+        ),
+        "the wildcard's rule governed a path the named group leaves unmentioned"
+    );
+    assert!(
+        run(
+            "default-agent-outside-the-named-rule",
+            "from-special",
+            "special-only",
+            None,
+        ),
+        "the named group's rule leaked onto the identity it does not name"
+    );
+    assert!(
+        !run(
+            "default-agent-on-the-wildcard-rule",
+            "from-general",
+            "general-only",
+            None,
+        ),
         "the compiled default did not fall back to the wildcard group"
     );
 }
@@ -1110,9 +1127,17 @@ fn answer_naming_one_agent_in_robots(mut stream: TcpStream) -> std::io::Result<(
         .to_owned();
     let (media_type, body): (&str, &[u8]) = match path.as_str() {
         "/robots.txt" => ("text/plain", ROBOTS_TXT_NAMING_ONE_AGENT.as_bytes()),
-        "/" => (
+        "/from-special" => (
             "text/html; charset=utf-8",
-            NAMED_AGENT_ROBOTS_SEED_PAGE.as_bytes(),
+            FROM_SPECIAL_SEED_PAGE.as_bytes(),
+        ),
+        "/from-general" => (
+            "text/html; charset=utf-8",
+            FROM_GENERAL_SEED_PAGE.as_bytes(),
+        ),
+        "/special-only" => (
+            "text/html; charset=utf-8",
+            b"<html><head><title>Special</title></head><body>the named group's page</body></html>",
         ),
         "/general-only" => (
             "text/html; charset=utf-8",

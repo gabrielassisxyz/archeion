@@ -210,6 +210,10 @@ impl<'a> AssetCapture<'a> {
         fetch_order.sort_by_key(|&index| fetch_priority(referenced[index].kind));
 
         let mut outcomes: Vec<Option<Learned>> = vec![None; referenced.len()];
+        // A rendition recovered by falling back beside the primary result rather than in
+        // place of it: the widest candidate's own miss is still what a reader looks for that
+        // address under, and this is the address nobody asked for that turned out to answer.
+        let mut fallbacks_recovered: Vec<Asset> = Vec::new();
         let mut dealt_with = 0usize;
         let mut bytes_spent = 0u64;
         let mut silences = 0usize;
@@ -223,20 +227,19 @@ impl<'a> AssetCapture<'a> {
             // archive and then recorded it as absent, and on a whole publication that was half
             // of every absence reported. It is served for the same reason when the run is out
             // of time or the capture has given up asking.
-            if let Some(known) = self.known.get(&reference.url) {
-                outcomes[index] = Some(known.clone());
-                continue;
-            }
-            if let Some(reason) = no_room_for_another(dealt_with, bytes_spent) {
-                outcomes[index] = Some(Learned::Missed(reason));
+            let learned = if let Some(known) = self.known.get(&reference.url) {
+                known.clone()
+            } else if let Some(reason) = no_room_for_another(dealt_with, bytes_spent) {
                 dealt_with += 1;
-                continue;
-            }
-            let learned = if silences >= MAX_CONSECUTIVE_SILENCES {
+                Learned::Missed(reason)
+            } else if silences >= MAX_CONSECUTIVE_SILENCES {
+                dealt_with += 1;
                 Learned::Missed(AssetMiss::NothingWasAnswering)
             } else if self.out_of_time() {
+                dealt_with += 1;
                 Learned::Missed(AssetMiss::DeadlineReached)
             } else {
+                dealt_with += 1;
                 let asked = self.ask_for(&reference.url)?;
                 bytes_spent = bytes_spent.saturating_add(asked.transferred);
                 match asked.on_the_wire {
@@ -248,8 +251,12 @@ impl<'a> AssetCapture<'a> {
                     .insert(reference.url.clone(), asked.learned.clone());
                 asked.learned
             };
+            if let Some(asset) =
+                self.try_fallback(reference, &learned, &mut bytes_spent, &mut silences)?
+            {
+                fallbacks_recovered.push(asset);
+            }
             outcomes[index] = Some(learned);
-            dealt_with += 1;
         }
 
         let mut captured = CapturedAssets::default();
@@ -259,7 +266,84 @@ impl<'a> AssetCapture<'a> {
                 Learned::Missed(reason) => captured.missed.push(missed(&reference.url, reason)),
             }
         }
+        captured.stored.extend(fallbacks_recovered);
         Ok(captured)
+    }
+
+    /// Tries the next-widest candidate a `srcset` offered, when the one just asked for
+    /// answers false to `retryable_miss`: a 404, a body over the size ceiling, a short
+    /// arrival, or an address the run refused to dial. Those are the misses no later pass
+    /// changes by asking the same address again, which is exactly the state this project's
+    /// own review found leaves a picture with no rendition in the archive at all.
+    ///
+    /// A retryable miss is left alone. The ceiling or the deadline it hit is a fact about
+    /// this capture's own budget rather than about the file, and spending more of that
+    /// budget on a rendition nobody asked for first would make the shortfall worse rather
+    /// than better; a later pass over the same reference already retries the address that
+    /// failed. What runs here for a page that never needs it costs nothing:
+    /// `reference.fallback` is `None` for every asset that is not a `srcset`'s widest
+    /// candidate.
+    ///
+    /// Only the one address is tried, never the rest of what the attribute offered, so a
+    /// page whose widest rendition answers keeps costing exactly what it costs today and a
+    /// page whose widest fails costs one request more rather than one per rendition.
+    ///
+    /// What this returns is additional to `learned`, not a replacement for it: the widest
+    /// candidate's own outcome is reported exactly as it would be without this, address and
+    /// reason both, since that is the address the note and `assets_by_url` still look for.
+    /// A recovered rendition is a second fact about the same reference, not a correction of
+    /// the first one.
+    fn try_fallback(
+        &mut self,
+        reference: &ReferencedAsset,
+        learned: &Learned,
+        bytes_spent: &mut u64,
+        silences: &mut usize,
+    ) -> Result<Option<Asset>, StorageError> {
+        let Learned::Missed(reason) = learned else {
+            return Ok(None);
+        };
+        let Some(fallback_url) = reference.fallback.as_deref() else {
+            return Ok(None);
+        };
+        if retryable_miss(reason) {
+            return Ok(None);
+        }
+        // The same budget the primary address was judged against, since the address about
+        // to be asked for spends the same host's bandwidth and the same run's clock.
+        if *silences >= MAX_CONSECUTIVE_SILENCES
+            || *bytes_spent >= MAX_ASSET_BYTES_PER_CAPTURE
+            || self.out_of_time()
+        {
+            return Ok(None);
+        }
+        let candidate = if let Some(known) = self.known.get(fallback_url) {
+            known.clone()
+        } else {
+            let asked = self.ask_for(fallback_url)?;
+            *bytes_spent = bytes_spent.saturating_add(asked.transferred);
+            match asked.on_the_wire {
+                OnTheWire::Silent => *silences += 1,
+                OnTheWire::Answered => *silences = 0,
+                OnTheWire::NothingSent => {}
+            }
+            self.known
+                .insert(fallback_url.to_owned(), asked.learned.clone());
+            asked.learned
+        };
+        match candidate {
+            // Marked here rather than trusted from the memo: the same address can be
+            // somebody else's own widest candidate, stored and remembered as itself, and
+            // what makes it a fallback is this reference's situation, not a fact about the
+            // bytes.
+            Learned::Stored(asset) => Ok(Some(Asset {
+                is_fallback: true,
+                ..asset
+            })),
+            // The fallback did not answer either. Nothing is added; the widest's own miss,
+            // already in `learned`, is all this reference has to report.
+            Learned::Missed(_) => Ok(None),
+        }
     }
 
     fn ask_for(&mut self, url: &str) -> Result<Asked, StorageError> {
@@ -448,6 +532,11 @@ mod tests {
                 fetched: RefCell::new(Vec::new()),
             }
         }
+
+        /// The addresses actually dialled, in the order `fetch` was called for them.
+        fn fetched(&self) -> Vec<String> {
+            self.fetched.borrow().clone()
+        }
     }
 
     impl CrawlEngine for ScriptedEngine {
@@ -482,6 +571,15 @@ mod tests {
         ReferencedAsset {
             url: url.to_owned(),
             kind,
+            fallback: None,
+        }
+    }
+
+    fn referenced_with_fallback(url: &str, kind: AssetKind, fallback: &str) -> ReferencedAsset {
+        ReferencedAsset {
+            url: url.to_owned(),
+            kind,
+            fallback: Some(fallback.to_owned()),
         }
     }
 
@@ -858,5 +956,277 @@ mod tests {
         assert!(fetch_priority(AssetKind::Media) < fetch_priority(AssetKind::Stylesheet));
         assert!(fetch_priority(AssetKind::Stylesheet) < fetch_priority(AssetKind::Icon));
         assert!(fetch_priority(AssetKind::Icon) < fetch_priority(AssetKind::Script));
+    }
+
+    /// A response the engine never got back at all, the shape a 404 an underlying client
+    /// turns into an error for, or a request that timed out, both take.
+    fn no_response(url: &str) -> PageEvent {
+        PageEvent::NoResponse(FetchFailure {
+            url: url.to_owned(),
+            reason: "no server answered".to_owned(),
+        })
+    }
+
+    /// A response whose body arrived shorter than it promised.
+    fn short_response(url: &str) -> PageEvent {
+        let PageEvent::Response(mut response) = stored_response(url) else {
+            unreachable!("stored_response answers with a response");
+        };
+        response.body_truncated = true;
+        PageEvent::Response(response)
+    }
+
+    /// Every reason `retryable_miss` answers false for leaves the archive with nothing
+    /// recoverable today, per `arch-3ff`: no later pass changes any of the four by asking
+    /// the same address again. Each earns its own case because each is decided in a
+    /// different place: a 404 comes back as no response at all, a short arrival and an
+    /// oversized one are both read from a response that did arrive, and a private address is
+    /// refused before a request is ever sent.
+    #[test]
+    fn a_widest_candidate_with_no_response_falls_back_to_the_next_widest() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/");
+        let referenced_assets = vec![referenced_with_fallback(
+            "https://example.com/wide.jpg",
+            AssetKind::Image,
+            "https://example.com/narrow.jpg",
+        )];
+        let engine = ScriptedEngine::serving(vec![
+            no_response("https://example.com/wide.jpg"),
+            stored_response("https://example.com/narrow.jpg"),
+        ]);
+
+        let mut assets = AssetCapture::new(&engine, &archive, &seed, Instant::now());
+        let captured = assets
+            .of_page(&referenced_assets)
+            .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(
+            captured.missed,
+            [missed(
+                "https://example.com/wide.jpg",
+                AssetMiss::NoResponse {
+                    detail: "no server answered".to_owned()
+                }
+            )],
+            "the widest candidate's own miss is still reported, address and reason both"
+        );
+        assert_eq!(captured.stored.len(), 1, "{:?}", captured.stored);
+        assert_eq!(
+            captured.stored[0].final_url,
+            "https://example.com/narrow.jpg"
+        );
+        assert!(
+            captured.stored[0].is_fallback,
+            "a rendition kept because the widest could not be fetched is marked as one"
+        );
+    }
+
+    #[test]
+    fn a_widest_candidate_that_arrives_short_falls_back_to_the_next_widest() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/");
+        let referenced_assets = vec![referenced_with_fallback(
+            "https://example.com/wide.jpg",
+            AssetKind::Image,
+            "https://example.com/narrow.jpg",
+        )];
+        let engine = ScriptedEngine::serving(vec![
+            short_response("https://example.com/wide.jpg"),
+            stored_response("https://example.com/narrow.jpg"),
+        ]);
+
+        let mut assets = AssetCapture::new(&engine, &archive, &seed, Instant::now());
+        let captured = assets
+            .of_page(&referenced_assets)
+            .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(captured.stored.len(), 1, "{:?}", captured.stored);
+        assert_eq!(
+            captured.stored[0].final_url,
+            "https://example.com/narrow.jpg"
+        );
+        assert!(captured.stored[0].is_fallback);
+        assert_eq!(captured.missed.len(), 1, "{:?}", captured.missed);
+        assert_eq!(captured.missed[0].url, "https://example.com/wide.jpg");
+    }
+
+    /// The byte ceiling is read after the response has already arrived, unlike the other
+    /// three: the size is only known once the bytes have moved.
+    #[test]
+    fn a_widest_candidate_over_the_size_ceiling_falls_back_to_the_next_widest() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/");
+        let referenced_assets = vec![referenced_with_fallback(
+            "https://example.com/wide.jpg",
+            AssetKind::Image,
+            "https://example.com/narrow.jpg",
+        )];
+        let heavy = usize::try_from(MAX_ASSET_BYTES + 1).expect("fits in usize");
+        let engine = ScriptedEngine::serving(vec![
+            response_of_size("https://example.com/wide.jpg", heavy),
+            stored_response("https://example.com/narrow.jpg"),
+        ]);
+
+        let mut assets = AssetCapture::new(&engine, &archive, &seed, Instant::now());
+        let captured = assets
+            .of_page(&referenced_assets)
+            .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(captured.stored.len(), 1, "{:?}", captured.stored);
+        assert_eq!(
+            captured.stored[0].final_url,
+            "https://example.com/narrow.jpg"
+        );
+        assert!(captured.stored[0].is_fallback);
+        assert_eq!(
+            captured.missed,
+            [missed(
+                "https://example.com/wide.jpg",
+                AssetMiss::TooLarge {
+                    byte_len: MAX_ASSET_BYTES + 1
+                }
+            )]
+        );
+    }
+
+    /// The one of the four decided before any request is sent: the address itself is inside
+    /// a network this run was not told to reach, so the widest candidate costs no request at
+    /// all and the fallback is what the run actually asks for.
+    #[test]
+    fn a_widest_candidate_inside_a_network_falls_back_to_the_next_widest() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/");
+        let referenced_assets = vec![referenced_with_fallback(
+            "http://169.254.169.254/wide.jpg",
+            AssetKind::Image,
+            "https://example.com/narrow.jpg",
+        )];
+        let engine =
+            ScriptedEngine::serving(vec![stored_response("https://example.com/narrow.jpg")]);
+
+        let mut assets = AssetCapture::new(&engine, &archive, &seed, Instant::now());
+        let captured = assets
+            .of_page(&referenced_assets)
+            .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(
+            captured.missed,
+            [missed(
+                "http://169.254.169.254/wide.jpg",
+                AssetMiss::InsideANetwork
+            )]
+        );
+        assert_eq!(captured.stored.len(), 1, "{:?}", captured.stored);
+        assert_eq!(
+            captured.stored[0].final_url,
+            "https://example.com/narrow.jpg"
+        );
+        assert!(captured.stored[0].is_fallback);
+        assert_eq!(
+            engine.fetched(),
+            ["https://example.com/narrow.jpg"],
+            "the address inside the network is never dialled"
+        );
+    }
+
+    /// A miss `retryable_miss` answers true for is a fact about this capture's own budget
+    /// rather than about the file, so a fallback is not spent on it: a later pass over the
+    /// same reference already retries the address that failed, and asking a second address
+    /// too would spend more of a budget that is the reason the first one missed.
+    #[test]
+    fn a_retryable_miss_is_not_given_a_fallback() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/");
+        let referenced_assets = vec![referenced_with_fallback(
+            "https://example.com/wide.jpg",
+            AssetKind::Image,
+            "https://example.com/narrow.jpg",
+        )];
+        // A page of addresses ahead of it that fills the count ceiling, so the reference
+        // under test is refused by `no_room_for_another` before it is ever asked for, which
+        // is a retryable miss.
+        let filler: Vec<ReferencedAsset> = (0..MAX_ASSETS_PER_CAPTURE)
+            .map(|i| {
+                referenced(
+                    &format!("https://example.com/filler-{i}.png"),
+                    AssetKind::Image,
+                )
+            })
+            .collect();
+        let mut all = filler.clone();
+        all.extend(referenced_assets);
+        let engine = ScriptedEngine::serving(
+            filler
+                .iter()
+                .map(|asset| stored_response(&asset.url))
+                .collect(),
+        );
+
+        let mut assets = AssetCapture::new(&engine, &archive, &seed, Instant::now());
+        let captured = assets
+            .of_page(&all)
+            .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(
+            captured
+                .missed
+                .iter()
+                .find(|miss| miss.url == "https://example.com/wide.jpg")
+                .map(|miss| &miss.reason),
+            Some(&AssetMiss::CountCeilingReached)
+        );
+        assert!(
+            captured
+                .stored
+                .iter()
+                .all(|asset| asset.final_url != "https://example.com/narrow.jpg"),
+            "a retryable miss must not spend a request on its fallback: {:?}",
+            captured.stored
+        );
+        assert!(
+            !engine
+                .fetched()
+                .contains(&"https://example.com/narrow.jpg".to_owned()),
+            "the fallback address must never be dialled for a retryable miss"
+        );
+    }
+
+    /// The cost guard this fix must not violate: a reference whose widest candidate answers
+    /// spends exactly the one request it always did, whether or not it carries a fallback
+    /// address, because trying every candidate a `srcset` offered is the cost the
+    /// widest-only rule exists to remove.
+    #[test]
+    fn a_widest_candidate_that_answers_never_spends_a_request_on_its_fallback() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/");
+        let referenced_assets = vec![referenced_with_fallback(
+            "https://example.com/wide.jpg",
+            AssetKind::Image,
+            "https://example.com/narrow.jpg",
+        )];
+        let engine = ScriptedEngine::serving(vec![stored_response("https://example.com/wide.jpg")]);
+
+        let mut assets = AssetCapture::new(&engine, &archive, &seed, Instant::now());
+        let captured = assets
+            .of_page(&referenced_assets)
+            .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert!(captured.missed.is_empty(), "{:?}", captured.missed);
+        assert_eq!(captured.stored.len(), 1);
+        assert_eq!(captured.stored[0].final_url, "https://example.com/wide.jpg");
+        assert!(!captured.stored[0].is_fallback);
+        assert_eq!(
+            assets.fetches(),
+            1,
+            "a fallback nobody needed must cost nothing"
+        );
+        assert_eq!(engine.fetched(), ["https://example.com/wide.jpg"]);
     }
 }

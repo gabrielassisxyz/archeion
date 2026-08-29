@@ -763,6 +763,97 @@ fn a_missed_address_with_no_role_in_the_record_is_still_asked_for_before_a_scrip
     );
 }
 
+/// The exact combination `arch-3ff` found with no test today: a widest `srcset` candidate
+/// missed for a reason `retryable_miss` answers false for, which is the state in which the
+/// archive ends with nothing recoverable before this. The metadata record, re-derived under
+/// the current extractor, already carries the narrower candidate as a fallback; what this
+/// checks is that a repass reaches for it instead of asking the widest address again.
+#[test]
+fn a_widest_candidate_missed_for_good_is_recovered_from_its_fallback_rendition() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a").expect("valid URL");
+    let page = article_page(r#"<img srcset="/wide.jpg 1600w, /narrow.jpg 800w">"#);
+    let mut new = html_capture(&url, &page);
+    new.assets_missed = vec![MissedAsset {
+        url: "https://example.com/wide.jpg".to_owned(),
+        reason: AssetMiss::NoResponse {
+            detail: "404 Not Found".to_owned(),
+        },
+    }];
+    let capture = archive.write_capture(new).expect("capture is written");
+    let metadata = metadata::extract(PageSource {
+        body: page.as_bytes(),
+        content_type: Some("text/html; charset=utf-8"),
+        final_url: url.as_str(),
+    })
+    .expect("the page reads")
+    .expect("the page is html");
+    assert_eq!(
+        metadata
+            .assets
+            .iter()
+            .find(|asset| asset.url == "https://example.com/wide.jpg")
+            .and_then(|asset| asset.fallback.as_deref()),
+        Some("https://example.com/narrow.jpg"),
+        "the current extractor already carries the fallback address"
+    );
+    archive
+        .write_metadata(&url, &capture.id, &metadata)
+        .expect("metadata is written");
+    let engine = ScriptedEngine::new(vec![PageEvent::Response(PageResponse {
+        requested_url: "https://example.com/narrow.jpg".to_owned(),
+        final_url: "https://example.com/narrow.jpg".to_owned(),
+        status: 200,
+        headers: vec![Header {
+            name: "content-type".to_owned(),
+            value: "image/jpeg".to_owned(),
+        }],
+        body: b"a narrower rendition of the same photograph".to_vec(),
+        body_truncated: false,
+        fetched_at: at("2026-07-25T14:03:23Z"),
+    })]);
+
+    let run = repass_archive(
+        &engine,
+        &archive,
+        &SiteRules::default(),
+        RepassOptions::default(),
+    )
+    .expect("repass succeeds");
+
+    assert_eq!(
+        engine.fetched(),
+        ["https://example.com/narrow.jpg"],
+        "the widest address is not asked again; only its fallback, never tried before, is"
+    );
+    assert_eq!(run.assets_recovered, 1, "{run:#?}");
+    assert_eq!(run.assets_not_retried, 1, "{run:#?}");
+
+    let read_back = archive
+        .read_capture(&url, &capture.id)
+        .expect("capture reads");
+    assert_eq!(read_back.assets.len(), 1, "{:?}", read_back.assets);
+    assert_eq!(
+        read_back.assets[0].requested_url,
+        "https://example.com/narrow.jpg"
+    );
+    assert!(
+        read_back.assets[0].is_fallback,
+        "the recovered rendition is marked as a fallback"
+    );
+    assert_eq!(
+        read_back.assets_missed,
+        [MissedAsset {
+            url: "https://example.com/wide.jpg".to_owned(),
+            reason: AssetMiss::NoResponse {
+                detail: "404 Not Found".to_owned(),
+            },
+        }],
+        "the widest candidate's own miss is still named, exactly as it was recorded"
+    );
+}
+
 #[test]
 fn a_failed_asset_recovery_is_not_retried_on_the_next_pass() {
     let dir = TempDir::new().expect("temp dir");

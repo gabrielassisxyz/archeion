@@ -238,15 +238,29 @@ fn resolve_links(page: &ScannedPage, address: &PageAddress) -> Vec<OutboundLink>
 fn resolve_assets(page: &ScannedPage, address: &PageAddress) -> Vec<ReferencedAsset> {
     let mut seen = BTreeSet::new();
     let mut assets = Vec::new();
-    for (reference, kind) in &page.assets {
-        let Some(url) = address.absolute(reference) else {
+    for asset in &page.assets {
+        let Some(url) = address.absolute(&asset.url) else {
             continue;
         };
         let url = String::from(url);
         if !seen.insert(url.clone()) {
             continue;
         }
-        assets.push(ReferencedAsset { url, kind: *kind });
+        // Resolved the same way the widest candidate is, and dropped rather than kept
+        // pointing nowhere useful when it does not resolve, or when it resolves to the
+        // address that just failed: a page can write the same address twice with different
+        // descriptors, and that offers nothing a retry of `url` itself would not.
+        let fallback = asset
+            .fallback
+            .as_deref()
+            .and_then(|reference| address.absolute(reference))
+            .map(String::from)
+            .filter(|resolved| *resolved != url);
+        assets.push(ReferencedAsset {
+            url,
+            kind: asset.kind,
+            fallback,
+        });
     }
     assets
 }

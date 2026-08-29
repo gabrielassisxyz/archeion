@@ -56,7 +56,7 @@ pub(super) struct ScannedPage {
     pub json_ld: Vec<String>,
     pub declared_canonical: Option<String>,
     pub links: Vec<ScannedLink>,
-    pub assets: Vec<(String, AssetKind)>,
+    pub assets: Vec<ScannedAsset>,
     pub truncated: BTreeSet<Bound>,
 }
 
@@ -64,6 +64,16 @@ pub(super) struct ScannedPage {
 pub(super) struct ScannedLink {
     pub href: String,
     pub rel: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ScannedAsset {
+    pub url: String,
+    pub kind: AssetKind,
+    /// The next-widest `srcset` candidate beside this one, still relative and still encoded
+    /// exactly as `url` is at this stage. `None` for every asset that is not a `srcset`'s
+    /// widest candidate.
+    pub fallback: Option<String>,
 }
 
 /// Reads a decoded page.
@@ -374,6 +384,10 @@ impl Scanner {
     }
 
     fn see_asset(&mut self, url: String, kind: AssetKind) {
+        self.see_asset_with_fallback(url, kind, None);
+    }
+
+    fn see_asset_with_fallback(&mut self, url: String, kind: AssetKind, fallback: Option<String>) {
         if url.len() > MAX_URL_BYTES {
             self.page.truncated.insert(Bound::Assets);
             return;
@@ -382,7 +396,11 @@ impl Scanner {
             self.page.truncated.insert(Bound::Assets);
             return;
         }
-        self.page.assets.push((url, kind));
+        self.page.assets.push(ScannedAsset {
+            url,
+            kind,
+            fallback,
+        });
     }
 
     /// A `srcset` is a comma separated list of candidates, each a URL followed by an
@@ -419,9 +437,14 @@ impl Scanner {
             return;
         };
         let srcset = decode_entities(srcset);
-        if let Some(widest) = crate::srcset::widest(&srcset) {
-            self.see_asset(widest.to_owned(), AssetKind::Image);
-        }
+        let Some(widest) = crate::srcset::widest(&srcset) else {
+            return;
+        };
+        // Kept beside the widest candidate rather than fetched here: recording it costs
+        // nothing until the widest one turns out to need it, which is what keeps a page
+        // whose renditions all answer costing exactly what it costs without this.
+        let fallback = crate::srcset::second_widest(&srcset).map(str::to_owned);
+        self.see_asset_with_fallback(widest.to_owned(), AssetKind::Image, fallback);
     }
 
     fn finish(mut self) -> ScannedPage {

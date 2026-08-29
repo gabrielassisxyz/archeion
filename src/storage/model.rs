@@ -287,6 +287,13 @@ pub struct Asset {
     pub status: u16,
     pub media_type: Option<String>,
     pub body: StoredBody,
+    /// Whether this is not the widest `srcset` candidate the page offered but the one below
+    /// it, stored because the widest could not be fetched. A record written before the
+    /// archive tracked this reads as false, which is what it always meant: every asset used
+    /// to be either the address a page named outright or the widest of a `srcset`, never a
+    /// rendition kept in place of one that failed.
+    #[serde(default)]
+    pub is_fallback: bool,
 }
 
 /// A subresource that was referenced and not stored, and why.

@@ -101,6 +101,13 @@ pub struct OutboundLink {
 pub struct ReferencedAsset {
     pub url: String,
     pub kind: AssetKind,
+    /// The next-widest address the same `srcset` offered, when `url` is a widest candidate
+    /// and the attribute named more than one. It is never fetched unless `url` cannot be,
+    /// which is what keeps a page whose widest rendition answers costing what it costs
+    /// today. Absent for every asset that is not a `srcset`'s widest candidate, and for a
+    /// record written before this field existed.
+    #[serde(default)]
+    pub fallback: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

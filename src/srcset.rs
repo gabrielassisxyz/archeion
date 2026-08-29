@@ -117,6 +117,37 @@ pub(crate) fn widest(srcset: &str) -> Option<&str> {
     best.map(|(_, url)| url)
 }
 
+/// The address of the candidate offering the next most, after the widest, or nothing when
+/// the attribute lists fewer than two.
+///
+/// This is the fallback a capture reaches for when the widest candidate cannot be fetched: a
+/// transformation network that has not yet generated its largest derivative has usually
+/// generated the rest, so the address one step down is disproportionately likely to answer.
+/// It is one address and not the whole remaining list, since trying every candidate a page
+/// offered on a failure would reintroduce the fetch-per-rendition cost the widest-only rule
+/// exists to remove; a picture that also loses its second-widest rendition stays lost, the
+/// same as before this existed.
+///
+/// Ties are read the same way `widest` reads them: the earlier of two candidates ranked
+/// equal highest is the widest, and the later one is what this returns.
+pub(crate) fn second_widest(srcset: &str) -> Option<&str> {
+    let mut best: Option<(Rank, &str)> = None;
+    let mut runner_up: Option<(Rank, &str)> = None;
+    for candidate in candidates(srcset) {
+        let rank = rank_of(candidate.descriptor);
+        if best.as_ref().is_none_or(|(current, _)| rank > *current) {
+            runner_up = best.take();
+            best = Some((rank, candidate.url));
+        } else if runner_up
+            .as_ref()
+            .is_none_or(|(current, _)| rank > *current)
+        {
+            runner_up = Some((rank, candidate.url));
+        }
+    }
+    runner_up.map(|(_, url)| url)
+}
+
 /// How much a descriptor claims its candidate offers.
 ///
 /// Width outranks density outright rather than being converted into it: the two measure
@@ -251,5 +282,40 @@ mod tests {
     fn an_empty_srcset_offers_no_candidate() {
         assert_eq!(widest(""), None);
         assert_eq!(widest("  ,  , "), None);
+    }
+
+    #[test]
+    fn the_second_widest_is_the_next_one_down_wherever_the_page_put_it() {
+        assert_eq!(
+            second_widest("/small.png 424w, /large.png 1456w, /middle.png 848w"),
+            Some("/middle.png")
+        );
+        assert_eq!(second_widest("/a.png 424w, /b.png 1456w"), Some("/a.png"));
+    }
+
+    /// A single candidate has nowhere to fall back to, and neither does an empty attribute.
+    #[test]
+    fn a_srcset_with_fewer_than_two_candidates_has_no_second_widest() {
+        assert_eq!(second_widest("/only.png"), None);
+        assert_eq!(second_widest(""), None);
+    }
+
+    /// Two candidates tied for widest: the first is what `widest` returns, and the second is
+    /// what this falls back to, which is a real address and not the one already tried.
+    #[test]
+    fn a_tie_for_widest_falls_back_to_the_other_one() {
+        assert_eq!(widest("/a.png 2x, /b.png 2x"), Some("/a.png"));
+        assert_eq!(second_widest("/a.png 2x, /b.png 2x"), Some("/b.png"));
+    }
+
+    /// The runner-up is tracked across the whole list, not only against whichever candidate
+    /// most recently took the lead: a candidate that arrives after a new widest is found can
+    /// still outrank every earlier runner-up.
+    #[test]
+    fn the_second_widest_is_the_best_of_everything_that_was_not_the_widest() {
+        assert_eq!(
+            second_widest("/tiny.png 100w, /huge.png 2000w, /medium.png 900w"),
+            Some("/medium.png")
+        );
     }
 }

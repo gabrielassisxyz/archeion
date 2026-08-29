@@ -15,8 +15,10 @@ use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
+use html_escape::decode_html_entities;
 use jiff::Timestamp;
 use lol_html::{HtmlRewriter, MemorySettings, Settings, element};
+use spider::CaseInsensitiveString;
 use spider::configuration::RedirectPolicy;
 use spider::packages::robotparser::parser::Entry;
 use spider::page::Page;
@@ -25,7 +27,7 @@ use spider::reqwest::header::{CONTENT_LENGTH, COOKIE, HeaderMap, HeaderValue, SE
 use spider::tokio::runtime::{Builder, Runtime};
 use spider::tokio::sync::broadcast::Receiver;
 use spider::tokio::sync::broadcast::error::{RecvError, TryRecvError};
-use spider::website::Website;
+use spider::website::{OnLinkFindCallback, Website};
 use url::Url;
 
 use super::boundary::{
@@ -787,6 +789,11 @@ fn configure_for_seed(
     seed: &Seed,
     depths: Arc<Mutex<HashMap<String, usize>>>,
 ) {
+    // Fed by `hop_depth_guard`, from the same `page_links` it already walks for its own
+    // reason, and read by `rewrite_escaped_href` below: the one place still holding an
+    // href's raw text is not the one asked to fetch it, so the correction has to cross
+    // from one callback to the other rather than being computed where it is used.
+    let corrections: HrefCorrections = Arc::new(Mutex::new(HashMap::new()));
     website
         .set_url(start)
         .with_limit(seed.max_pages)
@@ -798,7 +805,13 @@ fn configure_for_seed(
         // every page this callback sees.
         .with_depth(0)
         .with_return_page_links(true)
-        .with_on_should_crawl_callback_closure(Some(hop_depth_guard(start, seed.max_depth, depths)))
+        .with_on_should_crawl_callback_closure(Some(hop_depth_guard(
+            start,
+            seed.max_depth,
+            depths,
+            corrections.clone(),
+        )))
+        .with_on_link_find_callback(Some(rewrite_escaped_href(corrections)))
         .with_concurrency_limit(Some(fetch_concurrency(seed)))
         .with_delay(u64::try_from(seed.delay.as_millis()).unwrap_or(u64::MAX))
         // A ceiling on one request, not on the crawl. It reaches the HTTP client, so a
@@ -894,10 +907,18 @@ fn configure_for_seed(
 /// reads it again once the crawl ends, to compare what it discovered against what it
 /// actually fetched. The seed itself is entered at zero before anything else, which is
 /// also why it is the one page never missing from the map.
+///
+/// `corrections` is unrelated to depth and rides along for a narrower reason: this closure
+/// is the only place that ever sees an href as the page wrote it, character references
+/// included, before anything resolves it into a URL. `corrected_resolution` uses that to
+/// work out what the engine should have requested for a link whose href spelled `&` as
+/// `&amp;`, `&#38;` or `&#x26;`, and leaves the answer here for `rewrite_escaped_href` to
+/// find when the engine actually asks for it.
 fn hop_depth_guard(
     seed_url: &str,
     max_depth: usize,
     depths: Arc<Mutex<HashMap<String, usize>>>,
+    corrections: HrefCorrections,
 ) -> impl Fn(&Page) -> bool + Send + Sync + 'static {
     let seed_host = Url::parse(seed_url)
         .ok()
@@ -937,8 +958,10 @@ fn hop_depth_guard(
         let base = Url::parse(page.get_url()).ok();
         if let Some(links) = page.page_links.as_ref() {
             for link in links.iter() {
-                let Some(resolved) = base.as_ref().and_then(|base| base.join(link.as_ref()).ok())
-                else {
+                let Some(base) = base.as_ref() else {
+                    continue;
+                };
+                let Some(resolved) = base.join(link.as_ref()).ok() else {
                     continue;
                 };
                 // A crawl never leaves the host it was pointed at, so a link that does is
@@ -955,14 +978,82 @@ fn hop_depth_guard(
                 if !matches!(resolved.scheme(), "http" | "https") {
                     continue;
                 }
+                // A link whose href spells its own separator with a character reference is
+                // fetched under the corrected spelling below, via `rewrite_escaped_href`,
+                // so it is the corrected address that lands here too: keying this on the
+                // buggy one would compare a page this project never asked the engine for
+                // against the one it actually requested, and report the difference as a
+                // link the crawl lost.
+                let corrected = corrected_resolution(base, link.as_ref(), &seed_scheme);
+                if let Some(corrected) = &corrected {
+                    corrections
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(
+                            depth_key(resolved.as_str(), &seed_scheme),
+                            corrected.to_string(),
+                        );
+                }
+                let fetch_target = corrected.as_ref().unwrap_or(&resolved);
                 depths
-                    .entry(depth_key(resolved.as_str(), &seed_scheme))
+                    .entry(depth_key(fetch_target.as_str(), &seed_scheme))
                     .and_modify(|known| *known = (*known).min(depth + 1))
                     .or_insert(depth + 1);
             }
         }
         true
     }
+}
+
+/// The shared table `hop_depth_guard` fills and `rewrite_escaped_href` reads from, mapping
+/// the address `push_link` itself resolves a link's href to onto the one its page actually
+/// meant.
+type HrefCorrections = Arc<Mutex<HashMap<String, String>>>;
+
+/// Decodes whatever character references an href carries, `&amp;`, `&#38;` and `&#x26;`
+/// among them: the same decode `arch-a3r` already runs for metadata extraction in
+/// `src/metadata/mod.rs`, one layer over, on the href text the crawl resolves into a URL.
+fn decode_href_character_references(href: &str) -> String {
+    decode_html_entities(href).into_owned()
+}
+
+/// The address the engine should request for `href` instead of the one `push_link` itself
+/// would resolve it to, when decoding its character references changes it; `None` when
+/// there is nothing to correct, `href` having no reference to decode.
+///
+/// Resolved against the same base and forced onto the same scheme as the buggy resolution
+/// it replaces, so the two are comparable everywhere both this closure and `depth_key` treat
+/// a resolution that way. It never carries a fragment to drop, because decoding the
+/// separator the page actually wrote never produces one, which is exactly the shape
+/// `&#38;` and `&#x26;` corrupt into before anything but this closure ever sees the href's
+/// own text.
+fn corrected_resolution(base: &Url, href: &str, seed_scheme: &str) -> Option<Url> {
+    let decoded = decode_href_character_references(href);
+    if decoded == href {
+        return None;
+    }
+    let mut corrected = base.join(&decoded).ok()?;
+    let _ = corrected.set_scheme(seed_scheme);
+    Some(corrected)
+}
+
+/// The `on_link_find_callback` this file wires up to rewrite a request before it is sent
+/// rather than after the fact, which is the only timing that can still save it: by the time
+/// anything else the engine offers runs, the request under the spelling `push_link` resolved
+/// has already gone out. A link this has no correction for, every ordinary one, passes
+/// through unchanged.
+fn rewrite_escaped_href(corrections: HrefCorrections) -> OnLinkFindCallback {
+    Arc::new(move |link, referrer| {
+        let corrected = corrections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(link.as_ref())
+            .cloned();
+        match corrected {
+            Some(url) => (CaseInsensitiveString::from(url), referrer),
+            None => (link, referrer),
+        }
+    })
 }
 
 /// How a URL is spelled in the depth map.

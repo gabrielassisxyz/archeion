@@ -46,7 +46,7 @@ A real archive holding a single capture of one page, with one stylesheet as its 
 
 `extraction-rules.json` is the one file here a person writes rather than the program, and the only one whose absence is ordinary. It holds what a host has to be told about where its prose lives, and it sits in the archive because a re-pass over these stored responses has to read it to produce the same articles again. It is at the root rather than under `items/`, which the walk reads as records and nothing else. [`docs/readability.md`](readability.md) has the format and what a broken one costs.
 
-Note that an archive is created in an empty or absent directory, so the file is written into an archive that already exists rather than dropped into a directory that is about to become one.
+It is also the one file that may be there before the archive is. An archive is created in a directory that is empty, absent, or holds this file and nothing else, so a host's rules can be written first and applied on the first capture rather than only on a re-pass after it. That tolerance is bounded by ownership: a name joins it only if it is a file this project itself writes, meaning one `Archive` answers a path for.
 
 ### What the archive is owed
 

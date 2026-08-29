@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use archeion::capture::{CaptureError, CaptureRun, RunSoFar, capture_seed, capture_sitemap};
 use archeion::crawl::{
-    CrawlEngine, CrawlStop, DEFAULT_MAX_RESPONSE_BYTES, SMALLEST_MAX_RESPONSE_BYTES, Seed,
-    SessionCookie, SpiderEngine,
+    CrawlEngine, CrawlStop, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_USER_AGENT,
+    SMALLEST_MAX_RESPONSE_BYTES, Seed, SessionCookie, SpiderEngine,
 };
 use archeion::readability::SiteRules;
 use archeion::sitemap::{SitemapListing, read_sitemap};
@@ -60,6 +60,10 @@ pub struct CaptureArgs {
     /// How many times a request that failed in a way worth repeating is repeated.
     #[arg(long, value_name = "N", default_value_t = defaults().max_retries)]
     max_retries: u8,
+    /// The identity this run announces to servers and matches `robots.txt` groups against,
+    /// in place of the compiled default archeion otherwise sends.
+    #[arg(long, value_name = "STRING", help = user_agent_help())]
+    user_agent: Option<String>,
     /// Ceiling on the body of one response, in bytes. It is settled for the whole process
     /// before anything is fetched, because that is the only channel the engine offers.
     #[arg(long, value_name = "BYTES", help = response_ceiling_help(),
@@ -105,6 +109,16 @@ fn defaults() -> Seed {
 
 fn response_ceiling_help() -> String {
     format!("Ceiling on the body of one response, in bytes [default: {DEFAULT_MAX_RESPONSE_BYTES}]")
+}
+
+/// Read off the engine's own constant rather than off `defaults()`: `Seed::new` carries
+/// `None` for this field, which means "the engine's compiled default" and prints as nothing
+/// useful, while the string an operator actually gets when they omit the flag lives in
+/// `archeion::crawl::DEFAULT_USER_AGENT`.
+fn user_agent_help() -> String {
+    format!(
+        "The identity announced to servers and matched against robots rules [default: {DEFAULT_USER_AGENT}]"
+    )
 }
 
 fn max_depth_help() -> String {
@@ -250,6 +264,12 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
         args.cookie_file.as_deref(),
         std::env::var_os(COOKIE_HEADER_VARIABLE),
     )?;
+    // Refused here for the same reason the credential above is: a byte no header can carry,
+    // let through, is a value the engine's own client cannot build at all rather than one it
+    // sends oddly, and the crate underneath assumes that construction never fails.
+    if let Some(agent) = args.user_agent.as_deref() {
+        usable_user_agent(agent)?;
+    }
     let seed = seed_of(&args, credential);
     // Before the archive, because opening one creates it. A seed the engine will not dial is
     // a run that was never going to fetch anything, and creating a directory for it leaves
@@ -345,6 +365,30 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Why `--user-agent`'s value cannot be used: a byte no header can carry, refused before a
+/// run starts rather than at the client that would otherwise be asked to build one from it.
+#[derive(Debug, thiserror::Error)]
+#[error("--user-agent holds a character that cannot be sent in a header")]
+struct UnusableUserAgent;
+
+/// Whether `value` could be sent as the value of some header, HTTP's own rule and not
+/// ASCII's: a `User-Agent` naming an operator with an accent in it is ordinary and stays
+/// accepted, since only a control byte, `\r` and `\n` chief among them, is what no header
+/// can hold. Letting one through would build a second header nobody wrote the moment this
+/// reaches the client, which for `--cookie-file` is refused the same way in
+/// `session_cookie.rs`; this mirrors that rule rather than the narrower, ASCII-only one the
+/// cookie path also applies, since a cookie's own grammar is stricter than a header's.
+fn usable_user_agent(value: &str) -> Result<(), UnusableUserAgent> {
+    let carries_only_what_a_header_can_hold = value
+        .bytes()
+        .all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f));
+    if carries_only_what_a_header_can_hold {
+        Ok(())
+    } else {
+        Err(UnusableUserAgent)
+    }
+}
+
 /// The seed this run crawls with. The credential arrives separately because reading it can fail
 /// and because it is bound here rather than where it was read: the origin it may be sent to is
 /// the seed's own, which is what keeps this flag ignorant of any particular publisher.
@@ -357,6 +401,7 @@ fn seed_of(args: &CaptureArgs, credential: Option<String>) -> Seed {
     seed.deadline = args.deadline.0;
     seed.request_timeout = args.request_timeout.0;
     seed.max_retries = args.max_retries;
+    seed.user_agent = args.user_agent.clone();
     seed.allow_private_addresses = args.allow_private_addresses;
     seed.session_cookie = credential.map(|value| SessionCookie::bound_to(&args.seed_url, value));
     seed

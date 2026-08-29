@@ -922,3 +922,65 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::readability::{
+        AdmissionCost, ArticleRecord, EXTRACTOR_VERSION, ExtractionRules, ProseShare,
+    };
+
+    use super::super::model::ContentHash;
+    use super::StoredArticle;
+
+    /// The served-document example in `docs/readability.md`, pulled from the file rather than
+    /// copied by hand, so a later edit to the block is what this test reads and not a second
+    /// transcription of it.
+    fn served_document_example_from_docs() -> &'static str {
+        const DOC: &str = include_str!("../../docs/readability.md");
+        let anchor = "A record for a document the site published looks like this";
+        let (_, after_anchor) = DOC
+            .split_once(anchor)
+            .expect("the anchor sentence is still in docs/readability.md");
+        let (_, after_fence) = after_anchor
+            .split_once("```json\n")
+            .expect("a fenced json block follows the anchor sentence");
+        let (block, _) = after_fence
+            .split_once("\n```")
+            .expect("the fenced block is closed");
+        block
+    }
+
+    /// This is the record `write_article` produces for a document read from `served.rs`:
+    /// nothing scored anything, so there is no excerpt, no byline and no paywall declaration,
+    /// and the two counts are equal because the document is the whole page. The doc's prose
+    /// says the same thing in words; this is what keeps the JSON beside it from drifting once
+    /// a field is added to `ArticleRecord` and this fixture is not updated to match.
+    #[test]
+    fn served_document_example_matches_what_the_record_actually_serializes() {
+        let stored = StoredArticle {
+            markdown_sha256: ContentHash::of(b""),
+            record: ArticleRecord {
+                extractor_version: EXTRACTOR_VERSION,
+                rules: ExtractionRules::Served,
+                word_count: 1240,
+                share: Some(ProseShare {
+                    article_chars: 6120,
+                    page_chars: 6120,
+                }),
+                excerpt: None,
+                byline: None,
+                accessible_for_free: None,
+                truncated: Vec::new(),
+                cost: AdmissionCost {
+                    document_bytes: 7104,
+                    peak_open_elements: 6,
+                },
+            },
+        };
+
+        let produced =
+            serde_json::to_string_pretty(&stored).expect("a StoredArticle always serializes");
+
+        assert_eq!(produced, served_document_example_from_docs());
+    }
+}

@@ -15,9 +15,10 @@ use cli::capture::CaptureArgs;
 /// web, and a run that reported it did its job.
 const EXIT_CODES: &str = "\
 Exit codes:
-  0  the command did what it was asked, including when a URL answered nothing
-  1  the archive is missing or damaged, a seed was refused, or a run ended up
-     holding less than it fetched
+  0  the command did what it was asked
+  1  the archive is missing or damaged, a seed was refused, a write failed, a
+     run ended up holding less than it fetched, or the crawl discovered a
+     link it never fetched at all
   2  the command line could not be read";
 
 #[derive(Debug, Parser)]

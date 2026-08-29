@@ -8,8 +8,10 @@
 use std::collections::HashSet;
 
 use dom_query::{Document, NodeId, NodeRef};
+use url::Url;
 
 use super::markup_scan::peak_open_elements;
+use super::readable_markdown::readable_destination;
 use super::rules::SiteRule;
 
 /// How deeply markup may nest before the document is refused.
@@ -113,6 +115,60 @@ pub(super) fn build(html: &str) -> Result<(Document, Measured), TooExpensive> {
             peak_open_elements: peak,
         },
     ))
+}
+
+/// Leaves a link where an embedded document was, before the scorer ever sees it.
+///
+/// The scoring library's own cleaning pass removes every `iframe`, `object` and `embed`
+/// outright unless one of its attributes names a domain on a short, hardcoded list of video
+/// hosts: `www.youtube-nocookie.com` is on it, `open.spotify.com` and
+/// `embed.podcasts.apple.com` are not, and a host that never sent that list a page never will
+/// be. So an `iframe` reaches the converter at all only if it stops being one before the
+/// cleaning pass runs: this rewrites it into an anchor carrying the same destination, labelled
+/// with its host, which is a shape the cleaning pass already knows to leave alone. The anchor
+/// handling in `markdown.rs` does the rest, exactly as it already does for a video a page wrote
+/// as a plain link.
+///
+/// An `iframe` whose `src` is absent, does not resolve to a readable destination, or resolves
+/// to one with no host to label it with, is left as an `iframe`: the cleaning pass then decides
+/// its fate on its own terms, which is removal for everything this project does not also
+/// recognise, rather than an empty link.
+pub(super) fn link_embedded_documents(document: &Document, final_url: &str) {
+    let base = Url::parse(final_url).ok();
+    let Some(iframes) = document.try_select("iframe[src]") else {
+        return;
+    };
+    for iframe in iframes.nodes() {
+        let Some(src) = iframe.attr("src") else {
+            continue;
+        };
+        let Some(destination) = readable_destination(&src, base.as_ref()) else {
+            continue;
+        };
+        let Some(host) = Url::parse(&destination)
+            .ok()
+            .and_then(|url| display_host(&url))
+        else {
+            continue;
+        };
+        let anchor = document.tree.new_element("a");
+        anchor.set_attr("href", &destination);
+        anchor.set_text(host);
+        iframe.replace_with(&anchor);
+    }
+}
+
+/// The host of a resolved address, without the `www.` prefix a reader's browser already hides.
+/// `www.com` keeps its prefix: stripped, `www` would not be a prefix of anything, it would be
+/// the whole registrable name.
+fn display_host(url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    Some(
+        host.strip_prefix("www.")
+            .filter(|rest| rest.contains('.'))
+            .unwrap_or(host)
+            .to_owned(),
+    )
 }
 
 /// What a host's rule made of the page.
@@ -336,6 +392,115 @@ mod tests {
     fn page_chars(html: &str) -> usize {
         let (document, _) = build(html).expect("well within every ceiling");
         page_text_chars(&document)
+    }
+
+    /// Whether `dom_smoothie`'s own cleaning pass would have kept the element on its own,
+    /// which is what decides whether this file has anything to do at all. Established against
+    /// the crate's real matching rules rather than assumed: `open.spotify.com` names no domain
+    /// on `dom_smoothie`'s hardcoded video whitelist, so an `iframe` pointing at it is removed
+    /// outright by `clean()` in `prep_article.rs` before a converter ever sees it, and that is
+    /// true regardless of anything this project does downstream. `www.youtube-nocookie.com` is
+    /// on that list, so a page embedding one survives `clean()` unaided. Both are pinned so a
+    /// future bump of the dependency that changes either answer is caught here rather than
+    /// read as a fact this project can otherwise not observe.
+    #[test]
+    fn the_scoring_library_keeps_only_a_hardcoded_whitelist_of_video_iframes_on_its_own() {
+        for (host, kept_by_the_library_alone) in [
+            ("www.youtube-nocookie.com", true),
+            ("open.spotify.com", false),
+            ("embed.podcasts.apple.com", false),
+        ] {
+            let html = format!(
+                "<html><body><article><p>Watch this.</p>\
+                 <iframe src=\"https://{host}/embed/one\"></iframe>\
+                 <p>{}</p></article></body></html>",
+                "Bread is mostly patience, and the dough will tell you when it is ready. "
+                    .repeat(20)
+            );
+            let (document, _) = build(&html).expect("well within every ceiling");
+            let mut readability = dom_smoothie::Readability::with_document(
+                document,
+                Some("https://example.com/posts/one"),
+                None,
+            )
+            .expect("a page this test wrote is readable");
+            let article = readability.parse().expect("enough prose to score");
+
+            assert_eq!(
+                article.content.contains("iframe"),
+                kept_by_the_library_alone,
+                "{host}: {}",
+                article.content
+            );
+        }
+    }
+
+    #[test]
+    fn an_iframe_with_an_absolute_src_becomes_a_link_labelled_with_its_host() {
+        let (document, _) = build(
+            r#"<html><body><iframe src="https://www.youtube-nocookie.com/embed/one"></iframe></body></html>"#,
+        )
+        .expect("well within every ceiling");
+
+        link_embedded_documents(&document, "https://example.com/posts/one");
+
+        assert!(!document.select("iframe").exists());
+        let anchor = document.select("a");
+        assert_eq!(anchor.length(), 1);
+        assert_eq!(
+            anchor.attr("href").as_deref(),
+            Some("https://www.youtube-nocookie.com/embed/one")
+        );
+        assert_eq!(anchor.text().as_ref(), "youtube-nocookie.com");
+    }
+
+    /// The rule this file exists for is not keyed on a host at all: nothing here consults a
+    /// whitelist, so a host absent from every corpus this project has read is covered on the
+    /// same terms as one that is in it.
+    #[test]
+    fn a_host_absent_from_the_corpus_is_covered_on_the_same_terms() {
+        let (document, _) =
+            build(r#"<html><body><iframe src="https://player.example.net/watch/1"></iframe></body></html>"#)
+                .expect("well within every ceiling");
+
+        link_embedded_documents(&document, "https://example.com/posts/one");
+
+        assert_eq!(document.select("a").text().as_ref(), "player.example.net");
+    }
+
+    #[test]
+    fn a_relative_src_is_resolved_against_the_pages_own_base() {
+        let (document, _) =
+            build(r#"<html><body><iframe src="/embed/one"></iframe></body></html>"#)
+                .expect("well within every ceiling");
+
+        link_embedded_documents(&document, "https://example.com/posts/one");
+
+        assert_eq!(
+            document.select("a").attr("href").as_deref(),
+            Some("https://example.com/embed/one")
+        );
+        assert_eq!(document.select("a").text().as_ref(), "example.com");
+    }
+
+    /// Nothing rather than an empty link, for both ways an iframe can fail to name an address:
+    /// missing entirely, and present but not a readable destination.
+    #[test]
+    fn an_iframe_with_no_readable_address_is_left_for_the_scorer_to_remove() {
+        for html in [
+            r#"<html><body><iframe></iframe></body></html>"#,
+            r#"<html><body><iframe src="javascript:alert(1)"></iframe></body></html>"#,
+            // A scheme the destination policy refuses but that still resolves to a host,
+            // which is the case a check reading only "does it have a host" would miss.
+            r#"<html><body><iframe src="ftp://example.com/embed"></iframe></body></html>"#,
+        ] {
+            let (document, _) = build(html).expect("well within every ceiling");
+
+            link_embedded_documents(&document, "https://example.com/posts/one");
+
+            assert!(!document.select("a").exists(), "{html}");
+            assert!(document.select("iframe").exists(), "{html}");
+        }
     }
 
     /// The denominator is what a reader would have seen, so what a page carries for machines

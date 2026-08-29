@@ -380,6 +380,41 @@ pub struct NewAsset {
     pub body: Vec<u8>,
 }
 
+/// An address a run asked for and did not archive, and why. Kept outside the collection
+/// rather than as a capture: there is nothing to file under `items/` for a response that
+/// was refused, never answered, could not be addressed at all, or was never even asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwedAddress {
+    pub url: String,
+    /// Flattened, for the reason `MissedAsset` above flattens its own: one object with a
+    /// `reason` in it, not a reason nested under a field also called reason.
+    #[serde(flatten)]
+    pub reason: OwedReason,
+}
+
+/// Why the archive owes this address instead of holding it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum OwedReason {
+    /// The host answered, and refused. `retry_after` carries the header's value verbatim
+    /// when the host sent one, and its absence when it did not: a caller asking whether to
+    /// wait needs to tell the two apart rather than read a missing header as an empty one.
+    Refused {
+        status: u16,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        retry_after: Option<String>,
+    },
+    /// No server answered at all.
+    NoResponse { detail: String },
+    /// The canonical rules refuse this address, so there is no directory it could be filed
+    /// under.
+    Unaddressable { detail: String },
+    /// The address resolved inside a network this run was not pointed at.
+    InsideANetwork,
+    /// The crawl discovered this link and never fetched it.
+    NeverFollowed,
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut hex = String::with_capacity(digest.len() * 2);

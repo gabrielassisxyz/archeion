@@ -22,6 +22,7 @@ An asset arrives at the capture already stored, as a record, rather than as byte
 <archive>/
   archeion.json                                     format name and version
   extraction-rules.json                             per-host extraction rules, written by hand
+  owed.json                                         addresses no run has archived yet, and why
   blobs/sha256/<ab>/<cd>/<hash>                     response bodies, addressed by content
   items/<host>/<item-id>/item.json                  one item
   items/<host>/<item-id>/captures/<capture-id>.json one fetch of it
@@ -46,6 +47,35 @@ A real archive holding a single capture of one page, with one stylesheet as its 
 `extraction-rules.json` is the one file here a person writes rather than the program, and the only one whose absence is ordinary. It holds what a host has to be told about where its prose lives, and it sits in the archive because a re-pass over these stored responses has to read it to produce the same articles again. It is at the root rather than under `items/`, which the walk reads as records and nothing else. [`docs/readability.md`](readability.md) has the format and what a broken one costs.
 
 Note that an archive is created in an empty or absent directory, so the file is written into an archive that already exists rather than dropped into a directory that is about to become one.
+
+### What the archive is owed
+
+A page response the host refused, status 400 or above, is not an item: an item is a page that was served, and a capture that never happened records nothing in `items/`. What replaces it is `owed.json`, a record at the root, beside `extraction-rules.json` and for the same reason: the walk under `items/` reads that directory as pages that were served, and an address with no capture behind it is not one. This rule is the page's own: a subresource is stored under whatever status it answered with, refusals included, since [`asset-capture.md`](asset-capture.md) reasons about what a page needed to still make sense and not about what the host said when it sent it.
+
+```json
+{
+  "format": "archeion-owed",
+  "version": 1,
+  "addresses": [
+    { "url": "https://blog.example.com/2026/07/a-page", "reason": "refused", "status": 429, "retry_after": "120" },
+    { "url": "https://blog.example.com/2026/07/gone", "reason": "refused", "status": 404 },
+    { "url": "https://cdn.example.net/timeout", "reason": "no_response", "detail": "error sending request: operation timed out" },
+    { "url": "javascript:void(0)", "reason": "unaddressable", "detail": "javascript:void(0) is a javascript URL, and the archive captures over http and https" },
+    { "url": "http://169.254.169.254/latest/meta-data", "reason": "inside_a_network" },
+    { "url": "https://blog.example.com/2026/07/never-fetched", "reason": "never_followed" }
+  ]
+}
+```
+
+`format` and `version` exist so a reader who has found this file on its own, with nothing else open, can still tell what it is and whether the shape it is reading is one this build understands, the same reasoning `archeion.json` follows for the archive as a whole.
+
+Every reason matches a field `CaptureRun` already carries in memory while a run is in progress, and its own comment says every URL the engine reported is in exactly one of them: `refused` for a status the host itself sent, `no_response` for a URL nothing answered, `unaddressable` for one the canonical rules refuse, `inside_a_network` for an address that resolved somewhere a run without `--allow-private-addresses` had no business reaching, and `never_followed` for a link the crawl discovered and never fetched at all. A refused address is named by its canonical spelling, the same one the page would have been filed under had it been served, and not by the literal address the response carried: that is what lets this file's own write compare an address against `Item`'s identity, below, to tell a page that is now archived from one still owed.
+
+`retry_after` is present only when the host sent the header on a refusal, carrying its value exactly as it arrived. Its absence is the record saying so, rather than a value nothing sent standing in for one. Nothing else about a refused response is kept: the body is discarded, on the measurement in `arch-9j5` that a run's refusals are typically identical short error pages carrying nothing worth an archive slot.
+
+The file is merged, not overwritten. An archive is not one seed: `items/<host>/...` is sharded by host precisely because one archive holds however many hosts were ever pointed at it, and a run against one of them says nothing about whether another's debt is still owed, so replacing the whole file with only this run's list would erase what an unrelated run left here. A write reads what is already on file, drops every address this run's own `archived_urls` says it just turned into an item, adds whatever this run newly learned, and keeps one entry per address if the same one appears twice.
+
+Only a `refused` entry is guaranteed to be dropped once it is archived. Its address is canonical, so it compares directly against `archived_urls`; the other four reasons carry whatever address the engine reported at the point the run gave up on it, before this project's own canonicalization had a reason to run, and are not guaranteed to match the spelling a later capture of the same page actually files under. An address stuck in one of those four keeps reappearing in this file until a run happens to archive it under the exact spelling recorded here.
 
 ### Bodies are addressed by their content
 

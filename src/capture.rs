@@ -16,7 +16,9 @@ use crate::crawl::{
 };
 use crate::metadata::{self, PageMetadata, PageSource, ReferencedAsset, UnreadablePage};
 use crate::readability::{self, Extraction, SiteRules, UnreadableArticle};
-use crate::storage::{Archive, Header, NewCapture, PolicyDeparture, StorageError};
+use crate::storage::{
+    Archive, Header, NewCapture, OwedAddress, OwedReason, PolicyDeparture, StorageError,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
@@ -45,11 +47,38 @@ pub struct UnaddressablePage {
     pub reason: InvalidCanonicalUrl,
 }
 
+/// The address of a response the host refused, and the header that would say when to come
+/// back, if it sent one. `responses_refused` below stays a count by status because a
+/// consumer outside this repo already reads that shape; this is the per-address detail the
+/// count cannot carry, and it is what the owed record in the archive is built from.
+///
+/// `url` is the canonical spelling, the same one an item would be filed under had the
+/// response succeeded, and not the final URL as the response actually spelled it. That is
+/// the deliberate choice, not an oversight: it is what lets `Archive::write_owed` tell a
+/// newly archived address apart from one still owed by comparing it against
+/// `CaptureRun::archived_urls`, which is canonical for the same reason. A later run resuming
+/// from this record re-resolves the canonical address rather than replaying a literal
+/// string, which it would have to do regardless, since a resume is free to reach the same
+/// page by a different route than the one that was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedResponse {
+    pub url: String,
+    pub status: u16,
+    pub retry_after: Option<String>,
+}
+
 /// What one seed left behind. Every URL the engine reported is in exactly one of these,
 /// so a run that archived less than expected says where the rest went.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CaptureRun {
     pub captures_written: usize,
+    /// How many times this run charged a sitemap phase's own page ceiling: a capture written
+    /// to disk, or a response the host refused. It exists because `captures_written` cannot
+    /// be that count any more: a refusal stopped being a capture, and `docs/cli.md` still
+    /// promises `captures_written` means captures written to disk. `RunSoFar` reads this
+    /// field, and only the sitemap phase reads `RunSoFar`; the ordinary crawl's own ceiling
+    /// is the engine's to enforce and never reads a field of this struct at all.
+    pub pages_spent: usize,
     /// How many of those captures the run's subscription actually reached, which is zero for
     /// every run that carries none.
     ///
@@ -59,16 +88,14 @@ pub struct CaptureRun {
     /// teasers, exits zero, and looks exactly like a run nobody gave a session to. This count is
     /// the one thing that separates the two, so the report can say the session did nothing.
     pub captures_with_a_session: usize,
-    /// How many stored captures the host answered with an error, by status.
-    ///
-    /// The response is stored either way, because a capture is what the server answered and
-    /// a 429 is an answer. What this exists for is that the answer must not vanish into the
-    /// count above: a run a host refused reported a collection larger than it holds, and the
-    /// only symptom was a derived count that read as a defect somewhere else entirely.
+    /// How many responses the host answered with an error, by status. Neither the response
+    /// nor its address is kept here: this field's name and shape are depended on outside
+    /// this repo, so it stays a count exactly as before, and `refused_responses` below is
+    /// where the address and the reason actually live now.
     ///
     /// Counted by status rather than listed by URL, because the interesting question is
     /// whether the run was refused at all and one line can say so. Which URLs is a question
-    /// the archive itself answers, and a hundred and sixty of them on stderr is a wall
+    /// `refused_responses` answers, and a hundred and sixty of them on stderr is a wall
     /// nobody reads.
     ///
     /// Four hundred and up, so a redirect the archive stored rather than followed is not
@@ -78,6 +105,16 @@ pub struct CaptureRun {
     /// answered every request, which is the false alarm that would teach a reader to ignore
     /// this row.
     pub responses_refused: BTreeMap<u16, usize>,
+    /// Every response counted above, named by address, with its `Retry-After` header when
+    /// the host sent one. A refused response is not stored as a capture: this is what
+    /// survives it, and what the archive's owed record is built from.
+    pub refused_responses: Vec<RefusedResponse>,
+    /// The canonical addresses this run has already been refused on, so a listed URL the
+    /// sitemap phase reaches after the ordinary crawl already asked for it and was turned
+    /// away is not asked for a second time. `archived_urls` cannot serve this: it names what
+    /// this run actually filed, and the owed record's merge in `Archive::write_owed` reads
+    /// it to mean exactly that.
+    pub refused_urls: HashSet<String>,
     pub unaddressable_pages: Vec<UnaddressablePage>,
     /// Pages that ended on an address existing only inside a network, which a run that did
     /// not ask for those addresses had no business reaching. They are reported rather than
@@ -136,10 +173,13 @@ impl CaptureRun {
     /// reason survives, since that is the one that actually decided when the run was done.
     pub fn merge(&mut self, other: CaptureRun) {
         self.captures_written += other.captures_written;
+        self.pages_spent += other.pages_spent;
         self.captures_with_a_session += other.captures_with_a_session;
         for (status, count) in other.responses_refused {
             *self.responses_refused.entry(status).or_default() += count;
         }
+        self.refused_responses.extend(other.refused_responses);
+        self.refused_urls.extend(other.refused_urls);
         self.unaddressable_pages.extend(other.unaddressable_pages);
         self.pages_inside_a_network
             .extend(other.pages_inside_a_network);
@@ -234,10 +274,12 @@ pub fn capture_seed(
 pub struct RunSoFar<'a> {
     /// When the run began, which is not when the phase reading this began.
     pub started: Instant,
-    /// Pages the earlier phases of this run filed.
+    /// What earlier phases of this run have already charged against the page ceiling: a
+    /// capture written to disk or a response the host refused, either one a page the run
+    /// spent regardless of what came back.
     pub pages_written: usize,
-    /// The canonical addresses already filed, so a listed URL the crawl reached is not bought
-    /// a second time.
+    /// The canonical addresses already filed or refused, so a listed URL the crawl reached
+    /// is not bought a second time and a host that already refused one is not asked again.
     pub archived: &'a HashSet<String>,
 }
 
@@ -251,9 +293,11 @@ impl<'a> RunSoFar<'a> {
         }
     }
 
-    /// Everything this run has filed, the phase now running included.
+    /// Everything this run has charged against its page ceiling so far, the phase now
+    /// running included: a capture written to disk or a response the host refused, either
+    /// one a page the run spent regardless of what came back.
     fn pages_written_including(&self, run: &CaptureRun) -> usize {
-        self.pages_written + run.captures_written
+        self.pages_written + run.pages_spent
     }
 
     /// Whether the run can still archive anything, asked before a phase starts.
@@ -419,19 +463,25 @@ pub fn capture_sitemap(
     Ok(run)
 }
 
-/// Whether an address this run already filed is being asked for again.
+/// Whether an address this run has already settled, filed or refused, is being asked for
+/// again.
 ///
 /// A sitemap normally lists the seed, and it can list one page twice, so without this a run
 /// buys the same response more than once and the archive grows a second capture of an item
-/// nothing about the site changed. The comparison is against the canonical spelling, which is
-/// what an item is filed under: what cannot be caught here is a listed URL that redirects onto
-/// a page already filed, since only the fetch itself can say where it lands.
+/// nothing about the site changed. A host that already refused the address is the other half:
+/// asking it again spends a second request on a host that just said it was being asked too
+/// often, for an answer this run already has. The comparison is against the canonical
+/// spelling, which is what an item is filed under: what cannot be caught here is a listed URL
+/// that redirects onto a page already filed or refused, since only the fetch itself can say
+/// where it lands.
 fn already_filed(url: &str, already_archived: &HashSet<String>, run: &CaptureRun) -> bool {
     let Ok(canonical) = CanonicalUrl::parse(url) else {
         return false;
     };
     let canonical = canonical.to_string();
-    already_archived.contains(&canonical) || run.archived_urls.contains(&canonical)
+    already_archived.contains(&canonical)
+        || run.archived_urls.contains(&canonical)
+        || run.refused_urls.contains(&canonical)
 }
 
 /// Waits the run's politeness delay, if it has one.
@@ -497,12 +547,13 @@ fn engine_overran_its_deadline(deadline: Option<Duration>, elapsed: Duration) ->
 
 /// Files one page under the address the archive knows it by.
 ///
-/// Two shapes are skipped and reported rather than stored, and neither ends the run: a page
-/// the archive cannot address, since one URL the canonical rules refuse says nothing about
-/// the other two hundred, and a page that ended inside a network the run was not pointed
-/// at. A failed write is the opposite, and stops the run: the disk that rejected this
-/// capture will reject the next one, and a crawl that keeps fetching after that spends a
-/// site's bandwidth on nothing.
+/// Three shapes are skipped and reported rather than stored, and none of them ends the run:
+/// a page the archive cannot address, since one URL the canonical rules refuse says nothing
+/// about the other two hundred; a page that ended inside a network the run was not pointed
+/// at; and a response the host refused, which is not an item and whose body is not kept, on
+/// the reasoning `docs/storage-model.md` records. A failed write is the opposite, and stops
+/// the run: the disk that rejected this capture will reject the next one, and a crawl that
+/// keeps fetching after that spends a site's bandwidth on nothing.
 fn capture_page(
     event: PageEvent,
     archive: &Archive,
@@ -545,6 +596,27 @@ fn capture_page(
         }
     };
 
+    // A refused response is not an item and its body is not stored: the decision in
+    // `arch-9j5` and the reasoning behind it are in `docs/storage-model.md`. Checked here,
+    // before a byte of the body is read, so nothing below spends effort extracting or
+    // fetching subresources for seventeen bytes of `Too Many Requests`.
+    if page.status >= 400 {
+        // Charged against the sitemap phase's own page ceiling exactly as a written capture
+        // is, a few lines down: before this bead a refusal was a capture and paid into that
+        // budget, and it still has to, or a host that refuses everything drains the sitemap
+        // listing down to its deadline instead of stopping at `--max-pages`.
+        run.pages_spent += 1;
+        let canonical_url = canonical.to_string();
+        run.refused_urls.insert(canonical_url.clone());
+        *run.responses_refused.entry(page.status).or_default() += 1;
+        run.refused_responses.push(RefusedResponse {
+            retry_after: retry_after_of(&page.headers),
+            url: canonical_url,
+            status: page.status,
+        });
+        return ControlFlow::Continue(());
+    }
+
     // Read before the capture is written, because the bytes are still in hand, and stored
     // after, because the response is what cannot be recovered: a run cut short then leaves
     // a capture with no reading of it, which a later pass can produce on its own.
@@ -563,9 +635,6 @@ fn capture_page(
         }
     };
     let (stored, missed) = (captured.stored.len(), captured.missed.len());
-    // Read before the response is moved into the record, and counted after the write below,
-    // so what is reported is what actually reached the disk.
-    let status = page.status;
     let capture = match archive.write_capture(new_capture(canonical.clone(), page, captured, seed))
     {
         Ok(capture) => capture,
@@ -575,6 +644,7 @@ fn capture_page(
         }
     };
     run.captures_written += 1;
+    run.pages_spent += 1;
     // Counted off the record that landed rather than off the seed, so what the report says a
     // session reached is what the archive says too.
     if capture
@@ -582,9 +652,6 @@ fn capture_page(
         .contains(&PolicyDeparture::Session)
     {
         run.captures_with_a_session += 1;
-    }
-    if status >= 400 {
-        *run.responses_refused.entry(status).or_default() += 1;
     }
     // Kept so a later phase of the same run does not archive an address this one already has.
     // It is what this run wrote rather than what the archive holds, because an archive holds
@@ -759,6 +826,92 @@ fn content_type_of(headers: &[Header]) -> Option<&str> {
         .iter()
         .find(|header| header.name.eq_ignore_ascii_case("content-type"))
         .map(|header| header.value.as_str())
+}
+
+/// The header a refused response uses to say when asking again might work. Read off the
+/// response and not stored on it: the body of a refusal is discarded, and this is the one
+/// part of it the owed record keeps.
+fn retry_after_of(headers: &[Header]) -> Option<String> {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("retry-after"))
+        .map(|header| header.value.clone())
+}
+
+/// Every address this run did not archive, with why, folded into the shape the archive
+/// keeps outside its collection.
+///
+/// The destructure below is exhaustive and binds every field this function does not read to
+/// `_`, on purpose: `CaptureRun`'s own comment says every URL the engine reported is in
+/// exactly one of its fields, and a loss field added there without a matching arm here used
+/// to compile silently and leave that loss unrecorded in the archive. Adding a field now
+/// fails the build here instead.
+///
+/// The final pass answers the case a reason above cannot: the same address reaching two of
+/// these fields, or the same field twice, most plainly when a run's crawl phase is refused on
+/// an address its sitemap phase also lists, and both push into `refused_responses`.
+/// The first entry for an address is the one kept.
+pub fn owed_addresses(run: &CaptureRun) -> Vec<OwedAddress> {
+    let CaptureRun {
+        captures_written: _,
+        pages_spent: _,
+        captures_with_a_session: _,
+        responses_refused: _,
+        refused_responses,
+        refused_urls: _,
+        unaddressable_pages,
+        pages_inside_a_network,
+        failed_fetches,
+        unreadable_pages: _,
+        articles_extracted: _,
+        extractions_refused: _,
+        unreadable_articles: _,
+        pages_dropped: _,
+        links_never_followed,
+        assets_stored: _,
+        assets_missed: _,
+        asset_fetches: _,
+        stopped: _,
+        archived_urls: _,
+    } = run;
+
+    let mut owed = Vec::new();
+    owed.extend(refused_responses.iter().map(|refused| OwedAddress {
+        url: refused.url.clone(),
+        reason: OwedReason::Refused {
+            status: refused.status,
+            retry_after: refused.retry_after.clone(),
+        },
+    }));
+    owed.extend(failed_fetches.iter().map(|failure| OwedAddress {
+        url: failure.url.clone(),
+        reason: OwedReason::NoResponse {
+            detail: failure.reason.clone(),
+        },
+    }));
+    owed.extend(unaddressable_pages.iter().map(|page| OwedAddress {
+        url: page.url.clone(),
+        reason: OwedReason::Unaddressable {
+            detail: page.reason.to_string(),
+        },
+    }));
+    owed.extend(
+        pages_inside_a_network
+            .iter()
+            .cloned()
+            .map(|url| OwedAddress {
+                url,
+                reason: OwedReason::InsideANetwork,
+            }),
+    );
+    owed.extend(links_never_followed.iter().cloned().map(|url| OwedAddress {
+        url,
+        reason: OwedReason::NeverFollowed,
+    }));
+
+    let mut seen = HashSet::new();
+    owed.retain(|address| seen.insert(address.url.clone()));
+    owed
 }
 
 #[cfg(test)]
@@ -1211,8 +1364,11 @@ mod tests {
         );
     }
 
+    /// A response the host refused is not an item: it is not written by `write_capture`, and
+    /// it creates no directory under `items/`. What survives it is the address, in
+    /// `refused_responses`, which is what the archive's owed record is built from.
     #[test]
-    fn a_page_that_failed_is_archived_with_the_status_it_failed_with() {
+    fn a_page_the_host_refused_is_not_archived_as_an_item() {
         let dir = TempDir::new().expect("temp dir");
         let archive = archive_in(&dir);
         let engine = ScriptedCrawlEngine::new(vec![page("https://example.com/gone", 404, "")]);
@@ -1220,13 +1376,132 @@ mod tests {
         let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("the run completes");
 
-        assert_eq!(run.captures_written, 1);
+        assert_eq!(run.captures_written, 0);
+        assert_eq!(run.responses_refused, BTreeMap::from([(404, 1)]));
+        assert_eq!(
+            run.refused_responses,
+            vec![RefusedResponse {
+                url: "https://example.com/gone".to_owned(),
+                status: 404,
+                retry_after: None,
+            }]
+        );
         let url = CanonicalUrl::parse("https://example.com/gone").expect("valid url");
-        let captures = archive.list_captures(&url).expect("captures are listed");
-        let capture = archive
-            .read_capture(&url, &captures[0])
-            .expect("the capture reads back");
-        assert_eq!(capture.status, 404);
+        assert_eq!(
+            archive.list_captures(&url).expect("captures are listed"),
+            Vec::new(),
+            "a refused response leaves no capture behind"
+        );
+    }
+
+    /// The header a refused response carries is read off it and kept, and its absence is
+    /// kept just as deliberately: a caller deciding whether to wait needs to tell "the host
+    /// said nothing" from "the host said now".
+    #[test]
+    fn a_retry_after_header_on_a_refused_response_reaches_the_record() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut refused = page("https://example.com/slow-down", 429, "Too Many Requests");
+        response_of(&mut refused).headers.push(Header {
+            name: "Retry-After".to_owned(),
+            value: "120".to_owned(),
+        });
+        let engine = ScriptedCrawlEngine::new(vec![refused]);
+
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(
+            run.refused_responses,
+            vec![RefusedResponse {
+                url: "https://example.com/slow-down".to_owned(),
+                status: 429,
+                retry_after: Some("120".to_owned()),
+            }]
+        );
+    }
+
+    /// Every reason `CaptureRun` can leave an address owed for, folded into the shape the
+    /// archive keeps outside its collection and written and read back once.
+    /// `owed_addresses`'s own destructure is exhaustive and would refuse to compile if a
+    /// loss field were left out of it; this test is the belt beside that brace, proving the
+    /// six variants that exist today actually reach the record rather than merely that a
+    /// seventh could not be forgotten silently.
+    #[test]
+    fn a_run_s_owed_addresses_round_trip_through_the_archive_with_every_reason() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut run = CaptureRun::default();
+        run.refused_responses.push(RefusedResponse {
+            url: "https://example.com/refused".to_owned(),
+            status: 429,
+            retry_after: Some("120".to_owned()),
+        });
+        run.refused_responses.push(RefusedResponse {
+            url: "https://example.com/refused-quietly".to_owned(),
+            status: 404,
+            retry_after: None,
+        });
+        run.failed_fetches.push(FetchFailure {
+            url: "https://example.com/timed-out".to_owned(),
+            reason: "error sending request: operation timed out".to_owned(),
+        });
+        run.unaddressable_pages.push(UnaddressablePage {
+            url: "ftp://example.com/file".to_owned(),
+            reason: InvalidCanonicalUrl::UnsupportedScheme {
+                url: "ftp://example.com/file".to_owned(),
+                scheme: "ftp".to_owned(),
+            },
+        });
+        run.pages_inside_a_network
+            .push("http://169.254.169.254/".to_owned());
+        run.links_never_followed
+            .push("https://example.com/never-fetched".to_owned());
+
+        let addresses = owed_addresses(&run);
+        assert_eq!(addresses.len(), 6, "every reason variant is present");
+
+        archive
+            .write_owed(&run.archived_urls, &addresses)
+            .expect("the owed record is written");
+        assert_eq!(
+            archive.read_owed().expect("the owed record reads back"),
+            addresses
+        );
+    }
+
+    /// A redirect collision, two different addresses this run asked for that both landed on
+    /// the same final URL and were both refused, is one shape that reaches `owed_addresses`
+    /// with the same URL twice; a run whose crawl and sitemap phases both met an address
+    /// `already_filed` failed to catch is another. Either way the record should not claim
+    /// the archive is owed the same page once for every path that led to it.
+    #[test]
+    fn the_same_address_owed_twice_is_recorded_once() {
+        let mut run = CaptureRun::default();
+        run.refused_responses.push(RefusedResponse {
+            url: "https://example.com/limited".to_owned(),
+            status: 429,
+            retry_after: Some("30".to_owned()),
+        });
+        run.refused_responses.push(RefusedResponse {
+            url: "https://example.com/limited".to_owned(),
+            status: 429,
+            retry_after: None,
+        });
+
+        let addresses = owed_addresses(&run);
+
+        assert_eq!(
+            addresses,
+            vec![OwedAddress {
+                url: "https://example.com/limited".to_owned(),
+                reason: OwedReason::Refused {
+                    status: 429,
+                    retry_after: Some("30".to_owned()),
+                },
+            }],
+            "the first entry for an address is the one kept"
+        );
     }
 
     #[test]
@@ -2226,10 +2501,86 @@ mod tests {
         );
     }
 
-    /// A response that is not a success is stored, because a capture is what the server
-    /// answered. What it must not do is disappear into the count of captures: a run refused by
-    /// a host reported a collection larger than it held, and the only visible symptom was an
-    /// article count that read as an extraction defect.
+    /// An address the ordinary crawl phase was refused on lives in a different `CaptureRun`
+    /// from the sitemap phase's own, so `run.refused_urls` alone cannot stop the sitemap
+    /// phase from asking a host that just refused it for the same page again: the address has
+    /// to travel through `RunSoFar.archived`, the same way an already filed one already did.
+    /// Two wrongs follow if it does not: a second request against a host already rate
+    /// limiting this run, and the same address recorded twice in the owed list, once per
+    /// phase that met it.
+    #[test]
+    fn a_url_the_crawl_phase_was_refused_on_is_not_asked_for_again_by_the_sitemap_phase() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/refused");
+        let crawl_engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/refused",
+            429,
+            "Too Many Requests",
+        )]);
+
+        let crawl_run = capture_with_no_rules(&crawl_engine, &archive, &seed)
+            .expect("a fake engine and a fresh archive do not fail a write");
+        assert_eq!(crawl_run.captures_written, 0, "the seed page was refused");
+
+        let urls = vec![
+            "https://example.com/refused".to_owned(),
+            "https://example.com/other".to_owned(),
+        ];
+        let sitemap_engine = ScriptedCrawlEngine::new(Vec::new()).serving(vec![page(
+            "https://example.com/other",
+            200,
+            "<html><body><p>ok</p></body></html>",
+        )]);
+        // What `src/cli/capture.rs` builds for the sitemap phase: the union of what the
+        // crawl phase filed and what it was refused on.
+        let archived: HashSet<String> = crawl_run
+            .archived_urls
+            .iter()
+            .chain(crawl_run.refused_urls.iter())
+            .cloned()
+            .collect();
+
+        let sitemap_run = capture_sitemap(
+            &sitemap_engine,
+            &archive,
+            &seed,
+            &SiteRules::default(),
+            &urls,
+            false,
+            RunSoFar {
+                started: Instant::now(),
+                pages_written: crawl_run.pages_spent,
+                archived: &archived,
+            },
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(
+            sitemap_engine.urls_fetched(),
+            vec!["https://example.com/other".to_owned()],
+            "the already-refused address is not asked for a second time"
+        );
+
+        let mut merged = CaptureRun::default();
+        merged.merge(crawl_run);
+        merged.merge(sitemap_run);
+
+        let owed = owed_addresses(&merged);
+        assert_eq!(
+            owed.iter()
+                .filter(|address| address.url == "https://example.com/refused")
+                .count(),
+            1,
+            "the refused address is recorded once, not once per phase that met it"
+        );
+    }
+
+    /// A response that is not a success does not become a capture, because an item is a page
+    /// that was served. What it must not do is disappear from the run without a trace:
+    /// `responses_refused` keeps the count a rate limited crawl needs, and the address
+    /// itself survives in `refused_responses`, which is what used to be silently indistinguishable
+    /// from a captures_written count that read as a collection larger than the archive held.
     ///
     /// Measured: 160 of 250 pages answered 429 with a seventeen byte body, and the run said
     /// `250 captures, stopped: nothing was left to fetch` and nothing else.
@@ -2251,11 +2602,26 @@ mod tests {
         let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("a fake engine and a fresh archive do not fail a write");
 
-        assert_eq!(run.captures_written, 4, "every response is still stored");
+        assert_eq!(
+            run.captures_written, 1,
+            "only the served page becomes an item"
+        );
         assert_eq!(
             run.responses_refused,
             BTreeMap::from([(429, 2), (503, 1)]),
             "a run has to be able to say the host refused it"
+        );
+        assert_eq!(
+            run.refused_responses
+                .iter()
+                .map(|refused| (refused.url.as_str(), refused.status))
+                .collect::<Vec<_>>(),
+            vec![
+                ("https://example.com/b", 429),
+                ("https://example.com/c", 429),
+                ("https://example.com/d", 503),
+            ],
+            "each refusal keeps the address the count alone cannot carry"
         );
     }
     /// The sitemap phase is where a host refusing a run was actually seen, and its counts reach
@@ -2290,8 +2656,17 @@ mod tests {
         let mut whole_run = CaptureRun::default();
         whole_run.merge(sitemap_run);
 
-        assert_eq!(whole_run.captures_written, 3);
+        assert_eq!(whole_run.captures_written, 1);
         assert_eq!(whole_run.responses_refused, BTreeMap::from([(429, 2)]));
+        assert_eq!(
+            whole_run
+                .refused_responses
+                .iter()
+                .map(|refused| refused.url.as_str())
+                .collect::<Vec<_>>(),
+            vec![urls[1].as_str(), urls[2].as_str()],
+            "a phase's refused addresses survive the merge along with its count"
+        );
     }
 
     /// The two bounds this phase answers to are different facts and send an operator to
@@ -2327,6 +2702,47 @@ mod tests {
         .expect("a fake engine and a fresh archive do not fail a write");
 
         assert_eq!(run.captures_written, 2);
+        assert_eq!(run.stopped, CrawlStop::PageCeilingReached);
+    }
+
+    /// Before this bead a refused response was still a written capture and paid into this
+    /// phase's own page ceiling; now that it is not an item at all, the phase has to charge
+    /// the ceiling some other way, or a host that refuses everything drains the whole
+    /// sitemap listing down to the deadline while `--max-pages` sits there unread.
+    #[test]
+    fn a_sitemap_phase_over_a_refusing_host_still_stops_at_the_page_ceiling() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut seed = Seed::new("https://example.com/");
+        seed.max_pages = 2;
+        seed.deadline = None;
+        let urls: Vec<String> = (0..4)
+            .map(|i| format!("https://example.com/p/{i}"))
+            .collect();
+        let engine = ScriptedCrawlEngine::new(Vec::new()).serving(
+            urls.iter()
+                .map(|url| page(url, 429, "Too Many Requests"))
+                .collect(),
+        );
+
+        let run = capture_sitemap(
+            &engine,
+            &archive,
+            &seed,
+            &SiteRules::default(),
+            &urls,
+            false,
+            RunSoFar::nothing_yet(&HashSet::new()),
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(
+            engine.urls_fetched().len(),
+            2,
+            "the ceiling has to stop the phase from asking for more than it was given"
+        );
+        assert_eq!(run.captures_written, 0, "every response was refused");
+        assert_eq!(run.pages_spent, 2);
         assert_eq!(run.stopped, CrawlStop::PageCeilingReached);
     }
 
@@ -2547,7 +2963,10 @@ mod tests {
         let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
             .expect("a fake engine and a fresh archive do not fail a write");
 
-        assert_eq!(run.captures_written, 2, "both responses are still stored");
+        assert_eq!(
+            run.captures_written, 1,
+            "the redirect is stored, the refused response is not"
+        );
         assert_eq!(run.responses_refused, BTreeMap::from([(404, 1)]));
     }
     /// The wait is paid when each listed URL is crawled too, not only when it is fetched, and

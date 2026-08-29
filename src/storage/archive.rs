@@ -921,7 +921,9 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::readability::{AdmissionCost, ArticleRecord, ExtractionRules, ProseShare};
+    use crate::readability::{
+        AdmissionCost, ArticleRecord, EXTRACTOR_VERSION, ExtractionRules, ProseShare,
+    };
 
     use super::super::model::ContentHash;
     use super::StoredArticle;
@@ -954,7 +956,7 @@ mod tests {
         let stored = StoredArticle {
             markdown_sha256: ContentHash::of(b""),
             record: ArticleRecord {
-                extractor_version: 3,
+                extractor_version: EXTRACTOR_VERSION,
                 rules: ExtractionRules::Served,
                 word_count: 1240,
                 share: Some(ProseShare {

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use archeion::CanonicalUrl;
-use archeion::storage::Archive;
+use archeion::storage::{Archive, ItemId};
 use tempfile::TempDir;
 
 fn archeion() -> Command {
@@ -848,4 +848,61 @@ fn a_wildcard_robots_rule_costs_at_most_one_extra_request_across_a_sitemap_run()
             "{path} was not archived, so the request count above could have passed by doing nothing"
         );
     }
+}
+
+/// A write failure inside the sitemap phase used to skip writing `owed.json` at all, on the
+/// reasoning that a disk which had already refused one write would refuse the next: a corrupt
+/// `item.json` says nothing of the kind, since `MalformedRecord` is one bad record on an
+/// otherwise healthy disk. The ordinary crawl phase's own refusal, already known before the
+/// sitemap phase ever reaches the corrupt item, has to survive being written despite it.
+#[test]
+fn a_write_failure_in_the_sitemap_phase_does_not_drop_the_crawl_phases_own_owed_debt() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    // Opened and closed before the run starts, purely to learn the directory a capture of
+    // `/corrupt-item` would land in, so that directory can be seeded with a record the run
+    // itself never wrote.
+    let archive = Archive::open(&archive_path).expect("archive opens in an empty directory");
+    let (listener, site) = Site::bind();
+    let corrupt_url = site.url("/corrupt-item");
+    let canonical = CanonicalUrl::parse(&corrupt_url).expect("valid url");
+    let item_dir = archive_path
+        .join("items")
+        .join(canonical.host_dir())
+        .join(ItemId::of(&canonical).as_str());
+    std::fs::create_dir_all(&item_dir).expect("the item directory is created ahead of the run");
+    std::fs::write(item_dir.join("item.json"), b"not json")
+        .expect("the item record is corrupted ahead of the run");
+    drop(archive);
+
+    let listed = vec![corrupt_url.clone()];
+    let routes = vec![
+        Route {
+            path: "/index.html",
+            status: "429 Too Many Requests",
+            media_type: "text/plain",
+            body: "Too Many Requests".to_owned(),
+        },
+        route("/sitemap.xml", "application/xml", urlset(&listed)),
+        route("/corrupt-item", "text/html; charset=utf-8", LONE_PAGE),
+    ];
+    site.serve(listener, routes);
+
+    let output = capture_command(&archive_path, &site.url("/index.html"))
+        .args(["--from-sitemap", &site.url("/sitemap.xml")])
+        .output()
+        .expect("the binary runs");
+
+    assert!(
+        !output.status.success(),
+        "the corrupt item record has to surface as a failure"
+    );
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    let owed = archive.read_owed().expect("the owed record reads back");
+    assert!(
+        owed.iter()
+            .any(|address| address.url == site.url("/index.html")),
+        "the crawl phase's own refusal survives a write failure in a later phase: {owed:?}"
+    );
 }

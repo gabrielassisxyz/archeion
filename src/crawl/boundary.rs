@@ -131,6 +131,16 @@ pub struct Seed {
     /// A subscription the run was given, sent only to the origin it is bound to. Absent by
     /// default, which is a run that archives what an anonymous reader is served.
     pub session_cookie: Option<SessionCookie>,
+    /// The identity this run announces to servers and matches `robots.txt` groups against.
+    /// `None` keeps the engine's own compiled default, read fresh by whichever adapter runs
+    /// the seed rather than copied in here: a boundary type has no default of its own to
+    /// give, since the string is a fact about one adapter and this crosses to any of them.
+    ///
+    /// Every request the seed causes, a crawl's, a single fetch's and a subresource's alike,
+    /// is decided by this same field, and so is the robots group the run is judged against:
+    /// an override that reached the client but not the matcher would obey rules nobody wrote
+    /// for the identity actually asking.
+    pub user_agent: Option<String>,
 }
 
 impl Seed {
@@ -164,6 +174,8 @@ impl Seed {
             // Carrying a credential is never the default. A run says so, out loud, and says
             // where the credential came from.
             session_cookie: None,
+            // The engine's own compiled default, until a caller asks for another identity.
+            user_agent: None,
         }
     }
 }

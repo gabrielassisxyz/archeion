@@ -19,6 +19,7 @@ use std::thread;
 use std::time::Duration;
 
 use archeion::CanonicalUrl;
+use archeion::crawl::DEFAULT_USER_AGENT;
 use archeion::storage::Archive;
 use tempfile::TempDir;
 
@@ -747,6 +748,409 @@ fn answer_with_an_escaped_wildcard_robots_rule(mut stream: TcpStream) -> std::io
     );
     stream.write_all(head.as_bytes())?;
     stream.write_all(&body)?;
+    stream.flush()
+}
+
+/// A page linking to a second, so the header check below has more than one request to hold
+/// against `--user-agent`: a client that sent the flag's value on the seed and reverted to
+/// its own default on every request after would pass a check that only read the first.
+const USER_AGENT_INDEX: &str = r#"<html><head><title>Index</title></head>
+    <body><a href="/second">a second page</a></body></html>"#;
+const USER_AGENT_SECOND_PAGE: &str =
+    "<html><head><title>Second</title></head><body>reached from the index</body></html>";
+
+/// `--user-agent`, honoured on the HTTP client of a real, multi-page crawl through the
+/// binary: every request the run makes carries the string the flag named, not only the one
+/// that fetched the seed.
+#[test]
+fn capture_sends_the_configured_user_agent_on_every_request() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = serve_recording_user_agent(Arc::clone(&requests));
+    let seed = format!("http://127.0.0.1:{port}/");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(&seed)
+        .args([
+            "--max-pages",
+            "2",
+            "--max-depth",
+            "1",
+            "--concurrency",
+            "1",
+            "--max-retries",
+            "0",
+            "--user-agent",
+            "archive-bot/9.0",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stdout_of(&output).contains("archived 2 capture(s)"),
+        "{}",
+        stdout_of(&output)
+    );
+
+    let seen = requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        seen.len() >= 2,
+        "the crawl made fewer requests than the pages it archived: {seen:?}"
+    );
+    assert!(
+        seen.iter().all(|agent| agent == "archive-bot/9.0"),
+        "not every request carried the configured identity: {seen:?}"
+    );
+}
+
+fn serve_recording_user_agent(requests: Arc<Mutex<Vec<String>>>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let recorded = Arc::clone(&requests);
+            thread::spawn(move || answer_recording_user_agent(stream, recorded));
+        }
+    });
+    port
+}
+
+fn answer_recording_user_agent(
+    mut stream: TcpStream,
+    requests: Arc<Mutex<Vec<String>>>,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut agent = None;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        if let Some(value) = header
+            .strip_prefix("User-Agent:")
+            .or_else(|| header.strip_prefix("user-agent:"))
+        {
+            agent = Some(value.trim().to_owned());
+        }
+        header.clear();
+    }
+    if let Some(agent) = agent {
+        requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(agent);
+    }
+
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    let (media_type, body): (&str, &[u8]) = match path.as_str() {
+        "/robots.txt" => ("text/plain", b""),
+        "/" => ("text/html; charset=utf-8", USER_AGENT_INDEX.as_bytes()),
+        "/second" => (
+            "text/html; charset=utf-8",
+            USER_AGENT_SECOND_PAGE.as_bytes(),
+        ),
+        _ => ("text/plain", b"not here"),
+    };
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {media_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
+/// A run given no `--user-agent` sends the same string the library compiles into
+/// `DEFAULT_USER_AGENT`, byte for byte, rather than a copy of it typed into this test.
+#[test]
+fn capture_with_no_user_agent_flag_sends_the_compiled_default() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = serve_recording_user_agent(Arc::clone(&requests));
+    let seed = format!("http://127.0.0.1:{port}/");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(&seed)
+        .args([
+            "--max-pages",
+            "1",
+            "--max-depth",
+            "1",
+            "--concurrency",
+            "1",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+
+    let seen = requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some(DEFAULT_USER_AGENT),
+        "omitting the flag did not send the compiled default byte for byte"
+    );
+}
+
+/// A value carrying a raw `\r\n` is refused before the process ever dials the seed: let
+/// through, it reaches a client the vendored engine builds with `unwrap_unchecked`, which
+/// aborts the process outright rather than reporting a failure this project defines. The
+/// exit code and the message are `--cookie-file`'s own for the same class of value; no
+/// archive is left behind, matching a seed refused for any other reason.
+#[test]
+fn capture_refuses_a_user_agent_carrying_a_control_character() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg("http://127.0.0.1:1/")
+        .args(["--deadline", "5s", "--allow-private-addresses"])
+        .args([
+            "--user-agent",
+            "bad
+X-Injected: 1",
+        ])
+        .output()
+        .expect("the binary runs");
+
+    assert!(
+        !output.status.success(),
+        "a header injection in --user-agent was accepted"
+    );
+    assert!(
+        stderr_of(&output).contains("--user-agent"),
+        "the refusal did not name the flag: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("cannot be sent in a header"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        !archive_path.exists(),
+        "a seed refused before the run started still left an archive behind"
+    );
+}
+
+/// The rule is what a header can carry, not what ASCII can spell: an operator's own name
+/// with an accent in it is ordinary and `--user-agent` must keep sending it rather than
+/// refusing every byte a control character is not.
+#[test]
+fn capture_accepts_a_user_agent_carrying_a_non_ascii_character() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = serve_recording_user_agent(Arc::clone(&requests));
+    let seed = format!("http://127.0.0.1:{port}/");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(&seed)
+        .args([
+            "--max-pages",
+            "1",
+            "--max-depth",
+            "1",
+            "--concurrency",
+            "1",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .args(["--user-agent", "café/1.0"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+
+    let seen = requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some("café/1.0"),
+        "a non-ASCII identity was not sent as given"
+    );
+}
+
+/// A `robots.txt` naming this run's own identity and a `*` group that disagrees with it:
+/// RFC 9309 reads whichever group names the requester and never the other one, so whether a
+/// path either one mentions is refused turns entirely on the identity the run announced.
+///
+/// Each crawl below is pointed at a page linking to exactly one target rather than at one
+/// page linking to both. The vendored engine's own frontier occasionally drops one of two
+/// links discovered on the same page before either is fetched, a race in its own concurrent
+/// link handling this project does not own and cannot fix from this side of the boundary.
+/// Two seed pages, `/from-special` and `/from-general`, keep every crawl below to one
+/// discovered link while still reaching both targets, which is what lets this cover both
+/// halves of the claim: that the named group's own rule is obeyed, and that a path outside
+/// it still falls to `*` or to nothing exactly as before this flag existed.
+const ROBOTS_TXT_NAMING_ONE_AGENT: &str = "User-agent: archive-bot\n\
+    Disallow: /special-only\n\n\
+    User-agent: *\n\
+    Disallow: /general-only\n";
+const FROM_SPECIAL_SEED_PAGE: &str = r#"<html><head><title>From special</title></head><body>
+    <a href="/special-only">the named group's rule</a>
+    </body></html>"#;
+const FROM_GENERAL_SEED_PAGE: &str = r#"<html><head><title>From general</title></head><body>
+    <a href="/general-only">the wildcard's rule</a>
+    </body></html>"#;
+
+/// `--user-agent` reaches the robots matcher, not only the HTTP client: run under the
+/// identity a `robots.txt` names, a crawl is judged against that named group's own rule
+/// rather than against `*`, a path the named group does not mention still falls to `*`, and
+/// the same two paths swap verdicts when the run falls back to the compiled default exactly
+/// as it did before this flag existed.
+#[test]
+fn captures_robots_group_named_for_the_configured_user_agent() {
+    let dir = TempDir::new().expect("temp dir");
+    let port = serve_a_site_naming_one_agent_in_robots();
+
+    let run = |case: &str, from: &str, target: &str, agent: Option<&str>| -> bool {
+        let seed = format!("http://127.0.0.1:{port}/{from}");
+        let archive_path = dir.path().join(case);
+        let mut command = archeion();
+        command.arg("capture").arg(&archive_path).arg(&seed).args([
+            "--max-pages",
+            "10",
+            "--max-depth",
+            "1",
+            "--concurrency",
+            "1",
+            "--max-retries",
+            "0",
+        ]);
+        if let Some(agent) = agent {
+            command.args(["--user-agent", agent]);
+        }
+        let output = command
+            .args(["--deadline", "30s", "--allow-private-addresses"])
+            .output()
+            .expect("the binary runs");
+        assert!(output.status.success(), "{case}: {}", stderr_of(&output));
+
+        let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+        let url =
+            CanonicalUrl::parse(&format!("http://127.0.0.1:{port}/{target}")).expect("valid url");
+        !archive
+            .list_captures(&url)
+            .expect("captures are listed")
+            .is_empty()
+    };
+
+    assert!(
+        !run(
+            "named-agent-on-its-own-rule",
+            "from-special",
+            "special-only",
+            Some("archive-bot/9.0"),
+        ),
+        "the named group's own Disallow rule was not applied under the identity it names"
+    );
+    assert!(
+        run(
+            "named-agent-outside-its-rule",
+            "from-general",
+            "general-only",
+            Some("archive-bot/9.0"),
+        ),
+        "the wildcard's rule governed a path the named group leaves unmentioned"
+    );
+    assert!(
+        run(
+            "default-agent-outside-the-named-rule",
+            "from-special",
+            "special-only",
+            None,
+        ),
+        "the named group's rule leaked onto the identity it does not name"
+    );
+    assert!(
+        !run(
+            "default-agent-on-the-wildcard-rule",
+            "from-general",
+            "general-only",
+            None,
+        ),
+        "the compiled default did not fall back to the wildcard group"
+    );
+}
+
+fn serve_a_site_naming_one_agent_in_robots() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || answer_naming_one_agent_in_robots(stream));
+        }
+    });
+    port
+}
+
+fn answer_naming_one_agent_in_robots(mut stream: TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    let (media_type, body): (&str, &[u8]) = match path.as_str() {
+        "/robots.txt" => ("text/plain", ROBOTS_TXT_NAMING_ONE_AGENT.as_bytes()),
+        "/from-special" => (
+            "text/html; charset=utf-8",
+            FROM_SPECIAL_SEED_PAGE.as_bytes(),
+        ),
+        "/from-general" => (
+            "text/html; charset=utf-8",
+            FROM_GENERAL_SEED_PAGE.as_bytes(),
+        ),
+        "/special-only" => (
+            "text/html; charset=utf-8",
+            b"<html><head><title>Special</title></head><body>the named group's page</body></html>",
+        ),
+        "/general-only" => (
+            "text/html; charset=utf-8",
+            b"<html><head><title>General</title></head><body>the wildcard's page</body></html>",
+        ),
+        _ => ("text/plain", b"not here"),
+    };
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {media_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)?;
     stream.flush()
 }
 

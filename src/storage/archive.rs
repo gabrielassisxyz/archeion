@@ -416,6 +416,15 @@ impl Archive {
         })
     }
 
+    /// Whether this address already has at least one capture, without reading any of them:
+    /// the item record exists exactly when a capture does, so a stat of it is enough. A
+    /// second capture into an item is otherwise invisible to a run that only ever appends,
+    /// and this is what lets a caller notice before or after it happens rather than not at
+    /// all.
+    pub fn has_captures(&self, url: &CanonicalUrl) -> bool {
+        self.item_path(url).exists()
+    }
+
     pub fn read_capture(
         &self,
         url: &CanonicalUrl,

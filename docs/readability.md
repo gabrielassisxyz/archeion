@@ -394,7 +394,7 @@ They are set where a hostile page is certainly refused, not where a real page is
 ```json
 {
   "markdown_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "extractor_version": 3,
+  "extractor_version": 4,
   "rules": "heuristic",
   "word_count": 1240,
   "share": {
@@ -441,7 +441,7 @@ A refused page gets a record of its own instead of this pair, holding the same m
 
 ```json
 {
-  "extractor_version": 3,
+  "extractor_version": 4,
   "rules": "heuristic",
   "share": {
     "article_chars": 137,
@@ -457,7 +457,7 @@ The excerpt is the page-controlled field that both article and refusal records c
 
 ```json
 {
-  "extractor_version": 3,
+  "extractor_version": 4,
   "rules": "heuristic",
   "share": {
     "article_chars": 137,
@@ -473,7 +473,7 @@ The byline is also page-controlled, but it cannot answer the same way. A cut exc
 ```json
 {
   "markdown_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "extractor_version": 3,
+  "extractor_version": 4,
   "rules": "heuristic",
   "word_count": 1240,
   "share": {
@@ -499,7 +499,7 @@ A page the extractor read and judged not to be an article gets the smaller marke
 
 ```json
 {
-  "extractor_version": 3,
+  "extractor_version": 4,
   "rules": "heuristic"
 }
 ```
@@ -513,7 +513,7 @@ A record for a document the site published looks like this. `excerpt` and `bylin
 ```json
 {
   "markdown_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "extractor_version": 3,
+  "extractor_version": 4,
   "rules": "served",
   "word_count": 1240,
   "share": {
@@ -534,7 +534,7 @@ A record for a document the site published looks like this. `excerpt` and `bylin
 
 `markdown_sha256` is the address of the document beside it, and it is what makes the pair safe to rewrite. Ordering alone is enough only the first time: writing over an existing pair and stopping between the two files leaves new prose beside an old record, both present, both parsing, and every field describing something that is no longer there. A reader that finds the two disagreeing reports no article, because the response the article was derived from is still in the archive and the pass that re-extracts will simply redo it.
 
-`extractor_version` is bumped when the meaning of a field or a rule that fills one changes, not when a field is added, on the same terms as the metadata record. It is 3 today. It became 2 for the sliver rule: `share` arriving beside the counts would not have been enough on its own, but a page can now produce prose and still not be stored as an article, so the absence of a record beside a capture stopped meaning what it meant at 1. It became 3 when HTML article links and image descriptions stopped reaching the stored Markdown as page-controlled syntax.
+`extractor_version` is bumped when the meaning of a field or a rule that fills one changes, not when a field is added, on the same terms as the metadata record. It is 4 today. It became 2 for the sliver rule: `share` arriving beside the counts would not have been enough on its own, but a page can now produce prose and still not be stored as an article, so the absence of a record beside a capture stopped meaning what it meant at 1. It became 3 when HTML article links and image descriptions stopped reaching the stored Markdown as page-controlled syntax. It became 4 when which address an image carries and whether an anchor around one is a link at all changed: a record written under 3 names a different address for the same image and spells a linked picture as characters that are not a link, so an export built from it differs from one built from a rebuild.
 
 The rules layer, the not-article marker, the byline bound and `accessible_for_free` did not bump it. For the byline, a present value still means the attribution the page carried, and `truncated: ["byline"]` is an added answer only records written after the bound can carry. The records that exist did not change their meanings: `article_chars` and `page_chars` mean exactly what they meant at 2, and `rules` says whether a rule reached the page. The marker is a new record type with the same version as the extractor that made the decision. An older absence stays stale to a repass because it is absence, not because every article record needs a new number. `accessible_for_free` is the same shape again: a record written before it existed said nothing about a paywall, and reading its absence as "nothing declared" is not a claim that record never had a chance to make, it is the true answer either way.
 

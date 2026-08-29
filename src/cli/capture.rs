@@ -641,6 +641,7 @@ struct CaptureReport {
     asset_fetches: usize,
     pages_dropped: usize,
     links_never_followed: Vec<String>,
+    links_recovered: usize,
     stopped: &'static str,
     session: Option<SessionReport>,
     sitemap: Option<SitemapReport>,
@@ -676,6 +677,7 @@ fn report_of(
         asset_fetches: run.asset_fetches,
         pages_dropped: run.pages_dropped,
         links_never_followed: run.links_never_followed.clone(),
+        links_recovered: run.links_recovered,
         stopped: stop_name(run.stopped),
         session: seed.session_cookie.as_ref().map(|cookie| SessionReport {
             origin: cookie.origin(),
@@ -790,6 +792,7 @@ fn human_report(report: &CaptureReport, stopped: CrawlStop) -> String {
         ),
         ("pages dropped", report.pages_dropped.to_string()),
         ("links lost", report.links_never_followed.len().to_string()),
+        ("recovered", report.links_recovered.to_string()),
         ("stopped", stop_sentence(stopped).to_owned()),
     ];
     for (label, value) in rows {

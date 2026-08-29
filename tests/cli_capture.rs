@@ -188,6 +188,7 @@ fn a_seed_is_crawled_into_an_archive_that_the_run_creates() {
              assets        1 stored, 0 missed, 1 request(s)\n  \
              pages dropped 0\n  \
              links lost    0\n  \
+             recovered     0\n  \
              stopped       nothing was left to fetch\n",
             archive = archive_path.display(),
             seed = site.url("/index.html"),
@@ -393,23 +394,35 @@ fn a_max_depth_of_one_takes_every_link_one_hop_from_the_seed_and_no_further() {
 }
 
 /// The scheduling defect the test above works around, pinned directly rather than dodged.
-/// A page with two sibling links crawled at a concurrency of one loses one of them to the
-/// vendored crawl engine's own frontier about half the time; `docs/crawl-boundary.md` has
-/// the mechanism. There is no fix for that from here, so what this asserts is the guard
-/// instead: a run that comes up short says so and leaves with a failing exit code, and a
-/// run that genuinely archived every page still leaves with a clean one. Thirty runs make a
-/// coin flip that happened to hide from every one of them a chance of about one in a
-/// billion, and each run is three tiny pages over loopback, so the whole test stays well
-/// inside the budget of `cargo test`.
+/// A page with two sibling links crawled at a concurrency of one still loses one of them to
+/// the vendored crawl engine's own frontier about half the time; `docs/crawl-boundary.md`
+/// has the mechanism. What no longer follows from that is a failed run: `recover_lost_links`
+/// fetches directly whatever this project's own robots decision would have let through and
+/// the frontier never asked the site for, so every run below leaves with a clean exit code
+/// holding every page, whether or not the race actually struck on that particular run.
+/// Thirty runs, at a coin flip this race resolved to about half the time before recovery
+/// existed, are what keep a version of the recovery that stopped fetching anything from
+/// passing by accident: the assertion inside the loop is where that version would fail, not
+/// a count taken afterward. Each run is three tiny pages over loopback, so the whole test
+/// stays well inside the budget of `cargo test`.
 ///
 /// This site's own `/robots.txt` answers 404, which the engine reads as permission to fetch
-/// everything, so every loss this test sees is the genuine one: proof that the guard below,
-/// which excuses a link `robots.txt` disallows, still reports one that was never mentioned
-/// at all.
+/// everything, so this exercises the recovery on its own, with no rule anywhere near the
+/// decision. `a_link_the_named_group_leaves_unmentioned_is_not_lost_to_the_frontier_race`
+/// covers the other reason a link reaches `recover_lost_links`: a `robots.txt` naming the
+/// identity a run is using, which removes the `Disallow` that would otherwise keep this same
+/// race from reaching every single run.
+///
+/// `links_recovered`, read off `--json`, is the self-check the loop needs now that a link
+/// the race drops no longer produces a visible symptom on its own: a version of this test
+/// that never actually reached the race, because a vendor bump quietly closed it, would
+/// still see every page archived by the ordinary frontier and would pass while proving
+/// nothing. Summed across the thirty attempts rather than asserted per attempt, since which
+/// runs the race strikes on is exactly the coin flip this loop exists to ride out.
 #[test]
-fn a_concurrency_of_one_reports_a_link_it_never_followed_instead_of_a_false_success() {
+fn a_concurrency_of_one_recovers_a_link_the_frontier_never_queued() {
     let site = Site::start();
-    let mut losses_seen = 0;
+    let mut links_recovered_total = 0u64;
 
     for _ in 0..30 {
         let dir = TempDir::new().expect("temp dir");
@@ -417,6 +430,7 @@ fn a_concurrency_of_one_reports_a_link_it_never_followed_instead_of_a_false_succ
 
         let output = archeion()
             .arg("capture")
+            .arg("--json")
             .arg(&archive_path)
             .arg(site.url("/depth-index.html"))
             .args([
@@ -433,6 +447,8 @@ fn a_concurrency_of_one_reports_a_link_it_never_followed_instead_of_a_false_succ
             .output()
             .expect("the binary runs");
 
+        assert!(output.status.success(), "{}", stderr_of(&output));
+
         let archive = Archive::open_existing(&archive_path).expect("the archive exists");
         let captures_of = |path: &str| {
             let url = CanonicalUrl::parse(&site.url(path)).expect("valid url");
@@ -445,38 +461,562 @@ fn a_concurrency_of_one_reports_a_link_it_never_followed_instead_of_a_false_succ
             + captures_of("/shallow")
             + captures_of("/p/deep-post");
 
+        assert_eq!(
+            archived,
+            3,
+            "a run that exited clean was holding fewer pages than it discovered: {}",
+            stdout_of(&output)
+        );
+
+        let report: serde_json::Value =
+            serde_json::from_str(&stdout_of(&output)).expect("one object and nothing else");
+        links_recovered_total += report["links_recovered"].as_u64().expect("a count");
+    }
+
+    assert!(
+        links_recovered_total > 0,
+        "thirty runs at a concurrency of one never asked recover_lost_links for a single link, so this loop never exercised the race it exists to ride out"
+    );
+}
+
+/// A recovered page is not a leaf: `record_discovered_links` folds its own outbound links
+/// into the same `--max-depth` bookkeeping a page the crawl queued itself would have gone
+/// through. This site's seed links two siblings, `/reachable` and `/half-open`, and only
+/// `/half-open` itself links further, to a second port on the same loopback host with
+/// nothing listening on it, a connection this project's own resolution reads as same-host
+/// (a scheme and a host, never a port) and is therefore recorded and pursued exactly like
+/// any other in-scope link.
+///
+/// Whichever sibling the frontier's own race drops at a concurrency of one, the run below
+/// still holds `/reachable`: recovered directly if the race dropped it, fetched by the
+/// ordinary frontier if it did not. What differs is `/half-open`'s own child. If the race
+/// spared `/half-open`, the ordinary frontier discovers and fails to fetch the unreachable
+/// address itself, an everyday failed fetch that does not fail the run. If the race dropped
+/// `/half-open` instead, recovery fetches it directly, discovers the same address from its
+/// freshly-fetched body, and now has to answer for it itself: a connection nothing accepts
+/// is not recoverable, so it lands in `still_missing`, the run exits non-zero, and stderr
+/// names it, restoring the failure path a version of recovery that never retried, paced or
+/// bounded itself would have no way to reach.
+///
+/// Twenty attempts are what let both branches show up: the two failure-path assertions
+/// only run on an attempt where the race actually dropped `/half-open`, which happens on
+/// roughly half of them.
+#[test]
+fn a_recovered_page_s_own_child_is_fetched_or_reported_never_silently_dropped() {
+    let dir = TempDir::new().expect("temp dir");
+    // Closed the instant it is bound, so every fetch aimed at this port for the rest of the
+    // test finds nothing listening and is refused rather than merely slow.
+    let closed_port = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        listener.local_addr().expect("the bound address").port()
+    };
+    let port = serve_a_site_with_a_half_open_grandchild(closed_port);
+    let reachable_url =
+        CanonicalUrl::parse(&format!("http://127.0.0.1:{port}/reachable")).expect("valid url");
+    let half_open_url =
+        CanonicalUrl::parse(&format!("http://127.0.0.1:{port}/half-open")).expect("valid url");
+    let unreachable_url = format!("http://127.0.0.1:{closed_port}/unreachable");
+    let mut saw_the_failure_path = false;
+
+    for attempt in 0..20 {
+        let seed = format!("http://127.0.0.1:{port}/");
+        let archive_path = dir.path().join(format!("attempt-{attempt}"));
+        let output = archeion()
+            .arg("capture")
+            .arg("--json")
+            .arg(&archive_path)
+            .arg(&seed)
+            .args([
+                "--max-pages",
+                "10",
+                "--max-depth",
+                "2",
+                "--concurrency",
+                "1",
+                "--max-retries",
+                "0",
+                "--deadline",
+                "20s",
+                "--allow-private-addresses",
+            ])
+            .output()
+            .expect("the binary runs");
+
+        let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+        assert!(
+            !archive
+                .list_captures(&reachable_url)
+                .expect("captures are listed")
+                .is_empty(),
+            "attempt {attempt}: the sibling with no children of its own was not archived"
+        );
+
+        let report: serde_json::Value =
+            serde_json::from_str(&stdout_of(&output)).expect("one object and nothing else");
+        // Whichever of the two branches below this attempt lands in, the run has to have
+        // actually discovered the unreachable address at all: named as a plain failed
+        // fetch when the ordinary frontier reached `/half-open` itself, or named as a lost
+        // link when recovery did and could not reach its child. A version that silently
+        // never discovered the child in the first place, the failure `--max-depth`
+        // expansion inside recovery exists to close, would leave it out of both and pass
+        // neither assertion below, so this is checked before either branch runs at all.
+        let named_as_a_failed_fetch = report["failed_fetches"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .any(|failure| failure["url"] == unreachable_url);
+        let named_as_a_lost_link = report["links_never_followed"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .any(|url| url == &unreachable_url);
+        assert!(
+            named_as_a_failed_fetch || named_as_a_lost_link,
+            "attempt {attempt}: the unreachable grandchild was never discovered at all: {}",
+            stdout_of(&output)
+        );
+
         if output.status.success() {
-            assert_eq!(
-                archived,
-                3,
-                "the run reported success while holding fewer pages than it discovered: {}",
-                stdout_of(&output)
+            // The race spared `/half-open`, or recovered it with nothing left over: either
+            // way the ordinary run holds it, and its own child is this run's problem to
+            // answer for, not a silent gap.
+            assert!(
+                !archive
+                    .list_captures(&half_open_url)
+                    .expect("captures are listed")
+                    .is_empty(),
+                "attempt {attempt}: a clean exit did not hold the page with a child of its own"
             );
         } else {
-            losses_seen += 1;
+            saw_the_failure_path = true;
             assert!(
-                archived < 3,
-                "the run reported a loss while the archive actually holds every page: {}",
+                stderr_of(&output).contains(&format!(
+                    "{unreachable_url} was discovered and never fetched"
+                )),
+                "attempt {attempt}: {}",
                 stderr_of(&output)
             );
             assert!(
-                stderr_of(&output).contains("was discovered and never fetched"),
-                "{}",
-                stderr_of(&output)
-            );
-            assert!(
-                stderr_of(&output).contains("link(s) the crawl discovered were never fetched"),
-                "{}",
+                stderr_of(&output).contains("1 link(s) the crawl discovered were never fetched"),
+                "attempt {attempt}: {}",
                 stderr_of(&output)
             );
         }
     }
 
     assert!(
-        losses_seen > 0,
-        "thirty runs at a concurrency of one never lost a single link, so this test never \
-         exercised the guard it exists to pin"
+        saw_the_failure_path,
+        "twenty attempts never once had the race drop the page whose own child recovery \
+         cannot reach, so the restored failure path was never exercised"
     );
+}
+
+fn serve_a_site_with_a_half_open_grandchild(closed_port: u16) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || answer_with_a_half_open_grandchild(stream, closed_port));
+        }
+    });
+    port
+}
+
+fn answer_with_a_half_open_grandchild(
+    mut stream: TcpStream,
+    closed_port: u16,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    let root_page = r#"<html><head><title>Root</title></head><body>
+        <a href="/reachable">a leaf</a>
+        <a href="/half-open">a page with its own child</a>
+        </body></html>"#
+        .to_owned();
+    let half_open_page = format!(
+        r#"<html><head><title>Half open</title></head><body>
+        <a href="http://127.0.0.1:{closed_port}/unreachable">nothing answers here</a>
+        </body></html>"#
+    );
+    let (media_type, body): (&str, String) = match path.as_str() {
+        "/" => ("text/html; charset=utf-8", root_page),
+        "/reachable" => (
+            "text/html; charset=utf-8",
+            "<html><head><title>Reachable</title></head><body>a leaf</body></html>".to_owned(),
+        ),
+        "/half-open" => ("text/html; charset=utf-8", half_open_page),
+        "/robots.txt" => ("text/plain", String::new()),
+        _ => ("text/plain", "not here".to_owned()),
+    };
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {media_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()
+}
+
+/// `--max-pages` is the run's, not a fresh budget recovery hands itself: three siblings are
+/// governed by an `Allow` longer than the `Disallow` above it, so the vendored engine's own
+/// first-match rule refuses all three at the frontier while this project's own longest-match
+/// reading of RFC 9309 allows every one of them, deterministically, on every single run, with
+/// no race and no coin flip anywhere in this test. `--max-pages 2` leaves the seed one page
+/// of budget once it is spent on the seed itself, and `recover_lost_links` checks that
+/// budget before every fetch rather than once for the batch of three, so it stops after the
+/// first and never touches the other two.
+#[test]
+fn recovery_stops_at_the_page_ceiling_instead_of_spending_the_whole_batch() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let port = serve_a_site_whose_allow_outranks_a_shorter_disallow();
+    let seed = format!("http://127.0.0.1:{port}/");
+
+    let output = archeion()
+        .arg("capture")
+        .arg("--json")
+        .arg(&archive_path)
+        .arg(&seed)
+        .args([
+            "--max-pages",
+            "2",
+            "--max-depth",
+            "1",
+            "--concurrency",
+            "1",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout_of(&output)).expect("one object and nothing else");
+    assert_eq!(
+        report["captures_written"],
+        2,
+        "the run held more captures than its own page ceiling allowed: {}",
+        stdout_of(&output)
+    );
+    assert_eq!(
+        report["links_recovered"],
+        1,
+        "recovery did not stop at the one page the ceiling left it: {}",
+        stdout_of(&output)
+    );
+    // A link the page ceiling left behind is the budget working as asked, not a loss:
+    // `links_discovered_but_never_fetched` already excludes it on the same reasoning for
+    // the crawl phase, and recovery's own per-candidate check exists to keep that true here.
+    assert_eq!(
+        report["links_never_followed"],
+        serde_json::json!([]),
+        "a page the ceiling left behind was reported as lost rather than left silent: {}",
+        stdout_of(&output)
+    );
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    let captures_of = |path: &str| {
+        let url =
+            CanonicalUrl::parse(&format!("http://127.0.0.1:{port}{path}")).expect("valid url");
+        archive
+            .list_captures(&url)
+            .expect("captures are listed")
+            .len()
+    };
+    // Sorted order is what `links_discovered_but_never_fetched` already hands recovery, so
+    // `/p/keep1` is deterministically the one candidate the remaining page went to.
+    assert!(
+        captures_of("/p/keep1") > 0,
+        "the one page the ceiling allowed was not archived"
+    );
+    assert_eq!(
+        captures_of("/p/keep2") + captures_of("/p/keep3"),
+        0,
+        "recovery spent the ceiling on more than the one page it had left"
+    );
+}
+
+/// A `robots.txt` naming this run's own identity, per arch-ugh, is the polite site this
+/// mechanism exists for, and pacing is the thing a polite site is owed back. `--delay` is
+/// honoured between the crawl's own requests already; this pins that recovery honours it
+/// too, over the same three siblings `recovery_stops_at_the_page_ceiling_instead_of_spending_the_whole_batch`
+/// uses so the entry into `recover_lost_links` is deterministic rather than raced.
+/// `--max-pages` is left high enough for all three, so the whole measured wall clock is the
+/// three waits recovery owes and whatever the loopback round trips themselves cost, which is
+/// negligible beside three hundred milliseconds.
+#[test]
+fn recovery_waits_the_configured_delay_between_its_own_fetches() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let port = serve_a_site_whose_allow_outranks_a_shorter_disallow();
+    let seed = format!("http://127.0.0.1:{port}/");
+
+    let started = std::time::Instant::now();
+    let output = archeion()
+        .arg("capture")
+        .arg("--json")
+        .arg(&archive_path)
+        .arg(&seed)
+        .args([
+            "--max-pages",
+            "10",
+            "--max-depth",
+            "1",
+            "--concurrency",
+            "1",
+            "--max-retries",
+            "0",
+            "--delay",
+            "500ms",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+    let elapsed = started.elapsed();
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout_of(&output)).expect("one object and nothing else");
+    assert_eq!(
+        report["links_recovered"],
+        3,
+        "all three siblings should have been recovered directly: {}",
+        stdout_of(&output)
+    );
+    // A lower bound, which is the only kind a sleep can be held to: it never returns early,
+    // and asserting an upper bound would be asserting that this machine was not busy. Half a
+    // second is large enough that the three waits this pins, a second and a half together,
+    // are not lost in the noise a real socket and a fresh runtime per fetch already cost.
+    assert!(
+        elapsed >= Duration::from_millis(1_200),
+        "recovery fetched three pages under a 500ms delay in {elapsed:?}, which is not three \
+         waits' worth of time"
+    );
+}
+
+/// A 429 is an answer, not a recovery: `filter_and_forward` still archives it, because a
+/// capture is what the server answered, but `recover_lost_links` does not let a status the
+/// crawl's own retry policy would have repeated clear a URL off `still_missing`. One
+/// candidate, the same deterministic "Allow outranks a shorter Disallow" shape used above so
+/// there is no race to wait out, answers 429 to every request it receives; `--max-retries 2`
+/// is what lets this also pin that recovery spends that budget rather than giving up on the
+/// first attempt, since the request count the server keeps has to reach three, one initial
+/// attempt and two retries, before the run gives up on it.
+#[test]
+fn recovery_answered_with_a_status_the_crawl_would_have_retried_stays_lost() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let requests = Arc::new(Mutex::new(0u32));
+    let port = serve_a_site_that_always_answers_429(Arc::clone(&requests));
+    let seed = format!("http://127.0.0.1:{port}/");
+    let only_url =
+        CanonicalUrl::parse(&format!("http://127.0.0.1:{port}/p/only")).expect("valid url");
+
+    let output = archeion()
+        .arg("capture")
+        .arg("--json")
+        .arg(&archive_path)
+        .arg(&seed)
+        .args([
+            "--max-pages",
+            "10",
+            "--max-depth",
+            "1",
+            "--concurrency",
+            "1",
+            "--max-retries",
+            "2",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(
+        !output.status.success(),
+        "a link stuck at 429 exited clean: {}",
+        stdout_of(&output)
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout_of(&output)).expect("one object and nothing else");
+    assert_eq!(
+        report["links_never_followed"],
+        serde_json::json!([only_url.as_str()]),
+        "a 429 recovery never stopped repeating was not left in still_missing: {}",
+        stdout_of(&output)
+    );
+    assert_eq!(
+        report["links_recovered"],
+        0,
+        "a link that never answered under 400 was counted as recovered: {}",
+        stdout_of(&output)
+    );
+    assert_eq!(
+        *requests.lock().expect("no poison"),
+        3,
+        "the retry budget was not spent: one attempt plus two retries is three requests"
+    );
+
+    // Not archived, and this is the one place recovery and the refusal rule have to agree:
+    // recovery declining to call a 429 a success is a decision about the link, and the
+    // refusal rule not filing it as an item is a decision about the response. A page the
+    // host refused is not an item whichever door it arrived through, so a recovery that
+    // ends in one leaves the address owed rather than a seventeen byte capture behind.
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    assert!(
+        archive
+            .list_captures(&only_url)
+            .expect("captures are listed")
+            .is_empty(),
+        "the 429 was filed as an item rather than left owed"
+    );
+    let owed = archive.read_owed().expect("the owed record reads back");
+    assert_eq!(
+        owed.iter()
+            .map(|address| address.url.as_str())
+            .collect::<Vec<_>>(),
+        vec![only_url.as_str()],
+        "the address recovery gave up on is what the archive says it is owed: {owed:?}"
+    );
+    // One, not the three requests above: recovery retries inside itself and hands the
+    // boundary only the attempt it gave up on, so this counts refusals the archive saw
+    // rather than refusals the host sent.
+    assert_eq!(
+        report["responses_refused"]["429"],
+        1,
+        "the refusal recovery gave up on is still counted as one: {}",
+        stdout_of(&output)
+    );
+}
+
+fn serve_a_site_that_always_answers_429(requests: Arc<Mutex<u32>>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let requests = Arc::clone(&requests);
+            thread::spawn(move || answer_always_429(stream, requests));
+        }
+    });
+    port
+}
+
+fn answer_always_429(mut stream: TcpStream, requests: Arc<Mutex<u32>>) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    let robots_body = "User-agent: *\nDisallow: /p/\nAllow: /p/only\n";
+    let seed_body = "<html><body><a href='/p/only'>only</a></body></html>";
+    let (status, media_type, body): (&str, &str, &[u8]) = match path.as_str() {
+        "/robots.txt" => ("200 OK", "text/plain", robots_body.as_bytes()),
+        "/" => ("200 OK", "text/html; charset=utf-8", seed_body.as_bytes()),
+        "/p/only" => {
+            *requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+            (
+                "429 Too Many Requests",
+                "text/html; charset=utf-8",
+                b"<html><body>slow down</body></html>",
+            )
+        }
+        _ => ("404 Not Found", "text/plain", b"not here"),
+    };
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {media_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
+const ROBOTS_TXT_ALLOW_OUTRANKING_A_SHORTER_DISALLOW: &str = "User-agent: *\n\
+    Disallow: /p/\n\
+    Allow: /p/keep1\n\
+    Allow: /p/keep2\n\
+    Allow: /p/keep3\n";
+const ALLOW_OUTRANKS_SEED_PAGE: &str = r#"<html><head><title>Home</title></head><body>
+    <a href="/p/keep1">first</a>
+    <a href="/p/keep2">second</a>
+    <a href="/p/keep3">third</a>
+    </body></html>"#;
+
+fn serve_a_site_whose_allow_outranks_a_shorter_disallow() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || answer_with_an_allow_outranking_a_shorter_disallow(stream));
+        }
+    });
+    port
+}
+
+fn answer_with_an_allow_outranking_a_shorter_disallow(
+    mut stream: TcpStream,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    let page = |title: &str| {
+        format!("<html><head><title>{title}</title></head><body>a page</body></html>")
+    };
+    let (media_type, body): (&str, Vec<u8>) = match path.as_str() {
+        "/robots.txt" => (
+            "text/plain",
+            ROBOTS_TXT_ALLOW_OUTRANKING_A_SHORTER_DISALLOW
+                .as_bytes()
+                .to_vec(),
+        ),
+        "/" => (
+            "text/html; charset=utf-8",
+            ALLOW_OUTRANKS_SEED_PAGE.as_bytes().to_vec(),
+        ),
+        _ => ("text/html; charset=utf-8", page(&path).into_bytes()),
+    };
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {media_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()
 }
 
 const ROBOTS_TXT_DISALLOWING_PRIVATE: &str = "User-agent: *\nDisallow: /private\n";
@@ -1109,6 +1649,15 @@ const FROM_SPECIAL_SEED_PAGE: &str = r#"<html><head><title>From special</title><
 const FROM_GENERAL_SEED_PAGE: &str = r#"<html><head><title>From general</title></head><body>
     <a href="/general-only">the wildcard's rule</a>
     </body></html>"#;
+/// The shape `arch-ugh` was filed against: one page linking both targets, which is exactly
+/// what `captures_robots_group_named_for_the_configured_user_agent`'s own two-seed split was
+/// built to avoid, on purpose, for that test's own concurrency-of-one race, this test now
+/// exists to cover directly. No other test here requests `/`, so adding it costs the two
+/// tests above nothing.
+const ROOT_PAGE_LINKING_BOTH: &str = r#"<html><head><title>Root</title></head><body>
+    <a href="/special-only">the named group's rule</a>
+    <a href="/general-only">the wildcard's rule</a>
+    </body></html>"#;
 
 /// `--user-agent` reaches the robots matcher, not only the HTTP client: run under the
 /// identity a `robots.txt` names, a crawl is judged against that named group's own rule
@@ -1218,6 +1767,10 @@ fn answer_naming_one_agent_in_robots(mut stream: TcpStream) -> std::io::Result<(
         .to_owned();
     let (media_type, body): (&str, &[u8]) = match path.as_str() {
         "/robots.txt" => ("text/plain", ROBOTS_TXT_NAMING_ONE_AGENT.as_bytes()),
+        "/" => (
+            "text/html; charset=utf-8",
+            ROOT_PAGE_LINKING_BOTH.as_bytes(),
+        ),
         "/from-special" => (
             "text/html; charset=utf-8",
             FROM_SPECIAL_SEED_PAGE.as_bytes(),
@@ -1243,6 +1796,90 @@ fn answer_naming_one_agent_in_robots(mut stream: TcpStream) -> std::io::Result<(
     stream.write_all(head.as_bytes())?;
     stream.write_all(body)?;
     stream.flush()
+}
+
+/// arch-ugh: one page linking two targets, under a `robots.txt` naming the identity the run
+/// is using for one of them. RFC 9309 says the named group governs alone once it matches, so
+/// this project's own `Disallow: /general-only` under `*` never applies here at all, which
+/// means neither link is one the named group's own rule refuses; the vendored engine's own
+/// frontier has nothing left to prefer over the other at a concurrency of one, and its own
+/// well-known race, `captures_robots_group_named_for_the_configured_user_agent`'s own
+/// two-seed split exists to dodge, drops one of the two on every single run rather than on
+/// some of them. Measured before the fix: five failures in eight of exactly this shape.
+///
+/// Looping the same crawl rather than asserting once is the point: a version of this that
+/// passed on its first try would have proven nothing about a race that struck roughly half
+/// the time. `links_recovered`, read off `--json` and summed across every attempt, is what
+/// tells the general-only half of the two assertions below apart from a run where the
+/// ordinary frontier simply fetched the page itself and `recover_lost_links` was never
+/// asked for anything: both leave the same archive behind, and only the count says which
+/// happened.
+#[test]
+fn a_link_the_named_group_leaves_unmentioned_is_not_lost_to_the_frontier_race() {
+    let dir = TempDir::new().expect("temp dir");
+    let port = serve_a_site_naming_one_agent_in_robots();
+    let general_only_url =
+        CanonicalUrl::parse(&format!("http://127.0.0.1:{port}/general-only")).expect("valid url");
+    let special_only_url =
+        CanonicalUrl::parse(&format!("http://127.0.0.1:{port}/special-only")).expect("valid url");
+    let mut links_recovered_total = 0u64;
+
+    for attempt in 0..20 {
+        let seed = format!("http://127.0.0.1:{port}/");
+        let archive_path = dir.path().join(format!("attempt-{attempt}"));
+        let output = archeion()
+            .arg("capture")
+            .arg("--json")
+            .arg(&archive_path)
+            .arg(&seed)
+            .args([
+                "--max-pages",
+                "10",
+                "--max-depth",
+                "1",
+                "--concurrency",
+                "1",
+                "--max-retries",
+                "0",
+                "--user-agent",
+                "archive-bot/9.0",
+                "--deadline",
+                "20s",
+                "--allow-private-addresses",
+            ])
+            .output()
+            .expect("the binary runs");
+        assert!(
+            output.status.success(),
+            "attempt {attempt}: {}",
+            stderr_of(&output)
+        );
+
+        let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+        assert!(
+            !archive
+                .list_captures(&general_only_url)
+                .expect("captures are listed")
+                .is_empty(),
+            "attempt {attempt}: the path the named group leaves unmentioned was not archived"
+        );
+        assert!(
+            archive
+                .list_captures(&special_only_url)
+                .expect("captures are listed")
+                .is_empty(),
+            "attempt {attempt}: the named group's own Disallow rule was not applied"
+        );
+
+        let report: serde_json::Value =
+            serde_json::from_str(&stdout_of(&output)).expect("one object and nothing else");
+        links_recovered_total += report["links_recovered"].as_u64().expect("a count");
+    }
+
+    assert!(
+        links_recovered_total > 0,
+        "twenty attempts against a robots.txt naming the running identity never asked recover_lost_links for a single link, so this loop never exercised the race arch-ugh was filed against"
+    );
 }
 
 /// The other way a discovered link can look lost without being lost: not a rule that

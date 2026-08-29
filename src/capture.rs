@@ -153,6 +153,10 @@ pub struct CaptureRun {
     /// the engine, and reported rather than counted for the reason every other URL here is:
     /// each one is a page the archive is missing that a person can go and look at.
     pub links_never_followed: Vec<String>,
+    /// Links the frontier lost and this run fetched directly instead, straight from the
+    /// engine. Counted rather than listed: a recovered link is an ordinary capture the
+    /// moment it lands, so `list` already names it.
+    pub links_recovered: usize,
     /// Subresources stored beside the captures of this run.
     pub assets_stored: usize,
     /// Subresources a page referenced and its capture does not hold. Each one is in the
@@ -196,6 +200,7 @@ impl CaptureRun {
         self.extractions_refused += other.extractions_refused;
         self.unreadable_articles.extend(other.unreadable_articles);
         self.pages_dropped += other.pages_dropped;
+        self.links_recovered += other.links_recovered;
         self.assets_stored += other.assets_stored;
         self.assets_missed += other.assets_missed;
         self.asset_fetches += other.asset_fetches;
@@ -250,6 +255,7 @@ pub fn capture_seed(
 
     run.pages_dropped = outcome.pages_dropped;
     run.links_never_followed = outcome.links_never_followed;
+    run.links_recovered = outcome.links_recovered;
     run.asset_fetches = assets.fetches();
     // The engine reports that its caller stopped it. This is that caller, and it knows why.
     run.stopped = if engine_overran {
@@ -882,6 +888,9 @@ pub fn owed_addresses(run: &CaptureRun) -> Vec<OwedAddress> {
         unreadable_articles: _,
         pages_dropped: _,
         links_never_followed,
+        // A count of links this run got back, so nothing here is owed: a link recovered was
+        // fetched, and one recovery failed to fetch is in `links_never_followed` above.
+        links_recovered: _,
         assets_stored: _,
         assets_missed: _,
         asset_fetches: _,

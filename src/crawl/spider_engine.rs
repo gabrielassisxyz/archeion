@@ -9,17 +9,23 @@
 //! is confined to this file. `docs/crawl-boundary.md` has the reasoning and what a second
 //! adapter would have to provide.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex, Once};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use html_escape::decode_html_entities;
 use jiff::Timestamp;
 use lol_html::{HtmlRewriter, MemorySettings, Settings, element};
 use spider::CaseInsensitiveString;
+use spider::RelativeSelectors;
+// The vendored `Page::page_links` field is a `hashbrown::HashSet`, not the standard
+// library's, since that is the set type `spider` builds its own page model on; aliased so
+// the two never read as the same type by name alone the way the compiler already refuses
+// to treat them as the same type by structure.
 use spider::configuration::RedirectPolicy;
+use spider::hashbrown::HashSet as PageLinkSet;
 use spider::packages::robotparser::parser::Entry;
 use spider::page::Page;
 use spider::reqwest::Client;
@@ -317,6 +323,13 @@ async fn crawl_seed(
     raw_lines_cache: &mut Option<Vec<RawRuleLine>>,
     on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
 ) -> CrawlOutcome {
+    // The same clock `seed.deadline` counts from, read once here rather than let recovery
+    // take a fresh one of its own: a phase that measured its own budget against a new
+    // instant would get the whole deadline over again, which is exactly the mistake
+    // `AssetCapture` was built to avoid for the subresource pass. This function is the
+    // whole of that budget's owner, crawl and recovery alike, so this is the one place the
+    // clock may start.
+    let seed_started = Instant::now();
     // Shared with `hop_depth_guard` through `configure_for_seed`, and read again below once
     // the crawl ends: every same-host link the guard judged inside `max_depth` lands here,
     // whether or not the engine ever came back to fetch it.
@@ -335,20 +348,12 @@ async fn crawl_seed(
     // dropped in its own frontier apart from one this adapter never promised to follow.
     let mut fetched: HashSet<String> = HashSet::new();
     let scheme = frontier_scheme(start);
-    let mut on_page = |event: PageEvent| {
-        // The one place a page the site refused can still be stopped. The engine's own
-        // frontier reads a `Disallow` with an interior wildcard as a literal prefix nothing
-        // begins with, so it queues and fetches the page regardless of what `robots.txt`
-        // said; refusing it here is what keeps it out of the archive, out of the extraction
-        // pass, and out of the subresource requests that would follow it. The request itself
-        // is already spent by the time this runs, and no hook this engine offers can prevent
-        // it: see `docs/crawl-boundary.md`.
-        if !robots.allows(requested_url_of(&event)) {
-            return ControlFlow::Continue(());
-        }
-        fetched.insert(depth_key(requested_url_of(&event), &scheme));
-        on_page(event)
-    };
+    // Named apart from the caller's own `on_page`, and not a shadow of it, because
+    // `recover_lost_links` below needs a second closure built the same way once this one's
+    // own borrow of `fetched` has ended; a shadow could not be told apart from the
+    // parameter it wraps once this scope needed to build another.
+    let mut filtered_on_page =
+        |event: PageEvent| filter_and_forward(event, &robots, &mut fetched, &scheme, on_page);
 
     // Scoped so the borrow of the website ends with the crawl it was driving.
     let mut stopped = {
@@ -357,14 +362,21 @@ async fn crawl_seed(
             // Drops the sender, which is what ends the drain below once it is empty.
             website.unsubscribe();
         };
-        crawl_until(crawl, seed.deadline, &mut pages, &mut on_page, &mut outcome).await
+        crawl_until(
+            crawl,
+            seed.deadline,
+            &mut pages,
+            &mut filtered_on_page,
+            &mut outcome,
+        )
+        .await
     };
 
     match stopped {
         // The crawl finishing does not mean the queue is empty, and cancelling the drain to
         // learn that would throw away pages already fetched.
         CrawlStop::Exhausted => {
-            if drain(&mut pages, &mut on_page, &mut outcome).await {
+            if drain(&mut pages, &mut filtered_on_page, &mut outcome).await {
                 outcome.pages_dropped += pages.len();
                 stopped = CrawlStop::CallerStopped;
             }
@@ -379,7 +391,7 @@ async fn crawl_seed(
         // with the deadline rather than left to a wildcard so that an engine that does come
         // to report it hands over the pages it already fetched instead of dropping them.
         CrawlStop::DeadlineReached | CrawlStop::PageCeilingReached => {
-            drain_queued(&mut pages, &mut on_page, &mut outcome);
+            drain_queued(&mut pages, &mut filtered_on_page, &mut outcome);
         }
     }
 
@@ -388,70 +400,383 @@ async fn crawl_seed(
     // caller already has an honest reason for what it left behind, and comparing against
     // `depths` there would report the budget as if it were this defect.
     //
-    // Both matchers are asked, and a link either one refuses is not a link this crawl lost.
+    // `robots` is this project's own decision and the only one consulted here, never the
+    // engine's: `website.is_allowed_robots` answers a question this project does not ask
+    // anymore, because trusting it either silences a real loss or reports one that was
+    // never real, in either direction. The engine takes the first rule that matches while
+    // RFC 9309 takes the longest, so a `Disallow: /p/` followed by an `Allow: /p/keep` is a
+    // link the frontier never queued and this project would have allowed; asking the
+    // engine too used to exclude that link from ever being noticed. A `robots.txt` naming
+    // the identity the run is using is the other direction: the vendored parser cannot
+    // distinguish "no named group applies" from "the named group applies and disallows",
+    // both being one `false` out of the same function, so it falls back to the `*` group's
+    // own answer for a path the named group already disallowed, and, for a path the named
+    // group left unmentioned, returns *allowed* by the named group directly, which is also
+    // this project's own answer. That makes every link on such a page pass the engine's
+    // frontier gate, which removes the one thing that otherwise keeps the frontier's own
+    // race, documented below `recover_lost_links`, from ever losing a page a fresh fetch
+    // would recover: a `Disallow` for someone else, or for `*`, usually blocks one of a
+    // page's links outright, and a link the frontier never queues at all cannot be caught
+    // mid-flight by that race, so a robots file that happens to clear every link for the
+    // running identity is exactly the file least likely to have that safety net. Asking
+    // only this project's own decision has a cost the engine's own gate used to absorb for
+    // free: every remaining disagreement between the two now costs a live request to a path
+    // the site's own frontier-visible rules refuse, which is exactly why that request is
+    // bound by the same page budget, deadline and pacing as everything else here.
     //
-    // `website` answers for the frontier: `robots.txt` was already read, before the first
-    // page was fetched, so its parser is exactly the one that decided every link the crawl
-    // itself declined to follow. It is not enough on its own, because it under-refuses a
-    // `Disallow` with an interior wildcard, and `robots` above is what makes up that
-    // difference by refusing the page after it arrives; a link refused there is missing from
-    // `fetched` and would otherwise be reported as data loss on exactly the sites this
-    // project cares about. It is not enough on its own either, because the two disagree in
-    // the other direction as well: the engine takes the first rule that matches while RFC
-    // 9309 takes the longest, so a `Disallow: /p/` followed by an `Allow: /p/keep` is a
-    // link the frontier never queued and this project would have allowed.
-    //
-    // Asking is sound with no `robots.txt` served at all: the engine reads a 4xx for the
-    // file itself as permission to fetch everything, and both answer the same way.
+    // A page this project's own decision refuses is still never delivered:
+    // `filter_and_forward` already returns before `fetched` ever gains an entry for one,
+    // whether or not the engine fetched it, so a refused link never becomes a recovery
+    // candidate here either.
     if frontier_claim_is_trustworthy(outcome.stopped, outcome.pages_dropped) {
         let discovered = depths
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        outcome.links_never_followed = links_discovered_but_never_fetched(
+        let candidates = links_discovered_but_never_fetched(
             &discovered,
             &fetched,
             start,
             seed.max_pages,
-            |url| website.is_allowed_robots(url) && robots.allows(url),
+            |url| robots.allows(url),
         );
+        // The depth each candidate was discovered at, carried alongside its address so
+        // recovery can still tell whether a page it recovers is itself allowed to expand,
+        // exactly as `hop_depth_guard` would have judged it had the engine fetched it.
+        let candidates: Vec<(String, usize)> = candidates
+            .into_iter()
+            .map(|url| {
+                let depth = discovered.get(&url).copied().unwrap_or(seed.max_depth);
+                (url, depth)
+            })
+            .collect();
+        drop(discovered);
+
+        // `--max-pages` bounds the whole seed, crawl and recovery together, not recovery's
+        // own count starting over from zero: a run that spent eight of its ten pages
+        // before the frontier lost anything has two left for recovery, not ten.
+        let already_fetched = fetched.len();
+        let seed_host = Url::parse(start)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned));
+        let selectors = website.setup_selectors();
+        // The larger of the two, never the site's alone: `robots_rules` already overwrote
+        // `website`'s own delay with the site's `Crawl-delay` whenever one was declared,
+        // which on a site asking for less than `--delay` would otherwise let recovery run
+        // faster than the crawl itself just did.
+        let effective_delay = seed.delay.max(website.get_delay());
+
+        // `filtered_on_page`'s own borrow of `fetched` ended with its last use above, so a
+        // second closure built the same way, over the same `robots`, `fetched` and
+        // `scheme`, can still reach the same caller.
+        let mut recovery_on_page =
+            |event: PageEvent| filter_and_forward(event, &robots, &mut fetched, &scheme, on_page);
+        let (still_missing, links_recovered, recovery_stop) = recover_lost_links(
+            candidates,
+            seed,
+            already_fetched,
+            seed_started,
+            &selectors,
+            seed_host.as_deref(),
+            &scheme,
+            effective_delay,
+            &depths,
+            &robots,
+            &mut recovery_on_page,
+        );
+        outcome.links_recovered = links_recovered;
+        outcome.links_never_followed = still_missing;
+        outcome.stopped = match recovery_stop {
+            RecoveryStop::Exhausted => outcome.stopped,
+            RecoveryStop::DeadlineReached => CrawlStop::DeadlineReached,
+            RecoveryStop::CallerStopped => CrawlStop::CallerStopped,
+        };
     }
     outcome
 }
 
-/// The site's own rules, read out of the engine's parse of its `robots.txt`.
+/// What ended `recover_lost_links`'s own attempt at what the crawl's frontier lost, folded
+/// into the same `CrawlStop` the crawl phase itself already answered with: a run whose
+/// recovery ran out of time or budget is exactly as incomplete as a run whose crawl phase
+/// did, and the report says so the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryStop {
+    /// Every candidate, and everything discovered while fetching one, was answered: either
+    /// archived or reported.
+    Exhausted,
+    /// The seed's own deadline ran out mid-recovery, read from the same clock the crawl
+    /// phase's own budget counts from. Whatever is still queued is left unreported, on the
+    /// same reasoning `frontier_claim_is_trustworthy` already applies to the crawl phase: an
+    /// honestly incomplete run is not this guard's to flag.
+    DeadlineReached,
+    /// The caller asked to stop, on a page recovery handed it.
+    CallerStopped,
+}
+
+/// The one place a page the site refused can still be stopped, and the one place a page
+/// recovered by `recover_lost_links` is folded into the same bookkeeping as one the crawl
+/// found on its own. The engine's own frontier reads a `Disallow` with an interior wildcard
+/// as a literal prefix nothing begins with, so it queues and fetches the page regardless of
+/// what `robots.txt` said; refusing it here is what keeps it out of the archive, out of the
+/// extraction pass, and out of the subresource requests that would follow it. The request
+/// itself is already spent by the time this runs, and no hook this engine offers can
+/// prevent it: see `docs/crawl-boundary.md`.
+fn filter_and_forward(
+    event: PageEvent,
+    robots: &RobotRules,
+    fetched: &mut HashSet<String>,
+    scheme: &str,
+    on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
+) -> ControlFlow<()> {
+    if !robots.allows(requested_url_of(&event)) {
+        return ControlFlow::Continue(());
+    }
+    fetched.insert(depth_key(requested_url_of(&event), scheme));
+    on_page(event)
+}
+
+/// Whether a status is worth asking again, the same three shapes `configure_for_seed`'s own
+/// retry policy already names for the crawl itself: a 429, a 408, or a server error other
+/// than 501, 505 and 511. Kept as one predicate so recovery's own retry loop asks the
+/// identical question rather than a second guess at it.
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 408)
+        || ((500..=599).contains(&status) && !matches!(status, 501 | 505 | 511))
+}
+
+/// Fetches, and where it can, expands, every link the frontier discovered in scope and this
+/// project's own `robots.allows` would have let through, but the engine never asked the
+/// site for at all.
 ///
-/// The file is fetched here rather than by the crawl, which is what makes the rules available
-/// before the first page rather than after the last, and it also covers a case the engine's
-/// setup skips outright, a crawl limited to a single page, which is a crawl `docs/cli.md`
-/// promises respects `robots.txt` like any other.
+/// A link reaches here only because the frontier's own account of what it fetched already
+/// disagrees with this project's robots decision, and that gap has two causes, neither of
+/// which a second trip through the frontier could repair: the vendored matcher disagreeing
+/// with `RobotRules` about a rule (see the comment above this function's call site), and the
+/// frontier's own well-known race at a concurrency of one, where the crawl decides it is
+/// done by asking whether its own newly-found-links accumulator is empty and nothing is in
+/// flight, without asking whether the batch it already knew about still had one link left to
+/// dequeue. A direct fetch, aimed by this adapter rather than queued through the frontier
+/// that already lost it, is the only way to still recover the page.
 ///
-/// The groups and the empty `Disallow:` are still the engine's reading of the file, and
-/// re-reading them here would be a second opinion about what the file says rather than about
-/// what one of its rules matches. Every rule's pattern is not, in the one case the vendored
-/// parser's own decode cannot be trusted for: it applies `percent_decode` to a rule's value
-/// unconditionally, which collapses a literal `*` or `$` and an escaped `%2A` or `%24` onto
-/// the same character before this ever sees either one. `needs_raw_rules` is what keeps that
-/// correction from costing every crawl a second request for a file that never used either
-/// character to begin with: a rule with neither operator has nothing for `raw_rule_lines` to
-/// recover. `raw_lines_cache` bounds it further, to at most one extra request per origin
-/// rather than one per call: `SpiderEngine` already reuses one `Website` across a sitemap
-/// phase's sub-crawls so the vendored parser's own fetch happens once, and without this cache
-/// the correction above would ask for the file again on every sub-crawl that shares it, which
-/// is the same waste that reuse exists to remove, reintroduced through this fetch instead.
+/// A recovered page is not a leaf. `record_discovered_links` folds its own outbound links
+/// into the same `depths` bookkeeping a page the crawl queued itself would have gone
+/// through, subject to the same `--max-depth`, so a link two hops past the one the frontier
+/// lost is still answered rather than silently missing; this project's own robots decision
+/// gates a newly discovered child before it is ever queued, exactly as it gates every other
+/// candidate here.
 ///
-/// `configure_robots_parser` only ever reads `Crawl-delay` into the website's own delay the
-/// first time it runs for a given parser, guarded on the parser's `mtime`: a `Website` this
-/// engine is reusing across a sitemap phase's sub-crawls skips that assignment on every call
-/// after the first, since the parser is still the one already read. `configure_for_seed`
-/// resets the delay to the seed's own `--delay` before every call here, so without
-/// rederiving `Crawl-delay` from the parser directly below, a reused sub-crawl would run
-/// under the operator's delay instead of the site's from its second listed URL on. Deriving
-/// it is a pure read of data the parser already holds, so doing it unconditionally costs
-/// nothing on the call that did just fetch the file.
+/// Every bound the crawl itself stayed inside binds recovery too, checked once per
+/// candidate rather than once for the whole batch, since the batch itself grows as pages
+/// are recovered: `--max-pages`, counted from `already_fetched` rather than from zero, so a
+/// seed that spent eight of its ten pages before the frontier lost anything has two left
+/// for recovery rather than ten more, and a batch built one page at a time can still cross
+/// that ceiling a single check taken at the top would have missed; the seed's own deadline,
+/// read from the same clock this call started on rather than a fresh one, because a run
+/// that finished its crawl with time to spare can still spend the rest of it recovering
+/// forever; and the effective delay, the larger of `--delay` and the site's own
+/// `Crawl-delay`, waited between fetches, because the case this exists for, a site polite
+/// enough to name this crawler in its `robots.txt`, is exactly the site this must not
+/// answer by asking faster than the crawl itself would have.
 ///
-/// `user_agent` is `configure_for_seed`'s own `user_agent_of(seed)`, passed rather than
-/// re-derived, so the group a run is judged against always names the identity its requests
-/// actually sent.
+/// A response the site sent is delivered like any other, archived and counted, because a
+/// capture is what the server answered; a status of 400 or higher is retried up to the
+/// seed's own retry budget and, if it is still refusing past that budget, does not count as
+/// having recovered the link. A page nothing answered is delivered as the failure it is and
+/// does not count either. Only a status under 400 clears a URL from what this returns.
+///
+/// What comes back is the URLs still missing once the attempt is over, how many were
+/// recovered, counting a child discovered along the way exactly like an initial candidate,
+/// and why recovery itself stopped: a network or status failure recovering one is the same
+/// loss `links_never_followed` already reports, not a new kind of one; a caller that stops
+/// mid-recovery leaves every URL from there on exactly as unfetched as it already was; and
+/// a page or deadline ceiling reached mid-recovery leaves whatever is still queued
+/// unreported, on the same reasoning `frontier_claim_is_trustworthy` already applies to the
+/// crawl phase.
+#[allow(clippy::too_many_arguments)]
+fn recover_lost_links(
+    initial: Vec<(String, usize)>,
+    seed: &Seed,
+    already_fetched: usize,
+    seed_started: Instant,
+    selectors: &RelativeSelectors,
+    seed_host: Option<&str>,
+    seed_scheme: &str,
+    effective_delay: Duration,
+    depths: &Mutex<HashMap<String, usize>>,
+    robots: &RobotRules,
+    on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
+) -> (Vec<String>, usize, RecoveryStop) {
+    let mut seen: HashSet<String> = initial.iter().map(|(url, _)| url.clone()).collect();
+    let mut queue: VecDeque<(String, usize)> = initial.into();
+    let mut still_missing = Vec::new();
+    // Starts at what the crawl itself already spent, not at zero: `--max-pages` bounds the
+    // seed as a whole, and a run that used eight of its ten pages before the frontier lost
+    // anything has two left for recovery, not ten more.
+    let mut total_fetched = already_fetched;
+    let mut recovered_count = 0usize;
+
+    while let Some((url, depth)) = queue.pop_front() {
+        // Checked per candidate, since the queue this pulls from can still grow while it
+        // runs: a single check taken before this loop began would let a page discovered
+        // three iterations in cross a ceiling that check never saw coming.
+        if total_fetched >= seed.max_pages as usize {
+            return (still_missing, recovered_count, RecoveryStop::Exhausted);
+        }
+        if seed
+            .deadline
+            .is_some_and(|budget| seed_started.elapsed() >= budget)
+        {
+            return (
+                still_missing,
+                recovered_count,
+                RecoveryStop::DeadlineReached,
+            );
+        }
+        if !effective_delay.is_zero() {
+            std::thread::sleep(effective_delay);
+        }
+
+        let mut attempts = 0u8;
+        let (event, has_absolute_base_href, page_links) = loop {
+            let attempt = fetch_recovered_page(&url, seed, selectors);
+            let should_retry = matches!(
+                &attempt.0,
+                PageEvent::Response(response) if is_retryable_status(response.status)
+            ) && attempts < seed.max_retries;
+            if !should_retry {
+                break attempt;
+            }
+            attempts += 1;
+            if !effective_delay.is_zero() {
+                std::thread::sleep(effective_delay);
+            }
+        };
+
+        let recovered = matches!(&event, PageEvent::Response(response) if response.status < 400);
+        if recovered {
+            total_fetched += 1;
+            recovered_count += 1;
+            if depth < seed.max_depth {
+                let mut depths_guard = depths
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let children = record_discovered_links(
+                    &url,
+                    has_absolute_base_href,
+                    page_links.as_deref(),
+                    seed_host,
+                    seed_scheme,
+                    depth,
+                    &mut depths_guard,
+                    None,
+                );
+                drop(depths_guard);
+                for child in children {
+                    if seen.insert(child.clone()) && robots.allows(&child) {
+                        queue.push_back((child, depth + 1));
+                    }
+                }
+            }
+        } else {
+            still_missing.push(url.clone());
+        }
+
+        if on_page(event).is_break() {
+            still_missing.extend(queue.into_iter().map(|(url, _)| url));
+            still_missing.sort();
+            return (still_missing, recovered_count, RecoveryStop::CallerStopped);
+        }
+    }
+    still_missing.sort();
+    (still_missing, recovered_count, RecoveryStop::Exhausted)
+}
+
+/// Fetches one URL exactly as `fetch_one_url` does, on a thread of this call's own for the
+/// same reason, and additionally runs the same link extraction a crawl would run on the
+/// page, so a page `recover_lost_links` reaches directly is not a dead end for the links it
+/// names.
+///
+/// `base` is always `None`: the vendored `Page::base` field, which the engine's own crawl
+/// loop reads to resolve against an absolute `<base href>`, is private to that crate and
+/// unreachable from here. `None` is also what the overwhelming majority of pages, which
+/// declare no `<base>` at all, already resolve against during an ordinary crawl, and the
+/// one page shape it is not is excluded before this project ever reads `page.page_links`
+/// at all: `page_declares_an_absolute_base_href` is computed straight off the response
+/// body, independently of whatever `Page::links` resolved its own return value against,
+/// which is discarded here and never read.
+///
+/// A runtime, a `Website` and a client of its own, one per call, exactly like `fetch_one_url`
+/// beside it: neither reuses a connection across candidates. That is free at the one lost
+/// link this was built for and is not free at a batch recovery's own page budget can still
+/// let through, and the decision here is to leave it, on the same reasoning `fetch_one_url`
+/// already stands on for a subresource pass: recovery is bounded by `--max-pages`, `--delay`
+/// and the seed's own deadline exactly as the crawl is, so the batch it ever runs against is
+/// the same size the operator already chose to accept, not an unbounded one a connection
+/// pool would be answering for.
+fn fetch_recovered_page(
+    url: &str,
+    seed: &Seed,
+    selectors: &RelativeSelectors,
+) -> (
+    PageEvent,
+    bool,
+    Option<Box<PageLinkSet<CaseInsensitiveString>>>,
+) {
+    std::thread::scope(|threads| {
+        match threads
+            .spawn(|| fetch_recovered_page_on_this_thread(url, seed, selectors))
+            .join()
+        {
+            Ok(result) => result,
+            Err(_) => (
+                PageEvent::NoResponse(FetchFailure {
+                    url: url.to_owned(),
+                    reason: "the crawl engine panicked while fetching".to_owned(),
+                }),
+                false,
+                None,
+            ),
+        }
+    })
+}
+
+fn fetch_recovered_page_on_this_thread(
+    url: &str,
+    seed: &Seed,
+    selectors: &RelativeSelectors,
+) -> (
+    PageEvent,
+    bool,
+    Option<Box<PageLinkSet<CaseInsensitiveString>>>,
+) {
+    let runtime = match Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(source) => {
+            return (
+                PageEvent::NoResponse(FetchFailure {
+                    url: url.to_owned(),
+                    reason: format!("the crawl engine could not be started: {source}"),
+                }),
+                false,
+                None,
+            );
+        }
+    };
+    runtime.block_on(async {
+        let depths = Arc::new(Mutex::new(HashMap::new()));
+        let mut website = configured_website(url, seed, depths);
+        let (client, _handler) = website.setup_base();
+        let mut page = Page::new_page(url, &client).await;
+        // `Page::links` only collects into `page_links` when the field already holds
+        // `Some`, gated on that before the rewriter it drives ever runs: an ordinary crawl
+        // arrives here already seeded by `with_return_page_links(true)`, and a page fetched
+        // directly has nothing to seed it, so this is that seeding's one other call site.
+        page.page_links = Some(Default::default());
+        let _ = page.links(selectors, &None).await;
+        let has_absolute_base_href = page_declares_an_absolute_base_href(&page);
+        let page_links = page.page_links.clone();
+        (page_event(page), has_absolute_base_href, page_links)
+    })
+}
 async fn robots_rules(
     website: &mut Website,
     raw_lines_cache: &mut Option<Vec<RawRuleLine>>,
@@ -469,6 +794,13 @@ async fn robots_rules(
         // screens its own seed through `is_allowed_robots` before fetching it, so a run
         // archives nothing at all and this is never asked. Reading the flags anyway would be
         // a second copy of a decision that has no case left to decide.
+        //
+        // That reasoning now also carries `recover_lost_links`, which asks nothing but this
+        // return value: a 401 or 403 leaves `entries` and the base entry empty exactly as a
+        // missing file would, `RobotRules::for_agent` reads that as everything allowed, and
+        // the seed being refused before its first fetch means `crawl_seed` never discovers a
+        // link to hand recovery in the first place. A 4xx the parser reads as allow-all is
+        // the same case from the other side, and needs no separate answer either.
         let entries: Vec<&Entry> = parser
             .get_entries()
             .iter()
@@ -957,67 +1289,107 @@ fn hop_depth_guard(
             // chance to spend this crawl's memory on addresses the crawl will never visit.
             return false;
         }
-        // A page that declares an absolute `<base href>` resolves every one of its links
-        // against that value rather than against its own URL, and this has no way to
-        // resolve against the same base without reimplementing the engine's own rule for
-        // it. Leaving this page's links out of the map entirely is cheaper than reporting
-        // an address the site never had as one the crawl lost: see
-        // `page_declares_an_absolute_base_href` for why that is the trade being made.
-        if page_declares_an_absolute_base_href(page) {
-            return true;
-        }
-        // `page_links` holds hrefs as the page wrote them, which is relative as often as
-        // not, while every page later arrives here identified by its absolute URL: without
-        // resolving against this page's own address first, a relative link never matches
-        // the key its own fetch looks it up under.
-        let base = Url::parse(page.get_url()).ok();
-        if let Some(links) = page.page_links.as_ref() {
-            for link in links.iter() {
-                let Some(base) = base.as_ref() else {
-                    continue;
-                };
-                let Some(resolved) = base.join(link.as_ref()).ok() else {
-                    continue;
-                };
-                // A crawl never leaves the host it was pointed at, so a link that does is
-                // one this will never be asked about. Keeping it would let one page of
-                // outbound links cost the whole run's memory.
-                if resolved.host_str() != seed_host.as_deref() {
-                    continue;
-                }
-                // The engine's own frontier drops anything that is not http or https
-                // before it ever forces the scheme below, so a same-host link in another
-                // scheme, `ftp://` being the one seen in the wild, is never queued and
-                // recording it here would report a fetch the engine was never going to
-                // make in the first place.
-                if !matches!(resolved.scheme(), "http" | "https") {
-                    continue;
-                }
-                // A link whose href spells its own separator with a character reference is
-                // fetched under the corrected spelling below, via `rewrite_escaped_href`,
-                // so it is the corrected address that lands here too: keying this on the
-                // buggy one would compare a page this project never asked the engine for
-                // against the one it actually requested, and report the difference as a
-                // link the crawl lost.
-                let corrected = corrected_resolution(base, link.as_ref(), &seed_scheme);
-                if let Some(corrected) = &corrected {
-                    corrections
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .insert(
-                            depth_key(resolved.as_str(), &seed_scheme),
-                            corrected.to_string(),
-                        );
-                }
-                let fetch_target = corrected.as_ref().unwrap_or(&resolved);
-                depths
-                    .entry(depth_key(fetch_target.as_str(), &seed_scheme))
-                    .and_modify(|known| *known = (*known).min(depth + 1))
-                    .or_insert(depth + 1);
-            }
-        }
+        let mut corrections_guard = corrections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        record_discovered_links(
+            page.get_url(),
+            page_declares_an_absolute_base_href(page),
+            page.page_links.as_deref(),
+            seed_host.as_deref(),
+            &seed_scheme,
+            depth,
+            &mut depths,
+            Some(&mut corrections_guard),
+        );
         true
     }
+}
+
+/// Records, into `depths`, every same-host in-scope link a fetched page discovered, one hop
+/// past its own depth, and returns the fetch-target address of each one.
+///
+/// Shared between `hop_depth_guard`, called by the engine once per page it fetched itself,
+/// and `recover_lost_links`, called once per page it fetched directly instead: both answer
+/// the same question, what a page found and where the crawl's own bookkeeping should file
+/// it, and the two have to agree for the comparison `crawl_seed` runs at the end to mean
+/// anything.
+///
+/// `corrections` is `hop_depth_guard`'s alone, `None` from `recover_lost_links`. It exists
+/// so `rewrite_escaped_href` can rewrite a request the engine's own frontier is about to
+/// send, and recovery never sends a request through that frontier: every corrected spelling
+/// this returns is already the address recovery fetches next, with nothing left for a
+/// second lookup to find.
+#[allow(clippy::too_many_arguments)]
+fn record_discovered_links(
+    page_url: &str,
+    has_absolute_base_href: bool,
+    page_links: Option<&PageLinkSet<CaseInsensitiveString>>,
+    seed_host: Option<&str>,
+    seed_scheme: &str,
+    depth: usize,
+    depths: &mut HashMap<String, usize>,
+    mut corrections: Option<&mut HashMap<String, String>>,
+) -> Vec<String> {
+    let mut discovered = Vec::new();
+    // A page that declares an absolute `<base href>` resolves every one of its links
+    // against that value rather than against its own URL, and this has no way to resolve
+    // against the same base without reimplementing the engine's own rule for it. Leaving
+    // this page's links out of the map entirely is cheaper than reporting an address the
+    // site never had as one the crawl lost: see `page_declares_an_absolute_base_href` for
+    // why that is the trade being made.
+    if has_absolute_base_href {
+        return discovered;
+    }
+    // `page_links` holds hrefs as the page wrote them, which is relative as often as not,
+    // while every page later arrives here identified by its absolute URL: without resolving
+    // against this page's own address first, a relative link never matches the key its own
+    // fetch looks it up under.
+    let Some(base) = Url::parse(page_url).ok() else {
+        return discovered;
+    };
+    let Some(links) = page_links else {
+        return discovered;
+    };
+    for link in links.iter() {
+        let Some(resolved) = base.join(link.as_ref()).ok() else {
+            continue;
+        };
+        // A crawl never leaves the host it was pointed at, so a link that does is one this
+        // will never be asked about. Keeping it would let one page of outbound links cost
+        // the whole run's memory.
+        if resolved.host_str() != seed_host {
+            continue;
+        }
+        // The engine's own frontier drops anything that is not http or https before it
+        // ever forces the scheme below, so a same-host link in another scheme, `ftp://`
+        // being the one seen in the wild, is never queued and recording it here would
+        // report a fetch the engine was never going to make in the first place.
+        if !matches!(resolved.scheme(), "http" | "https") {
+            continue;
+        }
+        // A link whose href spells its own separator with a character reference is fetched
+        // under the corrected spelling below, via `rewrite_escaped_href` on the engine's
+        // own frontier, or directly by `recover_lost_links`, so it is the corrected address
+        // that lands here too: keying this on the buggy one would compare a page this
+        // project never asked for against the one it actually requested, and report the
+        // difference as a link the crawl lost.
+        let corrected = corrected_resolution(&base, link.as_ref(), seed_scheme);
+        if let (Some(corrected), Some(corrections)) = (&corrected, corrections.as_deref_mut()) {
+            corrections.insert(
+                depth_key(resolved.as_str(), seed_scheme),
+                corrected.to_string(),
+            );
+        }
+        let fetch_target = corrected.as_ref().unwrap_or(&resolved);
+        let key = depth_key(fetch_target.as_str(), seed_scheme);
+        depths
+            .entry(key)
+            .and_modify(|known| *known = (*known).min(depth + 1))
+            .or_insert(depth + 1);
+        discovered.push(fetch_target.as_str().to_owned());
+    }
+    discovered
 }
 
 /// The shared table `hop_depth_guard` fills and `rewrite_escaped_href` reads from, mapping
@@ -2346,6 +2718,91 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
             1,
             "the parser reuse this regression depends on was not exercised"
+        );
+    }
+
+    fn answer_two_trivial_pages(mut stream: std::net::TcpStream) -> std::io::Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line)?;
+        let mut header = String::new();
+        while reader.read_line(&mut header)? > 2 {
+            header.clear();
+        }
+        let path = request_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .to_owned();
+        let (status, body): (&str, &str) = match path.as_str() {
+            "/robots.txt" => ("404 Not Found", ""),
+            _ => ("200 OK", "<html><body>a page</body></html>"),
+        };
+        let head = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes())?;
+        stream.write_all(body.as_bytes())?;
+        stream.flush()
+    }
+
+    /// `outcome.stopped` is `crawl_seed`'s to keep honest, not `recover_lost_links`'s alone:
+    /// a caller that stops on a page recovery just handed it is a real `CallerStopped`, the
+    /// same answer the crawl phase itself gives when its own caller does the same thing, and
+    /// the fix is `crawl_seed` reading this return value rather than assuming the crawl
+    /// phase's own `Exhausted` still holds once recovery has run.
+    ///
+    /// Two candidates, `/a` and `/b`, both ordinary pages: `on_page` breaks on the very
+    /// first one handed to it, which is `/a` since `links_discovered_but_never_fetched`
+    /// already sorts its candidates. `/a` still counts as recovered, since the break comes
+    /// after it was already fetched and delivered; `/b` was never attempted at all, and is
+    /// exactly as unfetched as it already was.
+    #[test]
+    fn a_caller_that_stops_mid_recovery_is_reported_as_the_reason_recovery_stopped() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let addr = listener.local_addr().expect("the bound address");
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let _ = answer_two_trivial_pages(stream);
+            }
+        });
+        let seed = Seed::new(format!("http://{addr}/"));
+        let website = Website::new(&seed.url);
+        let selectors = website.setup_selectors();
+        let robots = RobotRules::everything_allowed();
+        let depths = empty_depths();
+
+        let candidates = vec![
+            (format!("http://{addr}/a"), 1),
+            (format!("http://{addr}/b"), 1),
+        ];
+        let seed_host = addr.ip().to_string();
+        let (still_missing, links_recovered, stop) = recover_lost_links(
+            candidates,
+            &seed,
+            0,
+            Instant::now(),
+            &selectors,
+            Some(seed_host.as_str()),
+            "http",
+            Duration::ZERO,
+            &depths,
+            &robots,
+            &mut |_event| ControlFlow::Break(()),
+        );
+
+        assert_eq!(stop, RecoveryStop::CallerStopped);
+        assert_eq!(
+            links_recovered, 1,
+            "the page fetched before the break was not counted"
+        );
+        assert_eq!(
+            still_missing,
+            vec![format!("http://{addr}/b")],
+            "the untouched candidate was not left exactly as unfetched as it already was"
         );
     }
 }

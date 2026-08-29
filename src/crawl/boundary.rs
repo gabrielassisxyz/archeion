@@ -327,7 +327,17 @@ pub struct CrawlOutcome {
     /// themselves even though the run reports there was nothing left to do. Nothing was
     /// spent on these, unlike the pages above: the loss is that a page reachable from the
     /// seed is simply missing, with no failed fetch and no warning to say so.
+    ///
+    /// What survives here is only a link recovery genuinely could not reach: refused past
+    /// its own retry budget, or still queued when the seed's own page count or deadline
+    /// ran out. A link recovery did reach is counted in `links_recovered` instead, never
+    /// listed twice.
     pub links_never_followed: Vec<String>,
+    /// Links the frontier discovered and never asked the site for, fetched directly instead
+    /// once the crawl claimed to be done, because they were in scope and this project's own
+    /// robots decision would have let them through. Counted rather than listed: once one is
+    /// archived it is an ordinary capture like any other, and `list` is what names it.
+    pub links_recovered: usize,
     pub stopped: CrawlStop,
 }
 

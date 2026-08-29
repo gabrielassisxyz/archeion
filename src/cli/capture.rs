@@ -5,7 +5,7 @@
 //! of decisions with reasons attached, written down in `docs/crawl-boundary.md`, and a
 //! command line that restated the numbers would be a second opinion about them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Write as _};
 use std::path::{Path, PathBuf};
@@ -13,7 +13,9 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use archeion::CanonicalUrl;
-use archeion::capture::{CaptureError, CaptureRun, RunSoFar, capture_seed, capture_sitemap};
+use archeion::capture::{
+    CaptureError, CaptureRun, RunSoFar, capture_seed, capture_sitemap, owed_addresses,
+};
 use archeion::crawl::{
     CrawlEngine, CrawlStop, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_USER_AGENT,
     SMALLEST_MAX_RESPONSE_BYTES, Seed, SessionCookie, SpiderEngine,
@@ -322,12 +324,20 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
     // is a set of that many strings copied and dropped unread.
     let sitemap = if failure.is_none() && args.from_sitemap.is_some() {
         // Snapshotted before the phase starts, because that is what the phase has to answer
-        // to: the pages the crawl already filed come out of the same ceiling, the addresses
-        // it filed are the ones not worth buying twice, and the clock is the run's.
-        let archived = run.archived_urls.clone();
+        // to: the pages the crawl already filed come out of the same ceiling, and the
+        // addresses it either filed or was refused on are the ones not worth asking a
+        // rate-limiting host for a second time. Refused addresses are unioned in here rather
+        // than left for the sitemap phase to discover on its own, since a page the ordinary
+        // crawl reached lives in that phase's own `CaptureRun` and never reaches this one's.
+        let archived: HashSet<String> = run
+            .archived_urls
+            .iter()
+            .chain(run.refused_urls.iter())
+            .cloned()
+            .collect();
         let so_far = RunSoFar {
             started: run_started,
-            pages_written: run.captures_written,
+            pages_written: run.pages_spent,
             archived: &archived,
         };
         sitemap_phase(&args, &engine, &archive, &seed, &rules, &mut run, so_far)
@@ -335,6 +345,17 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
         SitemapOutcome::default()
     };
     failure = failure.or(sitemap.failure);
+
+    // Attempted whether or not an earlier write in this run already failed: that failure
+    // can be one corrupt record elsewhere in the archive, which says nothing about whether
+    // the path this writes to is healthy, and skipping it on that assumption used to mean a
+    // single bad item silently dropped every loss this run had learned about, leaving
+    // whatever an earlier run left in the file unchanged and now doubly stale. An earlier
+    // failure still wins the report if this write also fails, since it is the one that
+    // actually stopped the run; this one is not left unheard, only not allowed to hide it.
+    if let Err(error) = archive.write_owed(&run.archived_urls, &owed_addresses(&run)) {
+        failure = failure.or(Some(error));
+    }
 
     let report = report_of(&args, &seed, &run, created, sitemap.report);
     let output = if json {
@@ -952,6 +973,28 @@ mod tests {
         assert!(refuse(&["--delay", "10"]).contains("has no unit"));
         assert!(refuse(&["--request-timeout", "1 minute"]).contains("not a unit of time"));
         assert!(refuse(&["--deadline", "forever"]).contains("none for a run with no deadline"));
+    }
+
+    /// A regression rather than a behavior test: `responses_refused` is depended on outside
+    /// this repo by name and by shape, a count by status, and `arch-qs9` moved the address
+    /// of a refused response to a record on disk without being allowed to move this. Built
+    /// from a `CaptureRun` directly rather than a live crawl, since what is being pinned is
+    /// the field this command line publishes and not the run that fills it.
+    #[test]
+    fn the_json_report_still_carries_responses_refused_by_status() {
+        let args = parse(&[]);
+        let seed = seed_of(&args, None);
+        let mut run = CaptureRun::default();
+        *run.responses_refused.entry(429).or_default() += 2;
+        *run.responses_refused.entry(503).or_default() += 1;
+
+        let report = report_of(&args, &seed, &run, false, None);
+        let json = serde_json::to_value(&report).expect("the report serializes");
+
+        assert_eq!(
+            json["responses_refused"],
+            serde_json::json!({"429": 2, "503": 1})
+        );
     }
 
     #[test]

@@ -81,6 +81,12 @@ It refuses anything under a mebibyte, which is the smallest ceiling the engine h
 
 The flag wins over `SPIDER_MAX_SIZE_BYTES` already in the environment, which is the escape hatch below it: a variable set there stands when the flag is absent, including a zero meaning no ceiling at all, which the flag itself will not accept.
 
+### A page response the host refuses
+
+A page response whose status is 400 or above does not become an item, and its body is not stored: an item is a page that was served, and `list` over an archive a host answered 429 on every page prints zero rows. What the archive keeps instead is the address, the status and the `Retry-After` header when the host sent one, in `owed.json` at the archive's root, so a later run knows what it is still owed. [`storage-model.md`](storage-model.md) has the record's shape and the reasoning it follows. This is a rule about the page, not about every response a run stores: a subresource, an image or a stylesheet a page referenced, is stored under whatever status it answered with, since it is asked for on the page's behalf and not judged on its own.
+
+The run's report is unaffected by where the response ends up: `responses_refused`, the count by status printed as `host refused` and carried by `--json`, still counts every one of these, exactly as before.
+
 ### The sitemap
 
 `--from-sitemap` archives what a site's sitemap lists, additionally to the ordinary crawl from the seed, for a site whose pages do not link to each other: an index rendering a handful of posts and loading the rest through an API a crawl has no reason to call is the case this answers.
@@ -147,7 +153,7 @@ The distinction is the point. A URL nobody answered, a page whose address the ca
 
 `list` answers with one object per line rather than one array, so a collection of any size can be read without holding all of it and `grep` stays a legitimate way to ask a question of it.
 
-`capture` and `export` answer with one object each, because each reports on a run rather than listing a collection. The capture object carries the counts the human report shows, `responses_refused` among them, a count by status of the captures a host answered with an error, plus every URL the run did not archive, grouped by why: `failed_fetches`, `unaddressable_pages`, `pages_inside_a_network`, `unreadable_pages`, `unreadable_articles` and `links_never_followed`. `items_appended` is `null` when the run created the archive and a number otherwise, how many items in this run's captures already held one from before it. With `--from-sitemap`, it also carries a `sitemap` object: the address read, how many URLs it listed, how many were taken and how many a bound refused, which is where a sitemap listing 247 posts against a run that archived 200 of them is made visible. The export object carries the number of notes written and the paths it could not read.
+`capture` and `export` answer with one object each, because each reports on a run rather than listing a collection. The capture object carries the counts the human report shows, `responses_refused` among them, a count by status of the responses a host answered with an error, plus every URL the run did not archive, grouped by why: `failed_fetches`, `unaddressable_pages`, `pages_inside_a_network`, `unreadable_pages`, `unreadable_articles` and `links_never_followed`. The addresses `responses_refused` counts are not among these, since a refused response is not stored as a capture at all and its address is instead in `owed.json`, described above. `items_appended` is `null` when the run created the archive and a number otherwise, how many items in this run's captures already held one from before it. With `--from-sitemap`, it also carries a `sitemap` object: the address read, how many URLs it listed, how many were taken and how many a bound refused, which is where a sitemap listing 247 posts against a run that archived 200 of them is made visible. The export object carries the number of notes written and the paths it could not read.
 
 Both objects are declared by the command line rather than serialized off the library's own report. A field added to a record inside the crate is then not accidentally a promise to everything already parsing this output.
 

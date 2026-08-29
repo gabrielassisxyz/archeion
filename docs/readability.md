@@ -91,6 +91,24 @@ An anchor's children are therefore reduced to one line. Trimming is what the com
 
 `EXTRACTOR_VERSION` is 4 for the two rules above. A record written under 3 names a different address for the same image and spells a linked picture as characters that are not a link, so it does not merely miss something added since: an export built from it differs from one built from a rebuild, and a repass has to treat it as stale.
 
+### An embedded document leaves a link where it was
+
+An embedded video, track or episode is ordinarily a container with no text of its own, `<iframe src="...">` and nothing else, and a container with no text is exactly what the scoring pass is built to drop. What survived into the archive before this was the sentence that introduced the embed, pointing at nothing that followed it.
+
+The scoring library's own answer to this is a short, hardcoded list of video domains: an `iframe` naming one of them survives its cleaning pass unaided, and every other `iframe`, `object` and `embed` is removed outright regardless of what it points at. `www.youtube-nocookie.com` is on that list. `open.spotify.com` and `embed.podcasts.apple.com`, both seen in the corpus this rule was measured against, are not, and neither is any host a page might embed that nobody has read yet.
+
+So the rule here runs before the scoring pass rather than inside it, on the tree this project already owns before handing it to the scorer: every `iframe[src]` whose address resolves to a destination the archive's own link policy keeps is rewritten in place into an anchor carrying that address, labelled with its host. An anchor is a shape the scoring pass already knows to keep, on the same terms as a video a page wrote as a plain link, so the existing anchor handling produces the Markdown from there with nothing further added: `[youtube-nocookie.com](https://www.youtube-nocookie.com/embed/rJ6RZ2YzaLc)`.
+
+The label is the host and not the address, because the address is what the destination already says. Measured on the corpus this rule was built against: not one of its 176 iframes carried a `title` attribute, so there is no author-written text to reuse, and a bare address in the label would turn a note into a list of them. The host is read with its `www.` prefix removed, the same way a reader's own browser already hides it, using the one-step rule that a bare `www.com` is a registrable name and not a prefix of one.
+
+**The rule is not keyed on a host.** Nothing here consults the scoring library's whitelist or one of its own: an `iframe` is rewritten and linked on the strength of its element name and a resolvable `src` alone, so a platform absent from every corpus this project has read is covered on the same terms as one already seen.
+
+**What this covers, and what it knowingly does not.** Covered: any `iframe` whose `src` resolves to a destination this archive's link policy would keep for an ordinary anchor, which includes a relative `src` resolved against the page's own address. Not covered, deliberately: `<video>`, `<audio>`, `<embed>` and `<object>`, which had zero occurrences across the corpus this rule was measured against and therefore no evidence to write a rule from; and a platform that writes an embed's address only into a data attribute and ships no `iframe` at all, which the same corpus also had none of. Either arriving in a real capture is a new measurement and a new rule, not an extension of this one.
+
+An `iframe` with no `src`, or a `src` the link policy refuses, is left exactly as it was: the scoring library's own cleaning pass then decides its fate on its own terms, which is removal for anything not on its whitelist, never an empty link.
+
+`EXTRACTOR_VERSION` is 5 for this. A record written under 4 simply lost the element, so its absence of a link is not evidence there was nothing to link: the response may hold an embed the article never mentioned, which is precisely the defect this rule exists to fix.
+
 ## What is not an article
 
 Most of the web is not. A listing page, a shop, a homepage and the shell of an application that renders itself in the browser are all captures with prose worth nothing, and writing an empty article record for each would fill the archive with files that say nothing.
@@ -394,7 +412,7 @@ They are set where a hostile page is certainly refused, not where a real page is
 ```json
 {
   "markdown_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "extractor_version": 4,
+  "extractor_version": 5,
   "rules": "heuristic",
   "word_count": 1240,
   "share": {
@@ -441,7 +459,7 @@ A refused page gets a record of its own instead of this pair, holding the same m
 
 ```json
 {
-  "extractor_version": 4,
+  "extractor_version": 5,
   "rules": "heuristic",
   "share": {
     "article_chars": 137,
@@ -457,7 +475,7 @@ The excerpt is the page-controlled field that both article and refusal records c
 
 ```json
 {
-  "extractor_version": 4,
+  "extractor_version": 5,
   "rules": "heuristic",
   "share": {
     "article_chars": 137,
@@ -473,7 +491,7 @@ The byline is also page-controlled, but it cannot answer the same way. A cut exc
 ```json
 {
   "markdown_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "extractor_version": 4,
+  "extractor_version": 5,
   "rules": "heuristic",
   "word_count": 1240,
   "share": {
@@ -499,7 +517,7 @@ A page the extractor read and judged not to be an article gets the smaller marke
 
 ```json
 {
-  "extractor_version": 4,
+  "extractor_version": 5,
   "rules": "heuristic"
 }
 ```
@@ -513,7 +531,7 @@ A record for a document the site published looks like this. `excerpt` and `bylin
 ```json
 {
   "markdown_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "extractor_version": 4,
+  "extractor_version": 5,
   "rules": "served",
   "word_count": 1240,
   "share": {
@@ -534,7 +552,7 @@ A record for a document the site published looks like this. `excerpt` and `bylin
 
 `markdown_sha256` is the address of the document beside it, and it is what makes the pair safe to rewrite. Ordering alone is enough only the first time: writing over an existing pair and stopping between the two files leaves new prose beside an old record, both present, both parsing, and every field describing something that is no longer there. A reader that finds the two disagreeing reports no article, because the response the article was derived from is still in the archive and the pass that re-extracts will simply redo it.
 
-`extractor_version` is bumped when the meaning of a field or a rule that fills one changes, not when a field is added, on the same terms as the metadata record. It is 4 today. It became 2 for the sliver rule: `share` arriving beside the counts would not have been enough on its own, but a page can now produce prose and still not be stored as an article, so the absence of a record beside a capture stopped meaning what it meant at 1. It became 3 when HTML article links and image descriptions stopped reaching the stored Markdown as page-controlled syntax. It became 4 when which address an image carries and whether an anchor around one is a link at all changed: a record written under 3 names a different address for the same image and spells a linked picture as characters that are not a link, so an export built from it differs from one built from a rebuild.
+`extractor_version` is bumped when the meaning of a field or a rule that fills one changes, not when a field is added, on the same terms as the metadata record. It is 5 today. It became 2 for the sliver rule: `share` arriving beside the counts would not have been enough on its own, but a page can now produce prose and still not be stored as an article, so the absence of a record beside a capture stopped meaning what it meant at 1. It became 3 when HTML article links and image descriptions stopped reaching the stored Markdown as page-controlled syntax. It became 4 when which address an image carries and whether an anchor around one is a link at all changed: a record written under 3 names a different address for the same image and spells a linked picture as characters that are not a link, so an export built from it differs from one built from a rebuild. It became 5 when an `iframe` whose `src` resolves to an address stopped vanishing from the article: a record written under 4 simply lost the element, so its absence of a link is not evidence there was nothing there to link.
 
 The rules layer, the not-article marker, the byline bound and `accessible_for_free` did not bump it. For the byline, a present value still means the attribution the page carried, and `truncated: ["byline"]` is an added answer only records written after the bound can carry. The records that exist did not change their meanings: `article_chars` and `page_chars` mean exactly what they meant at 2, and `rules` says whether a rule reached the page. The marker is a new record type with the same version as the extractor that made the decision. An older absence stays stale to a repass because it is absence, not because every article record needs a new number. `accessible_for_free` is the same shape again: a record written before it existed said nothing about a paywall, and reading its absence as "nothing declared" is not a claim that record never had a chance to make, it is the true answer either way.
 

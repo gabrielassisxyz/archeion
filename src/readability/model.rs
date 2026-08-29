@@ -36,7 +36,12 @@ use serde::{Deserialize, Serialize};
 /// link. Those records do not merely miss something added since: they say something else, and
 /// what an export builds from them differs from what a rebuild produces, so a repass has to
 /// treat them as stale.
-pub const EXTRACTOR_VERSION: u32 = 4;
+///
+/// 5 is an `iframe` that resolves to an absolute address no longer vanishing. A record written
+/// under 4 simply lost the element, and the sentence that introduced it is left pointing at
+/// nothing; the article that comes out from the same response now carries a link the previous
+/// version could not have written, so absence of one is not evidence there was nothing to link.
+pub const EXTRACTOR_VERSION: u32 = 5;
 
 /// How the prose in a record was obtained.
 ///

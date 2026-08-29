@@ -264,6 +264,12 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
         args.cookie_file.as_deref(),
         std::env::var_os(COOKIE_HEADER_VARIABLE),
     )?;
+    // Refused here for the same reason the credential above is: a byte no header can carry,
+    // let through, is a value the engine's own client cannot build at all rather than one it
+    // sends oddly, and the crate underneath assumes that construction never fails.
+    if let Some(agent) = args.user_agent.as_deref() {
+        usable_user_agent(agent)?;
+    }
     let seed = seed_of(&args, credential);
     // Before the archive, because opening one creates it. A seed the engine will not dial is
     // a run that was never going to fetch anything, and creating a directory for it leaves
@@ -357,6 +363,30 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
         .into());
     }
     Ok(())
+}
+
+/// Why `--user-agent`'s value cannot be used: a byte no header can carry, refused before a
+/// run starts rather than at the client that would otherwise be asked to build one from it.
+#[derive(Debug, thiserror::Error)]
+#[error("--user-agent holds a character that cannot be sent in a header")]
+struct UnusableUserAgent;
+
+/// Whether `value` could be sent as the value of some header, HTTP's own rule and not
+/// ASCII's: a `User-Agent` naming an operator with an accent in it is ordinary and stays
+/// accepted, since only a control byte, `\r` and `\n` chief among them, is what no header
+/// can hold. Letting one through would build a second header nobody wrote the moment this
+/// reaches the client, which for `--cookie-file` is refused the same way in
+/// `session_cookie.rs`; this mirrors that rule rather than the narrower, ASCII-only one the
+/// cookie path also applies, since a cookie's own grammar is stricter than a header's.
+fn usable_user_agent(value: &str) -> Result<(), UnusableUserAgent> {
+    let carries_only_what_a_header_can_hold = value
+        .bytes()
+        .all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f));
+    if carries_only_what_a_header_can_hold {
+        Ok(())
+    } else {
+        Err(UnusableUserAgent)
+    }
 }
 
 /// The seed this run crawls with. The credential arrives separately because reading it can fail

@@ -911,6 +911,87 @@ fn capture_with_no_user_agent_flag_sends_the_compiled_default() {
     );
 }
 
+/// A value carrying a raw `\r\n` is refused before the process ever dials the seed: let
+/// through, it reaches a client the vendored engine builds with `unwrap_unchecked`, which
+/// aborts the process outright rather than reporting a failure this project defines. The
+/// exit code and the message are `--cookie-file`'s own for the same class of value; no
+/// archive is left behind, matching a seed refused for any other reason.
+#[test]
+fn capture_refuses_a_user_agent_carrying_a_control_character() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg("http://127.0.0.1:1/")
+        .args(["--deadline", "5s", "--allow-private-addresses"])
+        .args(["--user-agent", "bad\r\nX-Injected: 1"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(
+        !output.status.success(),
+        "a header injection in --user-agent was accepted"
+    );
+    assert!(
+        stderr_of(&output).contains("--user-agent"),
+        "the refusal did not name the flag: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("cannot be sent in a header"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        !archive_path.exists(),
+        "a seed refused before the run started still left an archive behind"
+    );
+}
+
+/// The rule is what a header can carry, not what ASCII can spell: an operator's own name
+/// with an accent in it is ordinary and `--user-agent` must keep sending it rather than
+/// refusing every byte a control character is not.
+#[test]
+fn capture_accepts_a_user_agent_carrying_a_non_ascii_character() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = serve_recording_user_agent(Arc::clone(&requests));
+    let seed = format!("http://127.0.0.1:{port}/");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(&seed)
+        .args([
+            "--max-pages",
+            "1",
+            "--max-depth",
+            "1",
+            "--concurrency",
+            "1",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .args(["--user-agent", "café/1.0"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+
+    let seen = requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some("café/1.0"),
+        "a non-ASCII identity was not sent as given"
+    );
+}
+
 /// A `robots.txt` naming this run's own identity and a `*` group that disagrees with it:
 /// RFC 9309 reads whichever group names the requester and never the other one, so whether
 /// the one linked page is refused turns entirely on the identity the run announced.

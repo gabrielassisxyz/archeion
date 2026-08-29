@@ -159,6 +159,8 @@ A scoring heuristic reads markup that follows convention and fails on sites with
 
 The rules live in the archive, at `extraction-rules.json` beside `archeion.json`, and they are the one file there a person writes rather than the program. They are in the archive rather than in a configuration directory because a re-pass over these stored responses has to read them to produce the same articles again: an archive that travels without its rules extracts differently on the next machine and says nothing about why.
 
+The file may be written before the archive exists. `Archive::open` adopts a directory whose only visible entry is `extraction-rules.json`, so a host's rule can be written first, in the intuitive order, and the first capture of that host already applies it, with no repass to catch it up afterward. That tolerance is bounded by ownership rather than by the name alone: a filename joins it only when `Archive` itself has a path accessor for it, which today is exactly this one file. A directory holding the rules file alongside anything else, or holding some other single file in its place, is refused exactly as an unrelated directory always was.
+
 ```json
 {
   "hosts": {

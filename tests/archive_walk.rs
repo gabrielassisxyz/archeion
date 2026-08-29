@@ -134,6 +134,24 @@ fn an_empty_archive_walks_to_nothing_rather_than_failing() {
     assert!(walk.unreadable.is_empty());
 }
 
+/// The walk is not supposed to learn how the archive came to exist. A directory adopted
+/// because it held only the rules file has to walk exactly like one adopted empty: no item,
+/// no unreadable entry, and the rules file itself is not mistaken for either.
+#[test]
+fn a_directory_adopted_from_only_a_rules_file_walks_to_nothing_too() {
+    let dir = TempDir::new().expect("temp dir");
+    fs::write(dir.path().join("extraction-rules.json"), b"{}").expect("the rules file first");
+    let archive =
+        Archive::open(dir.path()).expect("a directory holding only the rules file is adopted");
+
+    let walk = archive
+        .walk()
+        .expect("an archive with no items still walks");
+
+    assert!(walk.items.is_empty());
+    assert!(walk.unreadable.is_empty());
+}
+
 #[test]
 fn an_item_directory_with_no_record_is_reported_and_not_passed_over() {
     let dir = TempDir::new().expect("temp dir");

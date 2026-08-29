@@ -1712,9 +1712,58 @@ fn a_path_holding_something_else_is_refused_rather_than_archived_into() {
     assert_eq!(
         stderr_of(&output),
         format!(
-            "{} holds something else, not an Archeion archive\n",
+            "{} holds notes.txt, not an Archeion archive\n",
             dir.path().display()
         )
+    );
+}
+
+/// The order this bead exists to make work: a host's rule is written into a directory
+/// before that host is ever captured, and the first capture already applies it, with no
+/// repass in between.
+#[test]
+fn a_capture_into_a_directory_holding_only_the_rules_file_applies_it_on_the_first_pass() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    std::fs::create_dir(&archive_path).expect("the directory exists before the archive does");
+    std::fs::write(
+        archive_path.join("extraction-rules.json"),
+        r#"{"hosts": {"127.0.0.1": {"why": "a test told it where the article is", "body": ["article"]}}}"#,
+    )
+    .expect("the rules file is written before the first capture");
+
+    let site = Site::start();
+
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(site.url("/article.html"))
+        .args([
+            "--max-pages",
+            "1",
+            "--concurrency",
+            "1",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    let url = CanonicalUrl::parse(&site.url("/article.html")).expect("valid url");
+    let captures = archive.list_captures(&url).expect("captures are listed");
+    let article = archive
+        .read_article(&url, &captures[0])
+        .expect("the prose is stored")
+        .expect("the article page produced prose");
+
+    assert_eq!(
+        article.record.rules,
+        archeion::readability::ExtractionRules::Site("127.0.0.1".to_owned()),
+        "the very first pass already knows it was told rather than worked out"
     );
 }
 

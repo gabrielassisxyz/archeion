@@ -153,6 +153,25 @@ fn urlset(locs: &[String]) -> String {
     )
 }
 
+/// The Yoast image-sitemap shape: every page's `<url>` entry carries its own `<image:loc>`
+/// pictures beside the page's `<loc>`, in a namespace the document declares for the extension.
+fn image_sitemap(pages: &[String], images_by_page: &[Vec<String>]) -> String {
+    let entries: String = pages
+        .iter()
+        .zip(images_by_page)
+        .map(|(page, images)| {
+            let image_tags: String = images
+                .iter()
+                .map(|image| format!("<image:image><image:loc>{image}</image:loc></image:image>"))
+                .collect();
+            format!("<url><loc>{page}</loc>{image_tags}</url>")
+        })
+        .collect();
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">{entries}</urlset>"#
+    )
+}
+
 const LONE_PAGE: &str = "<html><head><title>A post</title></head><body>\
     <p>Nothing on this page links anywhere else, which is the whole point of the sitemap.</p>\
     </body></html>";
@@ -222,6 +241,73 @@ fn a_sitemap_lists_pages_nothing_links_to_and_all_of_them_are_archived() {
         "{}",
         stdout_of(&output)
     );
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    for path in posts {
+        let url = CanonicalUrl::parse(&site.url(path)).expect("valid url");
+        assert!(
+            !archive
+                .list_captures(&url)
+                .expect("captures are listed")
+                .is_empty(),
+            "{path} was listed in the sitemap and never archived"
+        );
+    }
+}
+
+/// The measured shape this fix exists for, driven through the binary: a sitemap whose
+/// pictures outnumber its pages, run against a server that can tell a page request apart
+/// from an image request. `urls_listed` matching the page count alone is not proof that the
+/// images were never fetched; the request counts below are what actually shows it.
+#[test]
+fn an_image_extension_sitemap_yields_only_its_pages() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let (listener, site) = Site::bind();
+    let posts = ["/posts/1", "/posts/2"];
+    let images = [
+        "/images/1.jpg",
+        "/images/2.jpg",
+        "/images/3.jpg",
+        "/images/4.jpg",
+    ];
+    let listed_pages: Vec<String> = posts.iter().map(|path| site.url(path)).collect();
+    let images_by_page: Vec<Vec<String>> = vec![
+        vec![site.url(images[0]), site.url(images[1])],
+        vec![site.url(images[2]), site.url(images[3])],
+    ];
+    let mut routes = vec![
+        route("/index.html", "text/html; charset=utf-8", LONE_PAGE),
+        route(
+            "/sitemap.xml",
+            "application/xml",
+            image_sitemap(&listed_pages, &images_by_page),
+        ),
+    ];
+    for path in posts {
+        routes.push(route(path, "text/html; charset=utf-8", LONE_PAGE));
+    }
+    site.serve(listener, routes);
+
+    let output = capture_command(&archive_path, &site.url("/index.html"))
+        .arg("--json")
+        .arg("--from-sitemap")
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout_of(&output)).expect("one object and nothing else");
+    assert_eq!(report["sitemap"]["urls_listed"], 2);
+    assert_eq!(report["sitemap"]["urls_taken"], 2);
+
+    for image in images {
+        assert_eq!(
+            site.requests_for(image),
+            0,
+            "{image} was requested as if it were a listed page"
+        );
+    }
 
     let archive = Archive::open_existing(&archive_path).expect("the archive exists");
     for path in posts {

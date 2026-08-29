@@ -16,7 +16,8 @@ use std::fmt::{self, Display};
 
 use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::Event;
-use quick_xml::reader::Reader;
+use quick_xml::name::{Namespace, ResolveResult};
+use quick_xml::reader::NsReader;
 use url::Url;
 
 use crate::crawl::{CrawlEngine, PageEvent, Seed};
@@ -27,6 +28,12 @@ use crate::crawl::{CrawlEngine, PageEvent, Seed};
 /// sending. It bounds the list while it is still being read, not after: a body under the
 /// response byte ceiling can still spell out far more than fifty thousand short entries.
 const MAX_SITEMAP_URLS: usize = 50_000;
+
+/// The sitemap protocol's own namespace. A `<loc>` belongs to a page only when it resolves
+/// to this URI or to none at all; an extension such as Yoast's image sitemap declares its
+/// own namespace for its `<image:loc>` entries, and the prefix it happens to use for that
+/// namespace is a document-local label, not something this reader may key on.
+const SITEMAP_NS_URI: &[u8] = b"http://www.sitemaps.org/schemas/sitemap/0.9";
 
 /// What a sitemap named, once the host and count ceilings have run.
 #[derive(Debug)]
@@ -212,6 +219,20 @@ struct ParsedLocs {
     refused_over_ceiling: usize,
 }
 
+/// Whether a resolved namespace is the sitemap protocol's own, or none at all.
+///
+/// `Unbound` is the sloppy, unnamespaced feed: no `xmlns` anywhere in the document, which is
+/// the ordinary shape on the open web and must keep working exactly as it does today. `Bound`
+/// to any other URI is an extension element, whatever local name or prefix it was written
+/// with; `Unknown` (a prefix used but never declared) is neither, so it is refused too.
+fn is_page_namespace(resolved: ResolveResult) -> bool {
+    match resolved {
+        ResolveResult::Unbound => true,
+        ResolveResult::Bound(Namespace(uri)) => uri == SITEMAP_NS_URI,
+        ResolveResult::Unknown(_) => false,
+    }
+}
+
 /// Reads every `<loc>` a sitemap names, and whether its root is a sitemap index.
 ///
 /// This tracks only whether the reader is presently inside a `<loc>` element, which is
@@ -228,7 +249,7 @@ struct ParsedLocs {
 /// something other than what it closes being the shape a truncated response never produces.
 fn parse_locs(body: &[u8]) -> Result<ParsedLocs, String> {
     let text = String::from_utf8_lossy(body);
-    let mut reader = Reader::from_str(&text);
+    let mut reader = NsReader::from_str(&text);
     let mut seen_root = false;
     let mut root_is_index = false;
     let mut in_loc = false;
@@ -238,7 +259,9 @@ fn parse_locs(body: &[u8]) -> Result<ParsedLocs, String> {
     let mut refused_over_ceiling = 0usize;
 
     loop {
-        let event = reader.read_event().map_err(|error| error.to_string())?;
+        let (resolved_ns, event) = reader
+            .read_resolved_event()
+            .map_err(|error| error.to_string())?;
         match event {
             Event::Start(start) => {
                 let name = start.local_name();
@@ -254,7 +277,7 @@ fn parse_locs(body: &[u8]) -> Result<ParsedLocs, String> {
                         });
                     }
                 }
-                if name.as_ref() == b"loc" {
+                if name.as_ref() == b"loc" && is_page_namespace(resolved_ns) {
                     in_loc = true;
                     current.clear();
                 }
@@ -391,6 +414,141 @@ mod tests {
             r#"<?xml version="1.0" encoding="UTF-8"?>
             <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{entries}</urlset>"#
         )
+    }
+
+    /// The Yoast shape: a page `<loc>` in the default (protocol) namespace, and one or more
+    /// `<image:loc>` beside it in a namespace declared for the extension.
+    fn urlset_with_images(entries: &[(&str, &[&str])]) -> String {
+        let body: String = entries
+            .iter()
+            .map(|(page, images)| {
+                let image_tags: String = images
+                    .iter()
+                    .map(|image| {
+                        format!("<image:image><image:loc>{image}</image:loc></image:image>")
+                    })
+                    .collect();
+                format!("<url><loc>{page}</loc>{image_tags}</url>")
+            })
+            .collect();
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+                    xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">{body}</urlset>"#
+        )
+    }
+
+    /// The measured defect itself: waitbutwhy's sitemap put several `<image:loc>` beside every
+    /// page's `<loc>`, and every one of them was queued as if it were a page. This also covers
+    /// the sloppy default case, since the page `<loc>` here relies on the same default-namespace
+    /// declaration every plain fixture in this file already uses.
+    #[test]
+    fn an_image_extension_loc_is_not_queued_counted_or_charged_to_the_ceiling() {
+        let engine = FakeHost::new().serving(
+            "https://example.com/sitemap.xml",
+            &urlset_with_images(&[
+                (
+                    "https://example.com/a",
+                    &["https://example.com/a-1.jpg", "https://example.com/a-2.jpg"],
+                ),
+                ("https://example.com/b", &["https://example.com/b-1.jpg"]),
+            ]),
+        );
+
+        let listing = read_sitemap(&engine, &Seed::new("https://example.com/"), None)
+            .expect("the sitemap is read");
+
+        assert_eq!(listing.urls_listed, 2);
+        assert_eq!(
+            listing.urls,
+            ["https://example.com/a", "https://example.com/b"]
+        );
+    }
+
+    /// A prefix used but never declared anywhere in the document resolves to no namespace this
+    /// reader can name, which is neither the protocol's namespace nor the "no namespace at all"
+    /// case that keeps a sloppy feed working: it is refused rather than guessed at.
+    #[test]
+    fn a_loc_under_a_prefix_nobody_declared_is_refused_rather_than_queued() {
+        let engine = FakeHost::new().serving(
+            "https://example.com/sitemap.xml",
+            r#"<?xml version="1.0"?>
+               <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                 <url>
+                   <loc>https://example.com/a</loc>
+                   <foo:loc>https://example.com/not-a-page</foo:loc>
+                 </url>
+               </urlset>"#,
+        );
+
+        let listing = read_sitemap(&engine, &Seed::new("https://example.com/"), None)
+            .expect("the sitemap is read");
+
+        assert_eq!(listing.urls_listed, 1);
+        assert_eq!(listing.urls, ["https://example.com/a"]);
+    }
+
+    /// The ceiling is meant to bound how many pages a hostile file can force into memory. An
+    /// extension that names far more addresses than that must not trip it, because none of
+    /// those addresses are pages. The images are placed on the first entry and four more real
+    /// pages follow: a ceiling counting elements rather than page addresses would still have
+    /// "spent" itself well before reaching them, and wrongly refuse pages this file lists.
+    #[test]
+    fn extension_locs_alone_exceeding_the_ceiling_do_not_trip_it() {
+        let images: Vec<String> = (0..MAX_SITEMAP_URLS + 5)
+            .map(|index| format!("https://example.com/image-{index}.jpg"))
+            .collect();
+        let borrowed: Vec<&str> = images.iter().map(String::as_str).collect();
+        let engine = FakeHost::new().serving(
+            "https://example.com/sitemap.xml",
+            &urlset_with_images(&[
+                ("https://example.com/a", &borrowed),
+                ("https://example.com/b", &[]),
+                ("https://example.com/c", &[]),
+                ("https://example.com/d", &[]),
+                ("https://example.com/e", &[]),
+            ]),
+        );
+
+        let listing = read_sitemap(&engine, &Seed::new("https://example.com/"), None)
+            .expect("the sitemap is read");
+
+        assert_eq!(listing.urls_listed, 5);
+        assert_eq!(
+            listing.urls,
+            [
+                "https://example.com/a",
+                "https://example.com/b",
+                "https://example.com/c",
+                "https://example.com/d",
+                "https://example.com/e",
+            ]
+        );
+        assert_eq!(listing.refused_over_ceiling, 0);
+    }
+
+    /// The image extension is the case measured, but nothing here may key on the string
+    /// `"image:"`: a different extension, under a different prefix and a different namespace,
+    /// must be excluded by the same rule.
+    #[test]
+    fn an_extension_loc_under_a_different_prefix_is_excluded_by_the_same_rule() {
+        let engine = FakeHost::new().serving(
+            "https://example.com/sitemap.xml",
+            r#"<?xml version="1.0"?>
+               <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+                       xmlns:video="http://www.google.com/schemas/sitemap-video/1.1">
+                 <url>
+                   <loc>https://example.com/a</loc>
+                   <video:video><video:loc>https://example.com/a.mp4</video:loc></video:video>
+                 </url>
+               </urlset>"#,
+        );
+
+        let listing = read_sitemap(&engine, &Seed::new("https://example.com/"), None)
+            .expect("the sitemap is read");
+
+        assert_eq!(listing.urls_listed, 1);
+        assert_eq!(listing.urls, ["https://example.com/a"]);
     }
 
     #[test]

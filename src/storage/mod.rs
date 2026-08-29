@@ -9,6 +9,6 @@ mod walk;
 pub use archive::{Archive, StorageError};
 pub use model::{
     Asset, AssetMiss, Capture, CaptureId, ContentHash, Header, Item, ItemId, MalformedIdentifier,
-    MissedAsset, NewAsset, NewCapture, PolicyDeparture, StoredBody,
+    MissedAsset, NewAsset, NewCapture, OwedAddress, OwedReason, PolicyDeparture, StoredBody,
 };
 pub use walk::{ArchiveWalk, UnreadableItem};

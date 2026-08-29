@@ -5,6 +5,7 @@
 //! have to trust. An index, when the collection grows enough to need one, is derived from
 //! this tree and can be deleted and rebuilt at any time.
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ use serde::de::DeserializeOwned;
 
 use super::model::{
     Asset, Capture, CaptureId, ContentHash, Item, ItemId, MissedAsset, NewAsset, NewCapture,
-    StoredBody,
+    OwedAddress, StoredBody,
 };
 use super::walk::ArchiveWalk;
 use crate::canonical_url::CanonicalUrl;
@@ -27,6 +28,15 @@ const MARKER_FILE: &str = "archeion.json";
 /// The one file in an archive that a person writes rather than the program. It is beside the
 /// marker rather than under `items/`, which the walk reads as records and nothing else.
 const EXTRACTION_RULES_FILE: &str = "extraction-rules.json";
+/// Where the archive keeps what it does not hold. Beside the marker rather than under
+/// `items/`, for the same reason the extraction rules are: the walk reads that directory as
+/// records of pages, and an address with no capture behind it is not one.
+const OWED_FILE: &str = "owed.json";
+/// Named apart from the archive's own `archeion.json` marker, so a reader who has found
+/// this file on its own, with no other context, can still tell what it is: this project's
+/// record of what it does not hold, and which shape of that record it is reading.
+const OWED_RECORD_FORMAT: &str = "archeion-owed";
+const OWED_RECORD_VERSION: u32 = 1;
 const FORMAT_NAME: &str = "archeion-archive";
 const FORMAT_VERSION: u32 = 1;
 const MAX_ARTICLE_RECORD_BYTES: u64 = 64 * 1024;
@@ -61,6 +71,18 @@ struct RecoveredAssets {
     assets_missed: Vec<MissedAsset>,
 }
 
+/// What is written to `owed.json`. `format` and `version` are what let a reader who has
+/// only found this file, with no other context, tell what it is holding and whether this
+/// build can still make sense of it; `addresses` is wrapped in a named field rather than
+/// left as a bare array so one can be added beside it later without every reader changing
+/// shape.
+#[derive(Debug, Serialize, serde::Deserialize)]
+struct OwedRecord {
+    format: String,
+    version: u32,
+    addresses: Vec<OwedAddress>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("{path}: {source}")]
@@ -83,6 +105,16 @@ pub enum StorageError {
     NoArchiveMarker { path: PathBuf },
     #[error("{path} is an archive in format version {found}, this build reads version {readable}")]
     UnreadableFormat {
+        path: PathBuf,
+        found: u32,
+        readable: u32,
+    },
+    #[error("{path} holds something else, not an Archeion owed record")]
+    NotAnOwedRecord { path: PathBuf },
+    #[error(
+        "{path} is an owed record in format version {found}, this build reads version {readable}"
+    )]
+    UnreadableOwedFormat {
         path: PathBuf,
         found: u32,
         readable: u32,
@@ -187,6 +219,70 @@ impl Archive {
     /// owns the format, and the store owns only where it sits.
     pub fn extraction_rules_path(&self) -> PathBuf {
         self.root.join(EXTRACTION_RULES_FILE)
+    }
+
+    /// Folds what a run just learned into the archive's record of what it does not hold.
+    ///
+    /// Merged rather than replaced: an archive is not one seed, since the item tree is
+    /// sharded by host, and a run against one of them says nothing about whether another
+    /// host's debt is still owed. Overwriting the file would erase every address an
+    /// unrelated run left here. What settles an address is `archived_urls`, the canonical
+    /// addresses this run actually filed: anything owed that this run turned into an item
+    /// is no longer owed, and everything else this run just learned is unioned in,
+    /// deduplicated by address with the entry already on file winning a collision, since a
+    /// stale reason for an address still owed beats losing the entry outright.
+    pub fn write_owed(
+        &self,
+        archived_urls: &HashSet<String>,
+        newly_owed: &[OwedAddress],
+    ) -> Result<(), StorageError> {
+        let mut addresses = self.read_owed()?;
+        addresses.retain(|address| !archived_urls.contains(&address.url));
+        addresses.extend(newly_owed.iter().cloned());
+        let mut seen = HashSet::new();
+        addresses.retain(|address| seen.insert(address.url.clone()));
+        write_json(
+            &self.root.join(OWED_FILE),
+            &OwedRecord {
+                format: OWED_RECORD_FORMAT.to_owned(),
+                version: OWED_RECORD_VERSION,
+                addresses,
+            },
+        )
+    }
+
+    /// Reads the archive's record of what it does not hold. An archive that never wrote one,
+    /// because every run so far archived everything it asked for, reads as owing nothing.
+    ///
+    /// A record whose `format` names something other than this project's own, or whose
+    /// `version` is newer than this build reads, is refused rather than read anyway: the
+    /// two fields exist so a reader with only this file open can tell what it is and
+    /// whether the shape it is in is one this build understands, the same reasoning
+    /// `Archive::open` follows for the marker at the archive's own root, and reading a
+    /// shape this build does not recognise would silently fold whatever it does not
+    /// understand out of the file the next time something writes it. An older version is
+    /// still read, since that is the direction a version number is for.
+    ///
+    /// The refusal reaches the run through `write_owed`'s own `?`: a capture into an
+    /// archive whose owed record this build cannot read fails outright rather than
+    /// archiving normally and quietly skipping the write, which would lose the file's
+    /// existing debt without the run ever saying so.
+    pub fn read_owed(&self) -> Result<Vec<OwedAddress>, StorageError> {
+        let path = self.root.join(OWED_FILE);
+        match read_optional_json::<OwedRecord>(&path)? {
+            Some(record) if record.format != OWED_RECORD_FORMAT => {
+                Err(StorageError::NotAnOwedRecord { path })
+            }
+            Some(record) if record.version > OWED_RECORD_VERSION => {
+                Err(StorageError::UnreadableOwedFormat {
+                    path,
+                    found: record.version,
+                    readable: OWED_RECORD_VERSION,
+                })
+            }
+            Some(record) => Ok(record.addresses),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Stores the bytes of one subresource and answers with the record that references them.
@@ -414,6 +510,15 @@ impl Archive {
         read_optional_json(&self.item_path(url))?.ok_or_else(|| StorageError::NoSuchItem {
             url: url.to_string(),
         })
+    }
+
+    /// Whether this address already has at least one capture, without reading any of them:
+    /// the item record exists exactly when a capture does, so a stat of it is enough. A
+    /// second capture into an item is otherwise invisible to a run that only ever appends,
+    /// and this is what lets a caller notice before or after it happens rather than not at
+    /// all.
+    pub fn has_captures(&self, url: &CanonicalUrl) -> bool {
+        self.item_path(url).exists()
     }
 
     pub fn read_capture(
@@ -929,8 +1034,155 @@ mod tests {
         AdmissionCost, ArticleRecord, EXTRACTOR_VERSION, ExtractionRules, ProseShare,
     };
 
-    use super::super::model::ContentHash;
-    use super::StoredArticle;
+    use super::super::model::{ContentHash, OwedReason};
+    use super::{Archive, HashSet, OwedAddress, StorageError, StoredArticle};
+    use tempfile::TempDir;
+
+    fn owed_at(url: &str) -> OwedAddress {
+        OwedAddress {
+            url: url.to_owned(),
+            reason: OwedReason::Refused {
+                status: 429,
+                retry_after: None,
+            },
+        }
+    }
+
+    /// An archive holds every host it was ever pointed at, `items/<host>/...` says so in its
+    /// own path, so a run against one host cannot be allowed to erase what an earlier run
+    /// against a different one left owed. Two writes for two different addresses, neither
+    /// naming the other as archived, and both have to still be there afterward.
+    #[test]
+    fn a_run_against_one_host_does_not_erase_another_hosts_owed_debt() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = Archive::open(dir.path()).expect("archive opens in an empty directory");
+
+        archive
+            .write_owed(&HashSet::new(), &[owed_at("https://a.example/1")])
+            .expect("the first run's owed record is written");
+        archive
+            .write_owed(&HashSet::new(), &[owed_at("https://b.example/1")])
+            .expect("the second run's owed record is written");
+
+        let owed = archive.read_owed().expect("the owed record reads back");
+        assert_eq!(
+            owed,
+            vec![
+                owed_at("https://a.example/1"),
+                owed_at("https://b.example/1")
+            ],
+            "an unrelated run's debt is additive, not a replacement"
+        );
+    }
+
+    /// The other half of the same guarantee: an address stops being owed the moment some run
+    /// actually files it, and stays owed otherwise. `archived_urls` is what says which case
+    /// this run is in for each address already on file.
+    #[test]
+    fn an_address_a_run_actually_archives_is_removed_from_what_is_owed() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = Archive::open(dir.path()).expect("archive opens in an empty directory");
+        archive
+            .write_owed(
+                &HashSet::new(),
+                &[
+                    owed_at("https://a.example/1"),
+                    owed_at("https://a.example/2"),
+                ],
+            )
+            .expect("the first run's owed record is written");
+
+        let archived: HashSet<String> = [String::from("https://a.example/1")].into();
+        archive
+            .write_owed(&archived, &[])
+            .expect("the second run's owed record is written");
+
+        let owed = archive.read_owed().expect("the owed record reads back");
+        assert_eq!(
+            owed,
+            vec![owed_at("https://a.example/2")],
+            "only the address this run actually filed is settled"
+        );
+    }
+
+    /// An owed record naming a foreign format is refused rather than folded into: reading it
+    /// anyway would mean this project absorbing a shape it does not own and rewriting the
+    /// file over it, which is the silent loss the format field exists to catch.
+    #[test]
+    fn an_owed_record_naming_a_foreign_format_is_refused() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = Archive::open(dir.path()).expect("archive opens in an empty directory");
+        std::fs::write(
+            dir.path().join("owed.json"),
+            br#"{"format":"something-else","version":1,"addresses":[]}"#,
+        )
+        .expect("write a foreign owed record");
+
+        assert!(matches!(
+            archive.read_owed(),
+            Err(StorageError::NotAnOwedRecord { .. })
+        ));
+    }
+
+    /// The exact text a stranger sees for the foreign-format refusal, pinned so a later edit
+    /// cannot drift it back to a message generic enough to mean nothing.
+    #[test]
+    fn the_foreign_format_refusal_names_the_file_and_says_what_it_is_not() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = Archive::open(dir.path()).expect("archive opens in an empty directory");
+        std::fs::write(
+            dir.path().join("owed.json"),
+            br#"{"format":"something-else","version":1,"addresses":[]}"#,
+        )
+        .expect("write a foreign owed record");
+
+        let error = archive
+            .read_owed()
+            .expect_err("a foreign format is refused");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{} holds something else, not an Archeion owed record",
+                dir.path().join("owed.json").display()
+            )
+        );
+    }
+
+    /// A version newer than this build reads is refused for the same reason a newer archive
+    /// marker is: guessing at a shape added after this build was compiled is how a field gets
+    /// silently dropped the next time the file is written.
+    #[test]
+    fn an_owed_record_from_a_newer_version_is_not_guessed_at() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = Archive::open(dir.path()).expect("archive opens in an empty directory");
+        std::fs::write(
+            dir.path().join("owed.json"),
+            br#"{"format":"archeion-owed","version":99,"addresses":[]}"#,
+        )
+        .expect("write a future owed record");
+
+        assert!(matches!(
+            archive.read_owed(),
+            Err(StorageError::UnreadableOwedFormat { .. })
+        ));
+    }
+
+    /// The version this build actually writes still reads back clean, so the two refusals
+    /// above are about a foreign or a future record and not about the check itself rejecting
+    /// everything.
+    #[test]
+    fn an_owed_record_at_the_current_version_reads_clean() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = Archive::open(dir.path()).expect("archive opens in an empty directory");
+        archive
+            .write_owed(&HashSet::new(), &[owed_at("https://a.example/1")])
+            .expect("the owed record is written");
+
+        assert_eq!(
+            archive.read_owed().expect("the current version reads back"),
+            vec![owed_at("https://a.example/1")]
+        );
+    }
 
     /// The served-document example in `docs/readability.md`, pulled from the file rather than
     /// copied by hand, so a later edit to the block is what this test reads and not a second

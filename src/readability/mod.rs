@@ -145,6 +145,10 @@ pub fn extract(
     };
 
     let (document, measured) = document::build(&html).map_err(|cost| refused(cost.reason()))?;
+    // Before anything else touches the tree, and before a host's own rule might strip the
+    // element away entirely: this decides what happens to an embed, and rules and scoring
+    // both run on whatever it leaves behind.
+    document::link_embedded_documents(&document, source.final_url);
     let matched = rules.for_url(source.final_url);
     let narrowed = match matched {
         Some(matched) => document::narrow(&document, matched.rule),
@@ -741,6 +745,15 @@ mod tests {
         assert!(article.record.truncated.is_empty());
     }
 
+    /// A record's absence of a link is not evidence there was nothing to link, once an
+    /// `iframe` can produce one: pinned as a literal so a repass keeps rereading articles
+    /// extracted before this, rather than reading their absence of a link as `EXTRACTOR_VERSION`
+    /// simply moving again for something else.
+    #[test]
+    fn the_version_moved_for_the_iframe_link_rule() {
+        assert_eq!(EXTRACTOR_VERSION, 5);
+    }
+
     #[test]
     fn the_byline_is_the_one_the_page_carried() {
         let article = article_from(
@@ -779,6 +792,146 @@ mod tests {
         assert!(
             refused.reason.contains("elements open at once"),
             "{refused}"
+        );
+    }
+
+    /// The defect this rule exists to fix, at the smallest markup that reproduces it: a
+    /// sentence introducing a video, the video itself, and the sentence that follows it. The
+    /// share is one, since the article is the whole page, so the sliver rule cannot be what
+    /// keeps this article whether or not the link survives; what is asserted is only the link,
+    /// in the place the embed was.
+    #[test]
+    fn a_paragraph_then_an_iframe_then_a_paragraph_extracts_with_a_link_between_them() {
+        let filler =
+            "Bread is mostly patience, and the dough will tell you when it is ready. ".repeat(3);
+        let first_paragraph = format!("{filler}Watch the video below for the shaping steps.");
+        let second_paragraph =
+            format!("Once you have watched it, follow the timing table beneath. {filler}");
+        let article = article_from(
+            &format!(
+                "<html><body><article>\
+                 <p>{first_paragraph}</p>\
+                 <iframe src=\"https://www.youtube-nocookie.com/embed/rJ6RZ2YzaLc\"></iframe>\
+                 <p>{second_paragraph}</p>\
+                 </article></body></html>"
+            ),
+            Some("t"),
+        );
+
+        let before = article
+            .markdown
+            .find("Watch the video below")
+            .expect("the first paragraph survived");
+        let link = article
+            .markdown
+            .find("[youtube-nocookie.com](https://www.youtube-nocookie.com/embed/rJ6RZ2YzaLc)")
+            .unwrap_or_else(|| panic!("no link where the embed was: {}", article.markdown));
+        let after = article
+            .markdown
+            .find("Once you have watched it")
+            .expect("the second paragraph survived");
+        assert!(before < link && link < after, "{}", article.markdown);
+    }
+
+    /// `dom_smoothie`'s own cleaning pass keeps an `iframe` only when one of its attributes
+    /// names a domain on its hardcoded video whitelist, pinned directly in `document.rs`. Two
+    /// of these three hosts are not on it, and the fourth is not on any list this project has
+    /// read from a real archive at all. Producing a link on the same terms for all four is
+    /// what proves the rule reads the element rather than a table of known platforms.
+    #[test]
+    fn an_iframe_produces_a_link_regardless_of_its_host() {
+        for (src, label) in [
+            (
+                "https://www.youtube-nocookie.com/embed/rJ6RZ2YzaLc",
+                "youtube-nocookie.com",
+            ),
+            (
+                "https://open.spotify.com/embed/episode/abc123",
+                "open.spotify.com",
+            ),
+            (
+                "https://embed.podcasts.apple.com/us/podcast/one/id1",
+                "embed.podcasts.apple.com",
+            ),
+            ("https://player.example.net/watch/1", "player.example.net"),
+        ] {
+            let article = article_from(
+                &article_page(&format!("<iframe src=\"{src}\"></iframe>")),
+                Some("t"),
+            );
+            let expected = format!("[{label}]({src})");
+            assert!(
+                article.markdown.contains(&expected),
+                "{src}: expected {expected:?} in {}",
+                article.markdown
+            );
+            // The label is the host, not the address the reader would already see written out
+            // in the destination right beside it.
+            assert!(!article.markdown.contains(&format!("[{src}]")), "{src}");
+        }
+    }
+
+    #[test]
+    fn a_relative_iframe_src_is_resolved_against_the_pages_own_base() {
+        let article = article_from(
+            &article_page("<iframe src=\"/embed/one\"></iframe>"),
+            Some("t"),
+        );
+
+        assert!(
+            article
+                .markdown
+                .contains("[example.com](https://example.com/embed/one)"),
+            "{}",
+            article.markdown
+        );
+    }
+
+    /// Nothing rather than an empty link, on both ways an `iframe` can fail to name an
+    /// address: no `src` at all, and a `src` the destination policy refuses.
+    #[test]
+    fn an_iframe_with_no_readable_address_produces_nothing() {
+        for embed in [
+            "<iframe></iframe>",
+            "<iframe src=\"javascript:alert(1)\"></iframe>",
+        ] {
+            let article = article_from(&article_page(embed), Some("t"));
+            assert!(
+                !article.markdown.contains("]("),
+                "{embed}: {}",
+                article.markdown
+            );
+            assert!(
+                !article.markdown.to_lowercase().contains("iframe"),
+                "{embed}: {}",
+                article.markdown
+            );
+        }
+    }
+
+    /// The regression this bead names explicitly: a video a page already wrote as a plain
+    /// anchor survived before this rule existed, and this rule has no reason to touch an
+    /// element it does not match. Asserted by counting the address once, since a rule keyed on
+    /// content rather than on the element name could fire twice.
+    #[test]
+    fn a_video_written_as_a_plain_anchor_still_comes_through_whole_with_no_duplicate() {
+        let article = article_from(
+            &article_page("<p><a href=\"https://youtu.be/2qLXgmcv104\">HERE</a></p>"),
+            Some("t"),
+        );
+
+        assert_eq!(
+            article.markdown.matches("youtu.be/2qLXgmcv104").count(),
+            1,
+            "{}",
+            article.markdown
+        );
+        assert!(
+            article
+                .markdown
+                .contains("[HERE](https://youtu.be/2qLXgmcv104)"),
+            "{}",
+            article.markdown
         );
     }
 

@@ -5,14 +5,17 @@
 //! of decisions with reasons attached, written down in `docs/crawl-boundary.md`, and a
 //! command line that restated the numbers would be a second opinion about them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Write as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use archeion::capture::{CaptureError, CaptureRun, RunSoFar, capture_seed, capture_sitemap};
+use archeion::CanonicalUrl;
+use archeion::capture::{
+    CaptureError, CaptureRun, RunSoFar, capture_seed, capture_sitemap, owed_addresses,
+};
 use archeion::crawl::{
     CrawlEngine, CrawlStop, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_USER_AGENT,
     SMALLEST_MAX_RESPONSE_BYTES, Seed, SessionCookie, SpiderEngine,
@@ -278,6 +281,12 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
     let engine = SpiderEngine::default();
     engine.check_seed(&seed)?;
     let (archive, created) = open_or_create(&args.archive)?;
+    // Said before the first request rather than folded into the report at the end: appending
+    // is correct, but it is easy to start this by accident, and the run has to say so while
+    // there is still time to stop it rather than after the fact.
+    if !created {
+        warn_if_seed_already_captured(&archive, &args.seed_url);
+    }
     // A rule file that cannot be used costs the extractions it would have improved and not
     // the capture, so it is a warning here rather than a reason to refuse the run: the
     // response is the part that cannot be fetched again, and a better reading of it can be
@@ -315,12 +324,20 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
     // is a set of that many strings copied and dropped unread.
     let sitemap = if failure.is_none() && args.from_sitemap.is_some() {
         // Snapshotted before the phase starts, because that is what the phase has to answer
-        // to: the pages the crawl already filed come out of the same ceiling, the addresses
-        // it filed are the ones not worth buying twice, and the clock is the run's.
-        let archived = run.archived_urls.clone();
+        // to: the pages the crawl already filed come out of the same ceiling, and the
+        // addresses it either filed or was refused on are the ones not worth asking a
+        // rate-limiting host for a second time. Refused addresses are unioned in here rather
+        // than left for the sitemap phase to discover on its own, since a page the ordinary
+        // crawl reached lives in that phase's own `CaptureRun` and never reaches this one's.
+        let archived: HashSet<String> = run
+            .archived_urls
+            .iter()
+            .chain(run.refused_urls.iter())
+            .cloned()
+            .collect();
         let so_far = RunSoFar {
             started: run_started,
-            pages_written: run.captures_written,
+            pages_written: run.pages_spent,
             archived: &archived,
         };
         sitemap_phase(&args, &engine, &archive, &seed, &rules, &mut run, so_far)
@@ -328,6 +345,17 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
         SitemapOutcome::default()
     };
     failure = failure.or(sitemap.failure);
+
+    // Attempted whether or not an earlier write in this run already failed: that failure
+    // can be one corrupt record elsewhere in the archive, which says nothing about whether
+    // the path this writes to is healthy, and skipping it on that assumption used to mean a
+    // single bad item silently dropped every loss this run had learned about, leaving
+    // whatever an earlier run left in the file unchanged and now doubly stale. An earlier
+    // failure still wins the report if this write also fails, since it is the one that
+    // actually stopped the run; this one is not left unheard, only not allowed to hide it.
+    if let Err(error) = archive.write_owed(&run.archived_urls, &owed_addresses(&run)) {
+        failure = failure.or(Some(error));
+    }
 
     let report = report_of(&args, &seed, &run, created, sitemap.report);
     let output = if json {
@@ -419,6 +447,24 @@ fn open_or_create(path: &Path) -> Result<(Archive, bool), StorageError> {
             Archive::open(path).map(|archive| (archive, true))
         }
         Err(other) => Err(other),
+    }
+}
+
+/// Says, before anything is fetched, that this seed has been captured into this archive
+/// before. It has happened twice by accident: a run started, stopped and started again, with
+/// nothing about the invocation saying that a second run and a first look the same.
+///
+/// A seed that fails to canonicalize is left to whatever refuses it once the crawl actually
+/// starts; this line is a courtesy about a run that would otherwise say nothing; it is not
+/// where a malformed seed is reported.
+fn warn_if_seed_already_captured(archive: &Archive, seed_url: &str) {
+    if let Ok(canonical) = CanonicalUrl::parse(seed_url)
+        && archive.has_captures(&canonical)
+    {
+        warn(std::iter::once(format!(
+            "{seed_url} already has captures in this archive; this run appends to them \
+             rather than replacing them"
+        )));
     }
 }
 
@@ -579,6 +625,12 @@ struct CaptureReport {
     archive: String,
     archive_created: bool,
     captures_written: usize,
+    /// How many of the captures above landed on an item this archive already held one for.
+    /// `None` when this run created the archive, since nothing it just brought into
+    /// existence can have held anything before it: a run appending to nothing is not a case
+    /// this row exists to say anything about, unlike `responses_refused`, which is worth
+    /// reading even at zero.
+    items_appended: Option<usize>,
     /// Keyed by status, declared here in the shape this command promises rather than
     /// serialized off the library's report, which is this file's convention for every field.
     responses_refused: BTreeMap<String, usize>,
@@ -612,6 +664,7 @@ fn report_of(
         archive: args.archive.display().to_string(),
         archive_created: created,
         captures_written: run.captures_written,
+        items_appended: (!created).then_some(run.items_appended),
         responses_refused: run
             .responses_refused
             .iter()
@@ -765,6 +818,18 @@ fn human_report(report: &CaptureReport, stopped: CrawlStop) -> String {
         )
         .expect("writing to a string cannot fail");
     }
+    // Present whenever the run did not create the archive, at zero included: a zero here says
+    // this run touched nothing it had already captured, which is only worth knowing about an
+    // archive old enough to have captured something. Absent for a run that just created the
+    // archive, since nothing that new could have held anything for this run to append to.
+    if let Some(items_appended) = report.items_appended {
+        writeln!(
+            output,
+            "  {:<14}{items_appended} item(s) gained a further capture",
+            "appended"
+        )
+        .expect("writing to a string cannot fail");
+    }
     output
 }
 
@@ -911,6 +976,28 @@ mod tests {
         assert!(refuse(&["--delay", "10"]).contains("has no unit"));
         assert!(refuse(&["--request-timeout", "1 minute"]).contains("not a unit of time"));
         assert!(refuse(&["--deadline", "forever"]).contains("none for a run with no deadline"));
+    }
+
+    /// A regression rather than a behavior test: `responses_refused` is depended on outside
+    /// this repo by name and by shape, a count by status, and `arch-qs9` moved the address
+    /// of a refused response to a record on disk without being allowed to move this. Built
+    /// from a `CaptureRun` directly rather than a live crawl, since what is being pinned is
+    /// the field this command line publishes and not the run that fills it.
+    #[test]
+    fn the_json_report_still_carries_responses_refused_by_status() {
+        let args = parse(&[]);
+        let seed = seed_of(&args, None);
+        let mut run = CaptureRun::default();
+        *run.responses_refused.entry(429).or_default() += 2;
+        *run.responses_refused.entry(503).or_default() += 1;
+
+        let report = report_of(&args, &seed, &run, false, None);
+        let json = serde_json::to_value(&report).expect("the report serializes");
+
+        assert_eq!(
+            json["responses_refused"],
+            serde_json::json!({"429": 2, "503": 1})
+        );
     }
 
     #[test]
@@ -1065,6 +1152,63 @@ mod tests {
 
         assert!(report.session.is_none());
         assert!(!human_report(&report, CrawlStop::Exhausted).contains("session"));
+    }
+
+    /// The row's own boundary: present and zero for an archive this run did not create, gone
+    /// entirely for one it did, whatever `items_appended` happens to hold. A run that just
+    /// created its archive cannot have appended to anything in it, so the field carries no
+    /// number worth printing rather than a zero indistinguishable from the other case.
+    #[test]
+    fn the_appended_row_is_a_number_into_an_old_archive_and_absent_from_a_new_one() {
+        let args = parse(&[]);
+        let seed = seed_of(&args, None);
+
+        let untouched = report_of(
+            &args,
+            &seed,
+            &CaptureRun {
+                items_appended: 0,
+                ..CaptureRun::default()
+            },
+            false,
+            None,
+        );
+        assert_eq!(untouched.items_appended, Some(0));
+        assert!(
+            human_report(&untouched, CrawlStop::Exhausted).contains("appended      0 item(s)"),
+            "{}",
+            human_report(&untouched, CrawlStop::Exhausted)
+        );
+
+        let appended = report_of(
+            &args,
+            &seed,
+            &CaptureRun {
+                items_appended: 3,
+                ..CaptureRun::default()
+            },
+            false,
+            None,
+        );
+        assert_eq!(appended.items_appended, Some(3));
+        assert!(
+            human_report(&appended, CrawlStop::Exhausted).contains("appended      3 item(s)"),
+            "{}",
+            human_report(&appended, CrawlStop::Exhausted)
+        );
+
+        let fresh_archive = report_of(
+            &args,
+            &seed,
+            &CaptureRun {
+                items_appended: 3,
+                ..CaptureRun::default()
+            },
+            true,
+            None,
+        );
+        assert_eq!(fresh_archive.items_appended, None);
+        assert!(!human_report(&fresh_archive, CrawlStop::Exhausted).contains("appended"));
     }
 
     /// The stop is the row an operator reads to decide which flag to change, so the page

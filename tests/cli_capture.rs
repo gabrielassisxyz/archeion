@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use archeion::CanonicalUrl;
 use archeion::crawl::DEFAULT_USER_AGENT;
-use archeion::storage::Archive;
+use archeion::storage::{Archive, OwedReason};
 use tempfile::TempDir;
 
 const INDEX: &str = r#"<html><head><title>An index</title></head>
@@ -128,6 +128,29 @@ fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// Every file under `blobs/`, however many levels of sharding sit above it, so a test can
+/// assert on what actually reached the content store rather than only on whether its root
+/// directory happens to exist: a directory that was created for one blob and never cleaned
+/// up would pass an `exists()` check forever after, whatever a later run stored or skipped.
+fn blob_count(archive_root: &std::path::Path) -> usize {
+    fn walk(dir: &std::path::Path, count: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, count);
+            } else {
+                *count += 1;
+            }
+        }
+    }
+    let mut count = 0;
+    walk(&archive_root.join("blobs"), &mut count);
+    count
+}
+
 /// The whole verb, from a command line to records on disk. The counts are asserted as the
 /// report prints them, because the report is the only thing a person running this sees and a
 /// number that stops being true silently is the failure the report exists to prevent.
@@ -181,6 +204,74 @@ fn a_seed_is_crawled_into_an_archive_that_the_run_creates() {
         .expect("the prose is stored")
         .expect("the article page produced prose");
     assert!(article.markdown.contains("Bread is mostly patience"));
+}
+
+/// The behavior this bead exists for: a second run into an archive that already holds the
+/// seed says so before it fetches anything, and the report carries how many items gained a
+/// further capture. Nothing is refused or skipped: the second run appends exactly like the
+/// first one did, and the archive ends up holding two captures of each page.
+#[test]
+fn a_second_run_into_the_same_archive_reports_what_it_appended() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let site = Site::start();
+    let seed_url = site.url("/index.html");
+    let run = || {
+        archeion()
+            .arg("capture")
+            .arg(&archive_path)
+            .arg(&seed_url)
+            .args([
+                "--max-pages",
+                "4",
+                "--concurrency",
+                "1",
+                "--max-retries",
+                "0",
+            ])
+            .args(["--deadline", "30s", "--allow-private-addresses"])
+            .output()
+            .expect("the binary runs")
+    };
+
+    let first = run();
+    assert!(first.status.success(), "{}", stderr_of(&first));
+    assert_eq!(stderr_of(&first), "");
+    assert!(
+        !stdout_of(&first).contains("appended"),
+        "a fresh archive has nothing to append to: {}",
+        stdout_of(&first)
+    );
+
+    // A capture id is the fetch instant beside a fingerprint of the response, at a second's
+    // resolution: two fetches of identical content landing in the same second are one
+    // capture on purpose, so the wait is what lets this test tell "appended" apart from
+    // "overwrote the one that was already there".
+    thread::sleep(Duration::from_millis(1100));
+
+    let second = run();
+    assert!(second.status.success(), "{}", stderr_of(&second));
+    assert!(
+        stderr_of(&second).contains(&format!("{seed_url} already has captures")),
+        "{}",
+        stderr_of(&second)
+    );
+    assert!(
+        stdout_of(&second).contains("appended      2 item(s) gained a further capture"),
+        "{}",
+        stdout_of(&second)
+    );
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    let url = CanonicalUrl::parse(&site.url("/article.html")).expect("valid url");
+    assert_eq!(
+        archive
+            .list_captures(&url)
+            .expect("captures are listed")
+            .len(),
+        2,
+        "the second run appended a capture rather than replacing the first one"
+    );
 }
 
 /// A page the site published as Markdown, crawled the way one is really reached: through a
@@ -2432,4 +2523,264 @@ fn answer(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
     stream.write_all(head.as_bytes())?;
     stream.write_all(body)?;
     stream.flush()
+}
+
+/// A loopback site that answers every page with 429, optionally naming when to come back.
+/// `/robots.txt` still answers 404, exactly like every other server in this file, so the
+/// refusal being tested is the page's own and not a crawl `robots.txt` would have refused
+/// on its own account.
+fn serve_every_page_refused(retry_after: Option<&'static str>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || answer_every_page_refused(stream, retry_after));
+        }
+    });
+    port
+}
+
+fn answer_every_page_refused(
+    mut stream: TcpStream,
+    retry_after: Option<&'static str>,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    if path == "/robots.txt" {
+        stream.write_all(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return stream.flush();
+    }
+    let body: &[u8] = b"Too Many Requests";
+    let retry_after_header = retry_after
+        .map(|value| format!("Retry-After: {value}\r\n"))
+        .unwrap_or_default();
+    let head = format!(
+        "HTTP/1.1 429 Too Many Requests\r\n{retry_after_header}Content-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
+/// The decision in `arch-9j5`, driven end to end: a host that refuses every page leaves an
+/// archive holding no items and no blobs, and the address it asked for is readable from the
+/// owed record rather than from a line of text that scrolled past. `Retry-After` survives on
+/// the same record, since it is the one part of a refusal a later run needs.
+#[test]
+fn a_run_a_host_refuses_on_every_route_leaves_no_items_or_blobs_and_names_the_address_owed() {
+    let dir = TempDir::new().expect("temp dir");
+    let port = serve_every_page_refused(Some("120"));
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args([
+            "--max-pages",
+            "1",
+            "--max-retries",
+            "0",
+            "--deadline",
+            "30s",
+            "--allow-private-addresses",
+        ])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+
+    let archive = Archive::open_existing(dir.path()).expect("the run created an archive");
+    let walk = archive.walk().expect("the walk reads back");
+    assert!(
+        walk.items.is_empty(),
+        "a refused response is not an item: {:?}",
+        walk.items
+    );
+    assert!(
+        !dir.path().join("blobs").exists(),
+        "nothing was ever stored, so no blob directory was ever created"
+    );
+
+    let owed = archive.read_owed().expect("the owed record reads back");
+    assert_eq!(owed.len(), 1);
+    assert_eq!(owed[0].url, seed_url);
+    assert_eq!(
+        owed[0].reason,
+        OwedReason::Refused {
+            status: 429,
+            retry_after: Some("120".to_owned()),
+        }
+    );
+}
+
+/// The absence half of the same field: a host that never sends the header leaves the record
+/// saying so, rather than a value nothing sent standing in for one.
+#[test]
+fn a_refusal_with_no_retry_after_records_its_absence() {
+    let dir = TempDir::new().expect("temp dir");
+    let port = serve_every_page_refused(None);
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args([
+            "--max-pages",
+            "1",
+            "--max-retries",
+            "0",
+            "--deadline",
+            "30s",
+            "--allow-private-addresses",
+        ])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+
+    let archive = Archive::open_existing(dir.path()).expect("the run created an archive");
+    let owed = archive.read_owed().expect("the owed record reads back");
+    assert_eq!(
+        owed.len(),
+        1,
+        "exactly the one refused seed page is owed: {owed:?}"
+    );
+    assert_eq!(
+        owed[0].reason,
+        OwedReason::Refused {
+            status: 429,
+            retry_after: None,
+        }
+    );
+}
+
+const MIXED_RESPONSES_INDEX: &str = r#"<html><head><title>Index</title></head>
+    <body><ul>
+        <li><a href="/served">served</a></li>
+        <li><a href="/refused">refused</a></li>
+    </ul></body></html>"#;
+
+/// A loopback site whose index links to one page it serves and one it refuses, so a run over
+/// it produces exactly the mix `list` has to tell apart.
+fn serve_mixed_responses() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || answer_mixed_responses(stream));
+        }
+    });
+    port
+}
+
+fn answer_mixed_responses(mut stream: TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    let (status, body): (&str, &[u8]) = match path.as_str() {
+        "/robots.txt" => ("404 Not Found", b""),
+        "/index.html" => ("200 OK", MIXED_RESPONSES_INDEX.as_bytes()),
+        "/served" => (
+            "200 OK",
+            b"<html><head><title>Served</title></head><body>served</body></html>",
+        ),
+        "/refused" => ("429 Too Many Requests", b"Too Many Requests"),
+        _ => ("404 Not Found", b""),
+    };
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
+/// `list` over an archive whose run served some pages and was refused on others prints only
+/// the ones it holds: an item is a page that was served, so there is nothing failed for it
+/// to show. The refused address is not gone, only elsewhere: `owed.json` names it.
+#[test]
+fn a_mixed_run_lists_only_the_pages_the_host_served() {
+    let dir = TempDir::new().expect("temp dir");
+    let port = serve_mixed_responses();
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let capture = archeion()
+        .arg("capture")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args([
+            "--max-pages",
+            "5",
+            "--max-depth",
+            "1",
+            "--max-retries",
+            "0",
+            "--deadline",
+            "30s",
+            "--allow-private-addresses",
+        ])
+        .output()
+        .expect("the binary runs");
+    assert!(capture.status.success(), "{}", stderr_of(&capture));
+
+    let list = archeion()
+        .arg("list")
+        .arg(dir.path())
+        .output()
+        .expect("the binary runs");
+    assert!(list.status.success(), "{}", stderr_of(&list));
+    let printed = stdout_of(&list);
+    assert!(
+        printed.contains("/served"),
+        "the served page is listed: {printed}"
+    );
+    assert!(
+        !printed.contains("/refused"),
+        "the refused page is not listed: {printed}"
+    );
+
+    let archive = Archive::open_existing(dir.path()).expect("the run created an archive");
+    let owed = archive.read_owed().expect("the owed record reads back");
+    assert_eq!(
+        owed.iter()
+            .map(|address| address.url.as_str())
+            .collect::<Vec<_>>(),
+        vec![format!("http://127.0.0.1:{port}/refused").as_str()]
+    );
+
+    // The blob store is where "the refused body was skipped" and "the run stored nothing at
+    // all" actually come apart: two bodies in, the index and the served page, and neither
+    // is the seventeen bytes the refused route answered with.
+    assert_eq!(
+        blob_count(dir.path()),
+        2,
+        "one blob for the index, one for the served page, and none for the refused one"
+    );
 }

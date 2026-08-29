@@ -14,6 +14,6 @@ pub use boundary::{
     SessionCookie,
 };
 pub use spider_engine::{
-    DEFAULT_MAX_RESPONSE_BYTES, SMALLEST_MAX_RESPONSE_BYTES, SpiderEngine,
+    DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_USER_AGENT, SMALLEST_MAX_RESPONSE_BYTES, SpiderEngine,
     settle_response_byte_ceiling,
 };

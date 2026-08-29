@@ -26,6 +26,7 @@ Every option is one field of the seed the library crawls with, spelled the same,
 | `--deadline <SPAN>` | the wall clock the whole run gets, or `none` |
 | `--request-timeout <SPAN>` | how long one request may take before it counts as no response |
 | `--max-retries <N>` | how many times a request worth repeating is repeated |
+| `--user-agent <STRING>` | the identity announced to servers and matched against `robots.txt`, in place of the compiled default |
 | `--max-response-bytes <BYTES>` | the ceiling on one response body |
 | `--allow-private-addresses` | let the run reach addresses that exist only inside a network |
 | `--cookie-file <PATH>` | the `Cookie` header of an authenticated request, sent to the seed's own origin |

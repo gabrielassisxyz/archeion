@@ -37,11 +37,21 @@ use crate::storage::Header;
 
 /// Archiving under a name that says what it is and where to complain about it. A crawler
 /// that hides behind a browser's user agent is asking to be blocked once it is found out.
-const USER_AGENT: &str = concat!(
+///
+/// This is what a seed with no `user_agent` of its own runs under; `docs/cli.md` publishes it
+/// as `--user-agent`'s default, which is why it is public rather than confined to this file.
+pub const DEFAULT_USER_AGENT: &str = concat!(
     "archeion/",
     env!("CARGO_PKG_VERSION"),
     " (+https://github.com/gabrielassisxyz/archeion)"
 );
+
+/// The identity a seed runs under: its own choice if it made one, and the compiled default
+/// otherwise. Read once by `configure_for_seed` and once by `robots_rules`, so the request a
+/// run sends and the robots group it is judged against never name two different requesters.
+fn user_agent_of(seed: &Seed) -> &str {
+    seed.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT)
+}
 
 /// The most one response may spend before the archive stops reading it.
 ///
@@ -310,7 +320,7 @@ async fn crawl_seed(
     // whether or not the engine ever came back to fetch it.
     let depths: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     configure_for_seed(website, start, seed, Arc::clone(&depths));
-    let robots = robots_rules(website, raw_lines_cache).await;
+    let robots = robots_rules(website, raw_lines_cache, user_agent_of(seed)).await;
     // The engine fetches while the caller writes to disk, so the queue between them has to
     // absorb the difference. Sizing it to the fetch concurrency alone drops pages the
     // moment a write is slower than a fetch; sizing it to the page limit would hold a
@@ -436,9 +446,14 @@ async fn crawl_seed(
 /// under the operator's delay instead of the site's from its second listed URL on. Deriving
 /// it is a pure read of data the parser already holds, so doing it unconditionally costs
 /// nothing on the call that did just fetch the file.
+///
+/// `user_agent` is `configure_for_seed`'s own `user_agent_of(seed)`, passed rather than
+/// re-derived, so the group a run is judged against always names the identity its requests
+/// actually sent.
 async fn robots_rules(
     website: &mut Website,
     raw_lines_cache: &mut Option<Vec<RawRuleLine>>,
+    user_agent: &str,
 ) -> RobotRules {
     let (client, _control) = website.setup_base();
     website.configure_robots_parser(&client).await;
@@ -480,7 +495,7 @@ async fn robots_rules(
     if let Some(delay) = crawl_delay {
         website.with_delay(u64::try_from(delay.as_millis().min(60_000)).unwrap_or(u64::MAX));
     }
-    RobotRules::for_agent(groups, USER_AGENT)
+    RobotRules::for_agent(groups, user_agent)
 }
 
 /// Whether any already-decoded rule could have come from an escaped `%2A` or `%24`: the
@@ -828,7 +843,7 @@ fn configure_for_seed(
         .with_tld(false)
         // The sitemap is a claim about what exists; the crawl records what is reachable.
         .with_ignore_sitemap(true)
-        .with_user_agent(Some(USER_AGENT));
+        .with_user_agent(Some(user_agent_of(seed)));
     // Asked about `start` and not about the seed's own URL, because `start` is the address the
     // requests of this client are aimed at: a crawl is built around its seed, and a single
     // fetch around the subresource or listed URL being acquired. A cookie that belongs to
@@ -2093,10 +2108,76 @@ mod tests {
             .chain(std::iter::once(parser.get_base_entry()))
             .map(|entry| group_of(entry, &mut raw_lines))
             .collect();
-        let rules = RobotRules::for_agent(groups, USER_AGENT);
+        let rules = RobotRules::for_agent(groups, DEFAULT_USER_AGENT);
         assert!(!rules.allows("https://example.test/first"));
         assert!(!rules.allows("https://example.test/second"));
         assert!(rules.allows("https://example.test/general"));
+    }
+
+    /// `configure_for_seed` and `robots_rules` both read `Seed::user_agent`, so a seed's own
+    /// choice reaches the HTTP client and the robots matcher together rather than only one of
+    /// them, and a seed carrying none of its own sends the same compiled default to both.
+    ///
+    /// The file names the product token a real `robots.txt` would, `x` rather than `x/1.0`:
+    /// RFC 9309 matches on that token alone, so a group written against the full string this
+    /// seed sends would never match either identity and the two paths below would come out
+    /// identical regardless of which one governed.
+    #[test]
+    fn a_seeds_own_user_agent_reaches_both_the_client_and_the_robots_matcher() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let addr = listener.local_addr().expect("the bound address");
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let _ = answer_robots_txt(
+                    stream,
+                    "User-agent: x\nDisallow: /named-group-only\n\n\
+                     User-agent: *\nDisallow: /general-group-only\n",
+                );
+            }
+        });
+        let start = format!("http://{addr}/");
+
+        let runtime = Runtime::new().expect("a runtime for the test");
+        runtime.block_on(async {
+            let mut seed = Seed::new(&start);
+            seed.user_agent = Some("x/1.0".to_owned());
+            let mut website = Website::new(&start);
+            configure_for_seed(&mut website, &start, &seed, empty_depths());
+            assert_eq!(
+                website
+                    .configuration
+                    .user_agent
+                    .as_deref()
+                    .map(AsRef::as_ref),
+                Some("x/1.0"),
+                "the seed's own identity did not reach the HTTP client"
+            );
+
+            let mut raw_lines_cache = None;
+            let rules =
+                robots_rules(&mut website, &mut raw_lines_cache, user_agent_of(&seed)).await;
+            assert!(
+                !rules.allows(&format!("{start}named-group-only")),
+                "the named group governing this identity was not applied"
+            );
+            assert!(
+                rules.allows(&format!("{start}general-group-only")),
+                "the * group governed instead of the named group the seed asked for"
+            );
+        });
+
+        let seed = Seed::new(&start);
+        let mut website = Website::new(&start);
+        configure_for_seed(&mut website, &start, &seed, empty_depths());
+        assert_eq!(
+            website
+                .configuration
+                .user_agent
+                .as_deref()
+                .map(AsRef::as_ref),
+            Some(DEFAULT_USER_AGENT),
+            "omitting the flag did not send the compiled default byte for byte"
+        );
     }
 
     /// Answers every request on this connection with a fixed `robots.txt` body, which is all
@@ -2151,7 +2232,7 @@ mod tests {
             let mut raw_lines_cache = None;
 
             configure_for_seed(&mut website, &start, &seed, empty_depths());
-            robots_rules(&mut website, &mut raw_lines_cache).await;
+            robots_rules(&mut website, &mut raw_lines_cache, user_agent_of(&seed)).await;
             assert_eq!(
                 website.configuration.delay, 3000,
                 "the site's own crawl delay was not read on the first, fetching call"
@@ -2161,7 +2242,7 @@ mod tests {
             // cached `Website` back for it: the same reset-then-reread sequence, on a parser
             // that is already read and therefore skips the fetch this time.
             configure_for_seed(&mut website, &start, &seed, empty_depths());
-            robots_rules(&mut website, &mut raw_lines_cache).await;
+            robots_rules(&mut website, &mut raw_lines_cache, user_agent_of(&seed)).await;
             assert_eq!(
                 website.configuration.delay, 3000,
                 "a reused sub-crawl fell back to the seed's own delay instead of the site's"

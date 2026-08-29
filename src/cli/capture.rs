@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use archeion::capture::{CaptureError, CaptureRun, RunSoFar, capture_seed, capture_sitemap};
 use archeion::crawl::{
-    CrawlEngine, CrawlStop, DEFAULT_MAX_RESPONSE_BYTES, SMALLEST_MAX_RESPONSE_BYTES, Seed,
-    SessionCookie, SpiderEngine,
+    CrawlEngine, CrawlStop, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_USER_AGENT,
+    SMALLEST_MAX_RESPONSE_BYTES, Seed, SessionCookie, SpiderEngine,
 };
 use archeion::readability::SiteRules;
 use archeion::sitemap::{SitemapListing, read_sitemap};
@@ -60,6 +60,10 @@ pub struct CaptureArgs {
     /// How many times a request that failed in a way worth repeating is repeated.
     #[arg(long, value_name = "N", default_value_t = defaults().max_retries)]
     max_retries: u8,
+    /// The identity this run announces to servers and matches `robots.txt` groups against,
+    /// in place of the compiled default archeion otherwise sends.
+    #[arg(long, value_name = "STRING", help = user_agent_help())]
+    user_agent: Option<String>,
     /// Ceiling on the body of one response, in bytes. It is settled for the whole process
     /// before anything is fetched, because that is the only channel the engine offers.
     #[arg(long, value_name = "BYTES", help = response_ceiling_help(),
@@ -105,6 +109,16 @@ fn defaults() -> Seed {
 
 fn response_ceiling_help() -> String {
     format!("Ceiling on the body of one response, in bytes [default: {DEFAULT_MAX_RESPONSE_BYTES}]")
+}
+
+/// Read off the engine's own constant rather than off `defaults()`: `Seed::new` carries
+/// `None` for this field, which means "the engine's compiled default" and prints as nothing
+/// useful, while the string an operator actually gets when they omit the flag lives in
+/// `archeion::crawl::DEFAULT_USER_AGENT`.
+fn user_agent_help() -> String {
+    format!(
+        "The identity announced to servers and matched against robots rules [default: {DEFAULT_USER_AGENT}]"
+    )
 }
 
 fn max_depth_help() -> String {
@@ -357,6 +371,7 @@ fn seed_of(args: &CaptureArgs, credential: Option<String>) -> Seed {
     seed.deadline = args.deadline.0;
     seed.request_timeout = args.request_timeout.0;
     seed.max_retries = args.max_retries;
+    seed.user_agent = args.user_agent.clone();
     seed.allow_private_addresses = args.allow_private_addresses;
     seed.session_cookie = credential.map(|value| SessionCookie::bound_to(&args.seed_url, value));
     seed

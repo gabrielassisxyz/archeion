@@ -766,7 +766,7 @@ fn a_directory_holding_something_else_is_not_adopted_as_an_archive() {
 
     assert!(matches!(
         Archive::open(dir.path()),
-        Err(StorageError::NotAnArchive { .. })
+        Err(StorageError::NotAnArchiveDirectory { .. })
     ));
 }
 

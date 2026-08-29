@@ -99,6 +99,8 @@ pub enum StorageError {
     },
     #[error("{path} holds something else, not an Archeion archive")]
     NotAnArchive { path: PathBuf },
+    #[error("{path} holds {entry}, not an Archeion archive")]
+    NotAnArchiveDirectory { path: PathBuf, entry: String },
     #[error("{path} does not exist")]
     MissingArchive { path: PathBuf },
     #[error("{path} does not hold an Archeion archive")]
@@ -145,6 +147,14 @@ impl Archive {
     /// Opens the archive at `root`, creating it when the directory is empty or absent. A
     /// directory that holds anything else is refused rather than adopted: pointing this
     /// at the wrong path should fail loudly, not scatter records into it.
+    ///
+    /// One shape short of empty is also adopted: a directory whose only visible entry is
+    /// `extraction-rules.json`. A host's rule has nowhere to live before its first capture
+    /// other than the archive that capture is about to create, so writing it first is the
+    /// intuitive order and this is what lets that order work. The file is left exactly as
+    /// it was found; only the marker is written. What joins this tolerance is bounded by
+    /// ownership, not by taste: a name is added to it only when `Archive` itself has a path
+    /// accessor for it, which today is exactly this one file.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let root = root.into();
         let marker_path = root.join(MARKER_FILE);
@@ -162,8 +172,15 @@ impl Archive {
             }
             Some(_) => {}
             None => {
-                if directory_has_visible_entries(&root)? {
-                    return Err(StorageError::NotAnArchive { path: root });
+                match visible_entries(&root)?.as_slice() {
+                    [] => {}
+                    [only] if only == EXTRACTION_RULES_FILE => {}
+                    [first, ..] => {
+                        return Err(StorageError::NotAnArchiveDirectory {
+                            path: root,
+                            entry: first.clone(),
+                        });
+                    }
                 }
                 write_json(
                     &marker_path,
@@ -807,14 +824,14 @@ fn remove_optional_file(path: &Path) -> Result<(), StorageError> {
     }
 }
 
-/// Whether a directory holds anything that would make adopting it as an archive a
-/// mistake. Dotted entries do not count: a crash during the very first write leaves this
+/// The names of a directory's visible entries, in whatever order the filesystem returns
+/// them. Dotted entries do not count: a crash during the very first write leaves this
 /// store's own temporary file behind, and letting that permanently block the directory it
 /// was created in would be the store poisoning its own root.
-fn directory_has_visible_entries(path: &Path) -> Result<bool, StorageError> {
+fn visible_entries(path: &Path) -> Result<Vec<String>, StorageError> {
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(source) => {
             return Err(StorageError::Io {
                 path: path.to_owned(),
@@ -822,16 +839,18 @@ fn directory_has_visible_entries(path: &Path) -> Result<bool, StorageError> {
             });
         }
     };
+    let mut names = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|source| StorageError::Io {
             path: path.to_owned(),
             source,
         })?;
-        if !entry.file_name().to_string_lossy().starts_with('.') {
-            return Ok(true);
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with('.') {
+            names.push(name);
         }
     }
-    Ok(false)
+    Ok(names)
 }
 
 /// The name a capture is filed under, derived from everything about the response that
@@ -1037,6 +1056,150 @@ mod tests {
     use super::super::model::{ContentHash, OwedReason};
     use super::{Archive, HashSet, OwedAddress, StorageError, StoredArticle};
     use tempfile::TempDir;
+
+    /// An absent directory is created and adopted, which every other case in this module
+    /// assumes rather than asserts on its own.
+    #[test]
+    fn an_absent_directory_is_created_as_an_archive() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("does-not-exist-yet");
+
+        Archive::open(&root).expect("an absent directory becomes an archive");
+
+        assert!(root.join("archeion.json").exists());
+    }
+
+    /// The ordinary case the refusal exists to leave alone.
+    #[test]
+    fn an_empty_directory_is_adopted_as_an_archive() {
+        let dir = TempDir::new().expect("temp dir");
+
+        Archive::open(dir.path()).expect("an empty directory is adopted");
+
+        assert!(dir.path().join("archeion.json").exists());
+    }
+
+    /// The shape this bead exists for: a host's rule can be written before that host's
+    /// first capture, into a directory that is not an archive yet, and the directory
+    /// becomes one without disturbing the file already there.
+    #[test]
+    fn a_directory_holding_only_the_rules_file_is_adopted_and_the_file_is_untouched() {
+        let dir = TempDir::new().expect("temp dir");
+        let rules_path = dir.path().join("extraction-rules.json");
+        let written = br#"{"hosts":{"example.com":{"strip":[".ad"]}}}"#;
+        std::fs::write(&rules_path, written).expect("the rules file is written first");
+
+        Archive::open(dir.path()).expect("a directory holding only the rules file is adopted");
+
+        assert!(dir.path().join("archeion.json").exists());
+        assert_eq!(
+            std::fs::read(&rules_path).expect("the rules file is still there"),
+            written,
+            "the file this bead is about is left exactly as it was found"
+        );
+    }
+
+    /// Adopting one more directory shape is not a format change: the marker this writes for
+    /// a directory holding only the rules file has to be the same one an empty directory
+    /// gets, byte for byte, or the version silently started depending on how the archive
+    /// came to exist.
+    #[test]
+    fn adopting_a_directory_holding_only_the_rules_file_writes_the_same_marker_as_an_empty_one() {
+        let empty = TempDir::new().expect("temp dir");
+        Archive::open(empty.path()).expect("an empty directory is adopted");
+        let empty_marker = std::fs::read_to_string(empty.path().join("archeion.json"))
+            .expect("the marker is written");
+
+        let with_rules = TempDir::new().expect("temp dir");
+        std::fs::write(with_rules.path().join("extraction-rules.json"), b"{}")
+            .expect("the rules file");
+        Archive::open(with_rules.path())
+            .expect("a directory holding only the rules file is adopted");
+        let rules_marker = std::fs::read_to_string(with_rules.path().join("archeion.json"))
+            .expect("the marker is written");
+
+        assert_eq!(
+            rules_marker, empty_marker,
+            "adopting one more directory shape did not move the format version"
+        );
+    }
+
+    /// The tolerance is drawn at visibility, not at emptiness: a directory whose only entry
+    /// is dotted was already adopted before this bead, and narrowing the criterion to
+    /// ownership of the rules file must not take that away.
+    #[test]
+    fn a_directory_holding_only_a_hidden_entry_is_still_adopted() {
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join(".DS_Store"), b"").expect("a hidden entry");
+
+        Archive::open(dir.path()).expect("a hidden entry alone does not block adoption");
+
+        assert!(dir.path().join("archeion.json").exists());
+    }
+
+    /// The rules file is tolerated alone, never as an addition: a second visible entry
+    /// beside it is still a directory that looks like somebody else's.
+    #[test]
+    fn a_directory_holding_the_rules_file_and_another_entry_is_refused() {
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("extraction-rules.json"), b"{}").expect("the rules file");
+        std::fs::write(dir.path().join("notes.txt"), b"not this one")
+            .expect("another visible entry");
+
+        assert!(matches!(
+            Archive::open(dir.path()),
+            Err(StorageError::NotAnArchiveDirectory { .. })
+        ));
+    }
+
+    /// A single visible file that is not the rules file is exactly the case the original
+    /// refusal existed for, and adopting the rules file must not widen it.
+    #[test]
+    fn a_directory_holding_one_other_visible_file_is_refused() {
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("notes.txt"), b"a directory of my own")
+            .expect("a visible file");
+
+        assert!(matches!(
+            Archive::open(dir.path()),
+            Err(StorageError::NotAnArchiveDirectory { .. })
+        ));
+    }
+
+    /// The exact text a stranger sees, pinned so a later edit cannot drift it back to a
+    /// message that names nothing an operator can act on.
+    #[test]
+    fn the_refusal_names_the_entry_it_found() {
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("notes.txt"), b"a directory of my own")
+            .expect("a visible file");
+
+        let error = Archive::open(dir.path())
+            .map(|_| ())
+            .expect_err("a stray file is refused");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{} holds notes.txt, not an Archeion archive",
+                dir.path().display()
+            )
+        );
+    }
+
+    /// `open_existing` is a read-only caller and must not adopt anything, the rules file
+    /// included: a mistyped path handed to a reader must not silently become a valid,
+    /// empty-looking archive just because someone else already wrote a rule into it.
+    #[test]
+    fn open_existing_still_refuses_a_directory_holding_only_the_rules_file() {
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("extraction-rules.json"), b"{}").expect("the rules file");
+
+        assert!(matches!(
+            Archive::open_existing(dir.path()),
+            Err(StorageError::NoArchiveMarker { .. })
+        ));
+    }
 
     fn owed_at(url: &str) -> OwedAddress {
         OwedAddress {

@@ -40,6 +40,14 @@ A crawl that really should take everything says so with a large number. The one 
 
 The archive is created when the path holds no archive yet, since `capture` is the only verb that writes and a first collection has to start somewhere. It says so on the line above the report, because a path typed wrong is otherwise a new empty archive nobody was told about. The seed is screened before that happens: a run the engine will not dial leaves no directory behind on the path it was pointed at.
 
+### Capturing the same seed twice
+
+An item holds a history of captures, so running `capture` again with the same seed against the same archive is not a mistake the storage model needs protecting from: it appends a further capture to every item it reaches, exactly as the first run did. What is easy to miss is that this is what happened, since nothing about the invocation says a second run and a first look the same. Two things say so now, and appending itself is unchanged: nothing is refused, nothing is skipped, and no flag turns it off.
+
+Before anything is fetched, a run into an archive that already holds captures of this seed prints a line saying so on stderr. It is checked once, against the seed's own address, so it is there to catch a run started by accident before it spends a single request.
+
+The report then carries how many items gained a further capture in this run, printed as a row and carried under `--json` as `items_appended`. The row, and the field, are present whenever the run did not create the archive, at zero included, and absent when the run did create it: an archive this run just brought into existence cannot have held anything for the run to append to, so there is nothing for the field to say.
+
 The per-host extraction rules that sit in the archive are read at the start of the run. A rule file that cannot be used is a warning and not a refusal: it costs the extractions it would have improved, and the response is the part that cannot be fetched again. [`readability.md`](readability.md) has the file and its directives.
 
 ### Addresses inside a network
@@ -145,7 +153,7 @@ The distinction is the point. A URL nobody answered, a page whose address the ca
 
 `list` answers with one object per line rather than one array, so a collection of any size can be read without holding all of it and `grep` stays a legitimate way to ask a question of it.
 
-`capture` and `export` answer with one object each, because each reports on a run rather than listing a collection. The capture object carries the counts the human report shows, `responses_refused` among them, a count by status of the responses a host answered with an error, plus every URL the run did not archive, grouped by why: `failed_fetches`, `unaddressable_pages`, `pages_inside_a_network`, `unreadable_pages`, `unreadable_articles` and `links_never_followed`. The addresses `responses_refused` counts are not among these, since a refused response is not stored as a capture at all and its address is instead in `owed.json`, described above. With `--from-sitemap`, it also carries a `sitemap` object: the address read, how many URLs it listed, how many were taken and how many a bound refused, which is where a sitemap listing 247 posts against a run that archived 200 of them is made visible. The export object carries the number of notes written and the paths it could not read.
+`capture` and `export` answer with one object each, because each reports on a run rather than listing a collection. The capture object carries the counts the human report shows, `responses_refused` among them, a count by status of the responses a host answered with an error, plus every URL the run did not archive, grouped by why: `failed_fetches`, `unaddressable_pages`, `pages_inside_a_network`, `unreadable_pages`, `unreadable_articles` and `links_never_followed`. The addresses `responses_refused` counts are not among these, since a refused response is not stored as a capture at all and its address is instead in `owed.json`, described above. `items_appended` is `null` when the run created the archive and a number otherwise, how many items in this run's captures already held one from before it. With `--from-sitemap`, it also carries a `sitemap` object: the address read, how many URLs it listed, how many were taken and how many a bound refused, which is where a sitemap listing 247 posts against a run that archived 200 of them is made visible. The export object carries the number of notes written and the paths it could not read.
 
 Both objects are declared by the command line rather than serialized off the library's own report. A field added to a record inside the crate is then not accidentally a promise to everything already parsing this output.
 

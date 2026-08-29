@@ -72,6 +72,12 @@ pub struct RefusedResponse {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CaptureRun {
     pub captures_written: usize,
+    /// How many of the captures above landed on an item that already had one, which is what
+    /// separates a page a run is seeing for the first time from a page it is seeing again.
+    /// Appending is correct either way, so nothing here refuses or skips anything; this is
+    /// the count that lets a run into an archive it has already filled say so, since the
+    /// storage layer itself gives no other sign that it happened.
+    pub items_appended: usize,
     /// How many times this run charged a sitemap phase's own page ceiling: a capture written
     /// to disk, or a response the host refused. It exists because `captures_written` cannot
     /// be that count any more: a refusal stopped being a capture, and `docs/cli.md` still
@@ -173,6 +179,7 @@ impl CaptureRun {
     /// reason survives, since that is the one that actually decided when the run was done.
     pub fn merge(&mut self, other: CaptureRun) {
         self.captures_written += other.captures_written;
+        self.items_appended += other.items_appended;
         self.pages_spent += other.pages_spent;
         self.captures_with_a_session += other.captures_with_a_session;
         for (status, count) in other.responses_refused {
@@ -635,6 +642,9 @@ fn capture_page(
         }
     };
     let (stored, missed) = (captured.stored.len(), captured.missed.len());
+    // Read before the write below can create this item, since that is the only moment left
+    // to tell a further capture apart from the item's first.
+    let item_already_had_a_capture = archive.has_captures(&canonical);
     let capture = match archive.write_capture(new_capture(canonical.clone(), page, captured, seed))
     {
         Ok(capture) => capture,
@@ -644,6 +654,9 @@ fn capture_page(
         }
     };
     run.captures_written += 1;
+    if item_already_had_a_capture {
+        run.items_appended += 1;
+    }
     run.pages_spent += 1;
     // Counted off the record that landed rather than off the seed, so what the report says a
     // session reached is what the archive says too.
@@ -854,6 +867,7 @@ fn retry_after_of(headers: &[Header]) -> Option<String> {
 pub fn owed_addresses(run: &CaptureRun) -> Vec<OwedAddress> {
     let CaptureRun {
         captures_written: _,
+        items_appended: _,
         pages_spent: _,
         captures_with_a_session: _,
         responses_refused: _,
@@ -1524,6 +1538,59 @@ mod tests {
                 .expect("captures are listed")
                 .len(),
             2
+        );
+        // The first write created the item; the second landed on the one it just made, which
+        // is a further capture by the same definition as one landing on a run that ran
+        // yesterday.
+        assert_eq!(run.items_appended, 1);
+    }
+
+    /// Two different pages captured in the same run are two new items, neither of which is a
+    /// further capture of anything.
+    #[test]
+    fn distinct_items_captured_in_one_run_are_not_counted_as_appended() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![
+            page("https://example.com/a", 200, "<html>a</html>"),
+            page("https://example.com/b", 200, "<html>b</html>"),
+        ]);
+
+        let run = capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        assert_eq!(run.items_appended, 0);
+    }
+
+    /// The case the bead exists for: a run into an archive a previous run already filled.
+    /// Nothing here refuses or skips the second capture; the run just has to say it happened.
+    #[test]
+    fn a_run_into_an_archive_that_already_holds_the_item_counts_it_as_appended() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/");
+
+        let first_engine =
+            ScriptedCrawlEngine::new(vec![page("https://example.com/a", 200, "<html>a</html>")]);
+        let first =
+            capture_with_no_rules(&first_engine, &archive, &seed).expect("the first run completes");
+        assert_eq!(
+            first.items_appended, 0,
+            "a brand new item is not a further capture"
+        );
+
+        let second_engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/a",
+            200,
+            "<html>a, again</html>",
+        )]);
+        let second = capture_with_no_rules(&second_engine, &archive, &seed)
+            .expect("the second run completes");
+
+        assert_eq!(second.captures_written, 1);
+        assert_eq!(
+            second.items_appended, 1,
+            "the second run found the item the first one left behind"
         );
     }
 

@@ -205,6 +205,74 @@ fn a_seed_is_crawled_into_an_archive_that_the_run_creates() {
     assert!(article.markdown.contains("Bread is mostly patience"));
 }
 
+/// The behavior this bead exists for: a second run into an archive that already holds the
+/// seed says so before it fetches anything, and the report carries how many items gained a
+/// further capture. Nothing is refused or skipped: the second run appends exactly like the
+/// first one did, and the archive ends up holding two captures of each page.
+#[test]
+fn a_second_run_into_the_same_archive_reports_what_it_appended() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let site = Site::start();
+    let seed_url = site.url("/index.html");
+    let run = || {
+        archeion()
+            .arg("capture")
+            .arg(&archive_path)
+            .arg(&seed_url)
+            .args([
+                "--max-pages",
+                "4",
+                "--concurrency",
+                "1",
+                "--max-retries",
+                "0",
+            ])
+            .args(["--deadline", "30s", "--allow-private-addresses"])
+            .output()
+            .expect("the binary runs")
+    };
+
+    let first = run();
+    assert!(first.status.success(), "{}", stderr_of(&first));
+    assert_eq!(stderr_of(&first), "");
+    assert!(
+        !stdout_of(&first).contains("appended"),
+        "a fresh archive has nothing to append to: {}",
+        stdout_of(&first)
+    );
+
+    // A capture id is the fetch instant beside a fingerprint of the response, at a second's
+    // resolution: two fetches of identical content landing in the same second are one
+    // capture on purpose, so the wait is what lets this test tell "appended" apart from
+    // "overwrote the one that was already there".
+    thread::sleep(Duration::from_millis(1100));
+
+    let second = run();
+    assert!(second.status.success(), "{}", stderr_of(&second));
+    assert!(
+        stderr_of(&second).contains(&format!("{seed_url} already has captures")),
+        "{}",
+        stderr_of(&second)
+    );
+    assert!(
+        stdout_of(&second).contains("appended      2 item(s) gained a further capture"),
+        "{}",
+        stdout_of(&second)
+    );
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    let url = CanonicalUrl::parse(&site.url("/article.html")).expect("valid url");
+    assert_eq!(
+        archive
+            .list_captures(&url)
+            .expect("captures are listed")
+            .len(),
+        2,
+        "the second run appended a capture rather than replacing the first one"
+    );
+}
+
 /// A page the site published as Markdown, crawled the way one is really reached: through a
 /// link on an ordinary HTML index.
 ///

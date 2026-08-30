@@ -4,6 +4,7 @@ Four verbs, one rule about where the archive goes, and one rule about what an ex
 
 ```sh
 archeion capture <archive> <seed-url> [options]
+archeion capture <archive> --resume [options]
 archeion repass  <archive> [--allow-private-addresses]
 archeion list    <archive>
 archeion export  <archive> <destination> [--all-captures]
@@ -31,6 +32,7 @@ Every option is one field of the seed the library crawls with, spelled the same,
 | `--allow-private-addresses` | let the run reach addresses that exist only inside a network |
 | `--cookie-file <PATH>` | the `Cookie` header of an authenticated request, sent to the seed's own origin |
 | `--from-sitemap [<URL>]` | additionally archive what the site's sitemap lists |
+| `--resume` | ask only for the addresses `owed.json` names, instead of crawling a seed |
 
 A span carries its unit: `250ms`, `30s`, `5m`, `1h`. A bare number would have to mean seconds on the deadline and milliseconds on the delay, and a run whose budget was read in the wrong unit is either over before it starts or never over at all.
 
@@ -86,6 +88,16 @@ The flag wins over `SPIDER_MAX_SIZE_BYTES` already in the environment, which is 
 A page response whose status is 400 or above does not become an item, and its body is not stored: an item is a page that was served, and `list` over an archive a host answered 429 on every page prints zero rows. What the archive keeps instead is the address, the status and the `Retry-After` header when the host sent one, in `owed.json` at the archive's root, so a later run knows what it is still owed. [`storage-model.md`](storage-model.md) has the record's shape and the reasoning it follows. This is a rule about the page, not about every response a run stores: a subresource, an image or a stylesheet a page referenced, is stored under whatever status it answered with, since it is asked for on the page's behalf and not judged on its own.
 
 The run's report is unaffected by where the response ends up: `responses_refused`, the count by status printed as `host refused` and carried by `--json`, still counts every one of these, exactly as before.
+
+### Resuming a refused run
+
+`--resume` reads `owed.json` and asks only for the addresses it names, instead of crawling a seed: a publication that answered 429 on 160 of its 250 pages is finished by one command that makes 160 requests, not by capturing all 250 again. No seed url is given alongside it, and `--from-sitemap` and `--cookie-file` are refused the same way, since neither has an origin or a listing a resume adds to.
+
+Every other flag means what it means on an ordinary run: `--max-pages`, the deadline, the retry budget and the response byte ceiling all bound a resume exactly as they bound a seed, and it waits the longer of `--delay` and the host's own `Crawl-delay`, read off `robots.txt` for the addresses it is about to ask for again. An address is resumed as its own single page, exactly like a sitemap URL fetched with no `--max-depth`, and its own guards hold at this door too: the private address refusal, the response byte ceiling, the redirect screen and the `robots.txt` decision all apply before anything is stored, so a page `robots.txt` disallows is never asked for a second time either.
+
+An address already filed as an item under its own canonical spelling is left out of the request list before anything is asked for, in case an earlier run happened to archive it since the record was written. An address that answers successfully becomes an ordinary item and stops being owed; one refused again stays in `owed.json`, unchanged by this run beyond whatever the refusal itself updated. The report carries this as `resume`, printed as `N requested, M still owed`: a run that pays down only part of the debt still exits zero, on the same reasoning any other refusal does, but does not read as one that paid it in full.
+
+`--resume` against an archive owed nothing, or one with no `owed.json` at all because it predates this record, exits zero saying the archive owes nothing: the two are indistinguishable from what the file says, and both are answered the same way rather than one of them panicking or reading as a silent empty success. Capturing such an archive's seed again is what actually fills it.
 
 ### The sitemap
 

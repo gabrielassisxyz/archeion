@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
+use url::Url;
+
 use crate::assets::{AssetCapture, CapturedAssets};
 use crate::canonical_url::{CanonicalUrl, InvalidCanonicalUrl};
 use crate::crawl::{
@@ -474,6 +476,155 @@ pub fn capture_sitemap(
         });
     }
     Ok(run)
+}
+
+/// The addresses `owed` names that this archive does not already hold as an item under
+/// their own canonical spelling.
+///
+/// `capture_sitemap`'s own dedup, `already_filed` below, only ever compares against what
+/// the run in progress just learned: a resume has no earlier phase to have learned it from,
+/// so what it has to be checked against is the archive's whole history instead. An address
+/// whose canonical parse fails is kept rather than dropped, since asking for it is what
+/// reports why on its own account; dropping it here would make it disappear instead of
+/// being refused honestly.
+pub fn owed_but_not_yet_filed(archive: &Archive, owed: &[OwedAddress]) -> Vec<String> {
+    owed.iter()
+        .filter(|address| {
+            CanonicalUrl::parse(&address.url)
+                .map(|canonical| !archive.has_captures(&canonical))
+                .unwrap_or(true)
+        })
+        .map(|address| address.url.clone())
+        .collect()
+}
+
+/// Fetches every address `urls` names, each as its own single page and nothing past it.
+///
+/// Paying a debt is repeating exactly the request that was refused, not a licence to crawl
+/// on from wherever it happens to lead: depth is forced to zero regardless of what `seed`
+/// otherwise carries, which is what keeps a resumed page's own links from reopening the
+/// crawl `capture_seed` already finished.
+///
+/// Going through `capture_sitemap`'s `follow_links` branch rather than its plain fetch is
+/// what makes this door pass the same `robots.txt` decision a seed does: that branch drives
+/// `engine.crawl`, the same path a seed takes, while a plain fetch never reads the file at
+/// all. Every one of the four guards a seed passes, the private address refusal, the
+/// response byte ceiling, the redirect screen and the robots decision, has to hold at this
+/// door too, since an address arriving from the archive's own record is as untrusted as one
+/// arriving from a link.
+pub fn capture_owed(
+    engine: &dyn CrawlEngine,
+    archive: &Archive,
+    seed: &Seed,
+    rules: &SiteRules,
+    urls: &[String],
+) -> Result<CaptureRun, CaptureError> {
+    let started = Instant::now();
+    let mut run = CaptureRun::default();
+    let mut archived: HashSet<String> = HashSet::new();
+
+    for (origin, group) in grouped_by_origin(urls) {
+        let so_far = RunSoFar {
+            started,
+            pages_written: run.pages_spent,
+            archived: &archived,
+        };
+        // Checked before the request below, not only inside `capture_sitemap`'s own loop:
+        // a run out of budget has nothing to learn from a second host's `robots.txt` either,
+        // and asking for it anyway would be a request this run's own report cannot account
+        // for against any page it archived or was refused.
+        if so_far.nothing_left_to_spend(seed) {
+            break;
+        }
+        let mut resumed_seed = seed.clone();
+        resumed_seed.max_depth = 0;
+        resumed_seed.delay = seed.delay.max(crawl_delay_of(engine, seed, &origin));
+
+        match capture_sitemap(engine, archive, &resumed_seed, rules, &group, true, so_far) {
+            Ok(group_run) => {
+                archived.extend(group_run.archived_urls.iter().cloned());
+                archived.extend(group_run.refused_urls.iter().cloned());
+                run.merge(group_run);
+            }
+            Err(CaptureError::Storage {
+                source,
+                run: partial,
+            }) => {
+                run.merge(*partial);
+                return Err(CaptureError::Storage {
+                    source,
+                    run: Box::new(run),
+                });
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Ok(run)
+}
+
+/// `urls` split into runs that share one origin, in the order each origin was first seen.
+/// An owed record is not one seed's: `items/<host>/...` is sharded by host precisely
+/// because one archive holds however many hosts were ever pointed at it, so a resume that
+/// read one host's `Crawl-delay` and applied it to every address would under-pace every
+/// host but the first, which is the exact host a resume exists to ask more carefully of.
+///
+/// An address whose scheme and host cannot even be parsed keeps its own literal spelling
+/// as its key, which puts it in a group of one rather than folding it into whichever group
+/// happened to come first: it is refused for its own reason once it is asked for, and
+/// grouping it under a host it does not belong to would read as though that host answered
+/// for it.
+fn grouped_by_origin(urls: &[String]) -> Vec<(String, Vec<String>)> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for url in urls {
+        let key = Url::parse(url)
+            .map(|parsed| parsed.origin().ascii_serialization())
+            .unwrap_or_else(|_| url.clone());
+        match groups.iter_mut().find(|(origin, _)| *origin == key) {
+            Some((_, group)) => group.push(url.clone()),
+            None => groups.push((key, vec![url.clone()])),
+        }
+    }
+    groups
+}
+
+/// One origin's own pace for this resume, if it declared one: whichever of `--delay` and
+/// this host's `Crawl-delay` is longer is what `capture_sitemap`'s own pacing between this
+/// group's addresses then waits, on the same reasoning `docs/cli.md` already states for an
+/// ordinary crawl. The host a resume asks again is by definition one that refused this
+/// project once already, so reading past what the run was explicitly told to wait is worth
+/// the request, once per origin rather than once per address.
+///
+/// Read directly off `robots.txt` through `engine.fetch`, which has no entry point back into
+/// what the engine's own crawl reads internally: `discover_sitemap_url` in `src/sitemap.rs`
+/// reads the same file the same way, for the same reason, and this shares its simplification
+/// too, a directive read wherever it sits rather than scoped to the group this run's own
+/// identity matches, since a resume has no reason to parse the file more carefully than a
+/// sitemap lookup already does.
+fn crawl_delay_of(engine: &dyn CrawlEngine, seed: &Seed, origin: &str) -> Duration {
+    let robots_url = format!("{origin}/robots.txt");
+    match engine.fetch(&robots_url, seed) {
+        PageEvent::Response(response) => first_crawl_delay_directive(&response.body),
+        PageEvent::NoResponse(_) => Duration::ZERO,
+    }
+}
+
+/// The first `Crawl-delay` directive in a `robots.txt` body, read case insensitively because
+/// real files are inconsistent about how they spell it, mirroring `first_sitemap_directive`
+/// in `src/sitemap.rs` for the same directive-lookup reason. A value that does not parse as
+/// seconds, fractional or not, is read as no delay at all rather than refusing the whole run
+/// over one malformed line.
+fn first_crawl_delay_directive(body: &[u8]) -> Duration {
+    let text = String::from_utf8_lossy(body);
+    text.lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            if !key.trim().eq_ignore_ascii_case("crawl-delay") {
+                return None;
+            }
+            value.trim().parse::<f64>().ok()
+        })
+        .map(Duration::from_secs_f64)
+        .unwrap_or(Duration::ZERO)
 }
 
 /// Whether an address this run has already settled, filed or refused, is being asked for
@@ -1524,6 +1675,160 @@ mod tests {
                 },
             }],
             "the first entry for an address is the one kept"
+        );
+    }
+
+    /// The phase a resume turns the owed record into a request list with: an address
+    /// already filed as an item, under its own canonical spelling, is left out, and one
+    /// this archive has never held anything for is kept. A `--resume` that skipped this
+    /// would spend a second request on a page some other run already archived, which is
+    /// exactly the request the owed record's own merge-not-overwrite rule was written to
+    /// avoid on the write side.
+    #[test]
+    fn an_address_already_filed_as_an_item_is_left_out_of_the_request_list() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/already-here",
+            200,
+            "<html><head><title>Already here</title></head><body>already here</body></html>",
+        )]);
+        capture_with_no_rules(&engine, &archive, &Seed::new("https://example.com/"))
+            .expect("the run completes");
+
+        let owed = vec![
+            OwedAddress {
+                url: "https://example.com/already-here".to_owned(),
+                reason: OwedReason::Refused {
+                    status: 429,
+                    retry_after: None,
+                },
+            },
+            OwedAddress {
+                url: "https://example.com/still-owed".to_owned(),
+                reason: OwedReason::Refused {
+                    status: 429,
+                    retry_after: None,
+                },
+            },
+        ];
+
+        assert_eq!(
+            owed_but_not_yet_filed(&archive, &owed),
+            vec!["https://example.com/still-owed".to_owned()]
+        );
+    }
+
+    /// An owed address the canonical rules refuse cannot be checked against the archive's
+    /// items at all, so it is kept rather than silently dropped: asking for it again is
+    /// what reports why on its own account, and dropping it here would make it disappear
+    /// instead of being refused honestly a second time.
+    #[test]
+    fn an_owed_address_that_cannot_be_canonicalized_is_kept_rather_than_dropped() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let owed = vec![OwedAddress {
+            url: "javascript:void(0)".to_owned(),
+            reason: OwedReason::Unaddressable {
+                detail: "javascript is not a scheme this archive fetches".to_owned(),
+            },
+        }];
+
+        assert_eq!(
+            owed_but_not_yet_filed(&archive, &owed),
+            vec!["javascript:void(0)".to_owned()]
+        );
+    }
+
+    /// A resumed address is never a licence to crawl on from wherever it leads: whatever
+    /// depth the seed otherwise carries, the sub-seed `capture_owed` hands the engine for
+    /// each address is forced to zero. `ScriptedCrawlEngine::crawl` records the seed it was
+    /// given without dialling anything, so this is a property of the sub-seed itself and
+    /// not of what a real crawl happened to find.
+    #[test]
+    fn capture_owed_forces_a_resumed_address_to_depth_zero() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/paid-down",
+            200,
+            "<html><head><title>Paid down</title></head><body>paid down</body></html>",
+        )]);
+        let mut seed = Seed::new(String::new());
+        seed.max_depth = 5;
+
+        capture_owed(
+            &engine,
+            &archive,
+            &seed,
+            &SiteRules::default(),
+            &["https://example.com/paid-down".to_owned()],
+        )
+        .expect("the run completes");
+
+        let seeds = engine.seeds_crawled();
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(
+            seeds[0].max_depth, 0,
+            "a resumed address must not reopen the crawl a seed already finished"
+        );
+    }
+
+    /// Addresses on the same origin land in one group, in the order that origin was first
+    /// seen, and an address whose own origin cannot be read at all gets a group of its own
+    /// rather than joining whatever group happened to come first.
+    #[test]
+    fn urls_are_grouped_by_origin_in_first_seen_order() {
+        let groups = grouped_by_origin(&[
+            "https://a.example/one".to_owned(),
+            "https://b.example/one".to_owned(),
+            "https://a.example/two".to_owned(),
+            "not a url at all".to_owned(),
+        ]);
+
+        assert_eq!(
+            groups,
+            vec![
+                (
+                    "https://a.example".to_owned(),
+                    vec![
+                        "https://a.example/one".to_owned(),
+                        "https://a.example/two".to_owned(),
+                    ],
+                ),
+                (
+                    "https://b.example".to_owned(),
+                    vec!["https://b.example/one".to_owned()],
+                ),
+                (
+                    "not a url at all".to_owned(),
+                    vec!["not a url at all".to_owned()],
+                ),
+            ]
+        );
+    }
+
+    /// The directive a resume's own pace is read from, in the same shape
+    /// `first_sitemap_directive` reads `Sitemap:` in: case insensitively, wherever it sits
+    /// in the file, and a value that will not parse costs the run nothing rather than
+    /// refusing the whole request over one malformed line.
+    #[test]
+    fn the_first_crawl_delay_directive_is_read_case_insensitively_and_a_bad_one_is_ignored() {
+        for spelling in ["Crawl-delay:", "CRAWL-DELAY:", "crawl-delay:"] {
+            assert_eq!(
+                first_crawl_delay_directive(format!("User-agent: *\n{spelling} 2\n").as_bytes()),
+                Duration::from_secs(2)
+            );
+        }
+        assert_eq!(
+            first_crawl_delay_directive(b"User-agent: *\nCrawl-delay: soon\n"),
+            Duration::ZERO,
+            "a value that does not parse as seconds is read as no delay at all"
+        );
+        assert_eq!(
+            first_crawl_delay_directive(b"User-agent: *\nAllow: /\n"),
+            Duration::ZERO,
+            "a file naming no directive at all is read as no delay"
         );
     }
 

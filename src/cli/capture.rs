@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use archeion::CanonicalUrl;
 use archeion::capture::{
-    CaptureError, CaptureRun, RunSoFar, capture_seed, capture_sitemap, owed_addresses,
+    CaptureError, CaptureRun, RunSoFar, capture_owed, capture_seed, capture_sitemap,
+    owed_addresses, owed_but_not_yet_filed,
 };
 use archeion::crawl::{
     CrawlEngine, CrawlStop, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_USER_AGENT,
@@ -34,7 +35,10 @@ pub struct CaptureArgs {
     archive: PathBuf,
     /// Where the crawl starts. A seed is one host: subdomains and other TLDs of the same
     /// name are separate seeds, and a crawl never leaves the host it was pointed at.
-    seed_url: String,
+    /// Required unless `--resume` is given, which reads its addresses from the archive
+    /// instead of from a seed.
+    #[arg(required_unless_present = "resume")]
+    seed_url: Option<String>,
     /// How many pages this run may archive.
     #[arg(long, value_name = "N", default_value_t = defaults().max_pages,
           value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
@@ -92,6 +96,11 @@ pub struct CaptureArgs {
     /// listed URL unless `--max-depth` is also given explicitly.
     #[arg(long, value_name = "URL", num_args = 0..=1)]
     from_sitemap: Option<Option<String>>,
+    /// Ask only for the addresses the archive's own record says it is still owed, instead
+    /// of crawling a seed. No seed url is given alongside it, and it obeys every other flag
+    /// here exactly as an ordinary run does.
+    #[arg(long, conflicts_with_all = ["from_sitemap", "seed_url", "cookie_file"])]
+    resume: bool,
 }
 
 impl CaptureArgs {
@@ -260,6 +269,16 @@ impl Display for Deadline {
 }
 
 pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
+    // `--resume` reads its addresses from the archive rather than crawling a seed, and the
+    // parser already refuses it alongside a seed url or a cookie file, so the only thing left
+    // to decide here is which of the two very different runs this invocation is.
+    if args.resume {
+        return capture_resume(&args, json);
+    }
+    let seed_url = args
+        .seed_url
+        .as_deref()
+        .expect("clap requires a seed url when --resume is absent");
     // Read before anything else and refused rather than worked around: a run that silently went
     // out anonymous would archive a publication's paid half as teasers, which is the state this
     // flag exists to leave behind and looks like nothing in the report.
@@ -285,7 +304,7 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
     // is correct, but it is easy to start this by accident, and the run has to say so while
     // there is still time to stop it rather than after the fact.
     if !created {
-        warn_if_seed_already_captured(&archive, &args.seed_url);
+        warn_if_seed_already_captured(&archive, seed_url);
     }
     // A rule file that cannot be used costs the extractions it would have improved and not
     // the capture, so it is a warning here rather than a reason to refuse the run: the
@@ -357,22 +376,96 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
         failure = failure.or(Some(error));
     }
 
-    let report = report_of(&args, &seed, &run, created, sitemap.report);
+    let report = report_of(&args, &seed, &run, created, sitemap.report, None);
+    finish(
+        json,
+        &report,
+        &run,
+        failure,
+        sitemap.warning.into_iter().chain(losses(&run)),
+    )
+}
+
+/// Runs `--resume`: pays down what the archive's own record says it is owed, rather than
+/// crawling a seed.
+///
+/// It opens an existing archive rather than creating one, since resuming a collection that
+/// was never captured is not a first capture wearing a different flag: there is nothing an
+/// archive that does not exist could be owed. `--from-sitemap` and a seed url are refused
+/// by the parser before this is ever reached, and a cookie file along with them, since none
+/// of the three has an origin here to be bound to or a listing here to add to.
+fn capture_resume(args: &CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
+    if let Some(agent) = args.user_agent.as_deref() {
+        usable_user_agent(agent)?;
+    }
+    let seed = seed_of(args, None);
+    let engine = SpiderEngine::default();
+    let archive = Archive::open_existing(&args.archive)?;
+    let (rules, unused_rules) = SiteRules::read(&archive.extraction_rules_path());
+    warn(unused_rules.iter().map(ToString::to_string));
+
+    let owed = archive.read_owed()?;
+    let urls = owed_but_not_yet_filed(&archive, &owed);
+    let requested = urls.len();
+
+    let (run, mut failure) = match capture_owed(&engine, &archive, &seed, &rules, &urls) {
+        Ok(run) => (run, None),
+        Err(CaptureError::Storage { source, run }) => (*run, Some(source)),
+        Err(other) => return Err(other.into()),
+    };
+
+    if let Err(error) = archive.write_owed(&run.archived_urls, &owed_addresses(&run)) {
+        failure = failure.or(Some(error));
+    }
+    // Read again rather than derived from what this run just learned: an address landing
+    // in more than one of `run`'s own fields, or one this run never touched at all because
+    // it was left out above as already filed, both make an arithmetic answer wrong in a
+    // way a fresh read of the file this run just wrote cannot be.
+    let still_owed = archive
+        .read_owed()
+        .map(|owed| owed.len())
+        .unwrap_or(requested);
+
+    let report = report_of(
+        args,
+        &seed,
+        &run,
+        false,
+        None,
+        Some(ResumeReport {
+            requested,
+            still_owed,
+        }),
+    );
+    finish(json, &report, &run, failure, losses(&run).into_iter())
+}
+
+/// Prints the report, then turns what the run left behind into the command's own exit.
+///
+/// Shared between an ordinary run and `--resume`, because both make the same promise once
+/// fetching stops: a storage failure is the one thing here the caller acts on rather than
+/// only reads, a page the crawl paid for and never got is bytes spent for a record that
+/// does not exist, and a link the crawl found and never followed is the frontier losing it
+/// before a request was ever made. None of the three is the web misbehaving, which is why
+/// each still ends the run even though the report above already printed successfully.
+fn finish(
+    json: bool,
+    report: &CaptureReport,
+    run: &CaptureRun,
+    failure: Option<StorageError>,
+    warnings: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
     let output = if json {
-        format!("{}\n", serde_json::to_string(&report)?)
+        format!("{}\n", serde_json::to_string(report)?)
     } else {
-        human_report(&report, run.stopped)
+        human_report(report, run.stopped)
     };
     write_stdout(&output)?;
-    warn(sitemap.warning.into_iter().chain(losses(&run)));
+    warn(warnings);
 
     if let Some(source) = failure {
         return Err(source.into());
     }
-    // Pages the engine fetched and the archive never got. Every other shortfall above is the
-    // web being the web; this one is bytes that were spent on somebody else's host for a
-    // record that does not exist, which is the loss this archive can least afford to report
-    // as a success.
     if run.pages_dropped > 0 {
         return Err(format!(
             "{} page(s) the crawl fetched never reached the archive",
@@ -380,9 +473,6 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    // A link the crawl found and never fetched is the same failure from the other side:
-    // the frontier lost it before a request was ever made, and a run that says it
-    // exhausted the seed while one of these is sitting in the report would be lying.
     if !run.links_never_followed.is_empty() {
         return Err(format!(
             "{} link(s) the crawl discovered were never fetched",
@@ -420,8 +510,14 @@ fn usable_user_agent(value: &str) -> Result<(), UnusableUserAgent> {
 /// The seed this run crawls with. The credential arrives separately because reading it can fail
 /// and because it is bound here rather than where it was read: the origin it may be sent to is
 /// the seed's own, which is what keeps this flag ignorant of any particular publisher.
+///
+/// `seed_url` is absent exactly for `--resume`, which asks for addresses from the archive's
+/// own record rather than from a seed and is refused alongside a cookie file by the parser
+/// itself; what is built here for that case carries the run's execution policy, delay,
+/// deadline, retries, byte ceiling, private-address allowance, and is never dialled by its
+/// own `url` field.
 fn seed_of(args: &CaptureArgs, credential: Option<String>) -> Seed {
-    let mut seed = Seed::new(args.seed_url.clone());
+    let mut seed = Seed::new(args.seed_url.clone().unwrap_or_default());
     seed.max_pages = args.max_pages;
     seed.max_depth = args.max_depth.unwrap_or_else(|| defaults().max_depth);
     seed.concurrency = args.concurrency;
@@ -431,7 +527,8 @@ fn seed_of(args: &CaptureArgs, credential: Option<String>) -> Seed {
     seed.max_retries = args.max_retries;
     seed.user_agent = args.user_agent.clone();
     seed.allow_private_addresses = args.allow_private_addresses;
-    seed.session_cookie = credential.map(|value| SessionCookie::bound_to(&args.seed_url, value));
+    seed.session_cookie = credential
+        .map(|value| SessionCookie::bound_to(args.seed_url.as_deref().unwrap_or_default(), value));
     seed
 }
 
@@ -614,6 +711,16 @@ struct SessionReport {
     captures_used: usize,
 }
 
+/// What `--resume` asked for and what is left. A run that could not pay the whole debt
+/// still exits zero, on the same reasoning every other refusal in this report does, so
+/// `still_owed` is what keeps that run from reading as one that paid it in full: `stopped`
+/// says the whole list was gone through, and this says how much of it is still missing.
+#[derive(Debug, Serialize)]
+struct ResumeReport {
+    requested: usize,
+    still_owed: usize,
+}
+
 /// The run as this command line publishes it.
 ///
 /// It is declared here rather than serialized off `CaptureRun` so that the library's report
@@ -621,7 +728,9 @@ struct SessionReport {
 /// this output.
 #[derive(Debug, Serialize)]
 struct CaptureReport {
-    seed_url: String,
+    /// Absent for `--resume`, which has no one seed: its addresses come from the archive's
+    /// own record and can name any number of hosts.
+    seed_url: Option<String>,
     archive: String,
     archive_created: bool,
     captures_written: usize,
@@ -645,6 +754,7 @@ struct CaptureReport {
     stopped: &'static str,
     session: Option<SessionReport>,
     sitemap: Option<SitemapReport>,
+    resume: Option<ResumeReport>,
     failed_fetches: Vec<Loss>,
     unaddressable_pages: Vec<Loss>,
     pages_inside_a_network: Vec<String>,
@@ -658,6 +768,7 @@ fn report_of(
     run: &CaptureRun,
     created: bool,
     sitemap: Option<SitemapReport>,
+    resume: Option<ResumeReport>,
 ) -> CaptureReport {
     CaptureReport {
         seed_url: args.seed_url.clone(),
@@ -684,6 +795,7 @@ fn report_of(
             captures_used: run.captures_with_a_session,
         }),
         sitemap,
+        resume,
         failed_fetches: run
             .failed_fetches
             .iter()
@@ -764,11 +876,18 @@ fn human_report(report: &CaptureReport, stopped: CrawlStop) -> String {
         writeln!(output, "created an archive at {}", report.archive)
             .expect("writing to a string cannot fail");
     }
-    writeln!(
-        output,
-        "archived {} capture(s) from {} into {}",
-        report.captures_written, report.seed_url, report.archive
-    )
+    match &report.seed_url {
+        Some(seed_url) => writeln!(
+            output,
+            "archived {} capture(s) from {} into {}",
+            report.captures_written, seed_url, report.archive
+        ),
+        None => writeln!(
+            output,
+            "archived {} capture(s) of what {} was owed",
+            report.captures_written, report.archive
+        ),
+    }
     .expect("writing to a string cannot fail");
 
     let rows = [
@@ -817,6 +936,21 @@ fn human_report(report: &CaptureReport, stopped: CrawlStop) -> String {
             "sitemap", sitemap.urls_taken, sitemap.urls_refused, sitemap.urls_listed
         )
         .expect("writing to a string cannot fail");
+    }
+    // A resume that asked for nothing is not a resume that failed, and it is worth saying
+    // so in the same words either way an archive's own record produces that answer: an
+    // archive with nothing owed and one with no owed record at all read alike from here,
+    // on the same terms `arch-9j5` already settled for the archive itself.
+    if let Some(resume) = &report.resume {
+        let value = if resume.requested == 0 {
+            "archive owed nothing".to_owned()
+        } else {
+            format!(
+                "{} requested, {} still owed",
+                resume.requested, resume.still_owed
+            )
+        };
+        writeln!(output, "  {:<14}{value}", "resume").expect("writing to a string cannot fail");
     }
     // Present whenever the run did not create the archive, at zero included: a zero here says
     // this run touched nothing it had already captured, which is only worth knowing about an
@@ -905,6 +1039,35 @@ mod tests {
             .to_string()
     }
 
+    /// Every argument named exactly, since the two tests that use this are about which
+    /// combination of them the parser accepts rather than about one flag reaching one field.
+    fn try_parse_argv(argv: &[&str]) -> Result<CaptureArgs, String> {
+        OnlyCapture::try_parse_from(std::iter::once("archeion").chain(argv.iter().copied()))
+            .map(|only| only.args)
+            .map_err(|error| error.to_string())
+    }
+
+    /// `--resume` is the one invocation this command line accepts with no seed url at all;
+    /// every other combination still needs one, and the parser is what enforces both halves
+    /// rather than a check written by hand after the parse.
+    #[test]
+    fn a_seed_url_is_required_unless_resuming() {
+        assert!(try_parse_argv(&["/tmp/archive"]).is_err());
+        assert!(try_parse_argv(&["/tmp/archive", "--resume"]).is_ok());
+    }
+
+    /// `--resume` reads its addresses from the archive, so a seed url beside it says two
+    /// different things about where this run starts; `--from-sitemap` and `--cookie-file`
+    /// each need an origin resume has none of, and are refused the same way.
+    #[test]
+    fn resume_refuses_a_seed_url_a_sitemap_and_a_cookie_file() {
+        assert!(try_parse_argv(&["/tmp/archive", "https://example.com/", "--resume"]).is_err());
+        assert!(try_parse_argv(&["/tmp/archive", "--resume", "--from-sitemap"]).is_err());
+        assert!(
+            try_parse_argv(&["/tmp/archive", "--resume", "--cookie-file", "/tmp/cookie"]).is_err()
+        );
+    }
+
     #[test]
     fn a_seed_with_no_flags_is_the_seed_the_library_would_have_built() {
         let seed = seed_of(&parse(&[]), None);
@@ -991,7 +1154,7 @@ mod tests {
         *run.responses_refused.entry(429).or_default() += 2;
         *run.responses_refused.entry(503).or_default() += 1;
 
-        let report = report_of(&args, &seed, &run, false, None);
+        let report = report_of(&args, &seed, &run, false, None, None);
         let json = serde_json::to_value(&report).expect("the report serializes");
 
         assert_eq!(
@@ -1127,7 +1290,7 @@ mod tests {
             ..CaptureRun::default()
         };
 
-        let report = report_of(&args, &seed, &run, false, None);
+        let report = report_of(&args, &seed, &run, false, None, None);
         let printed = human_report(&report, run.stopped);
 
         assert!(
@@ -1147,6 +1310,7 @@ mod tests {
             &seed_of(&args, None),
             &CaptureRun::default(),
             false,
+            None,
             None,
         );
 
@@ -1172,6 +1336,7 @@ mod tests {
             },
             false,
             None,
+            None,
         );
         assert_eq!(untouched.items_appended, Some(0));
         assert!(
@@ -1189,6 +1354,7 @@ mod tests {
             },
             false,
             None,
+            None,
         );
         assert_eq!(appended.items_appended, Some(3));
         assert!(
@@ -1205,6 +1371,7 @@ mod tests {
                 ..CaptureRun::default()
             },
             true,
+            None,
             None,
         );
         assert_eq!(fresh_archive.items_appended, None);
@@ -1225,7 +1392,7 @@ mod tests {
             ..CaptureRun::default()
         };
 
-        let report = report_of(&args, &seed, &run, false, None);
+        let report = report_of(&args, &seed, &run, false, None, None);
         let printed = human_report(&report, run.stopped);
 
         assert_eq!(report.stopped, "page-ceiling-reached");

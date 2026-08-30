@@ -888,7 +888,24 @@ fn a_write_failure_in_the_sitemap_phase_does_not_drop_the_crawl_phases_own_owed_
     ];
     site.serve(listener, routes);
 
-    let output = capture_command(&archive_path, &site.url("/index.html"))
+    // Built directly rather than through `capture_command`, whose own baked-in `--deadline
+    // 30s` cannot be overridden by a second occurrence of the same flag: the seed page always
+    // answers 429, so at that deadline the crawl phase would now wait out the refusal for
+    // most of it before giving up, which this test has no need to sit through to prove what
+    // it is actually about.
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(site.url("/index.html"))
+        .args([
+            "--max-pages",
+            "10",
+            "--concurrency",
+            "4",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "5s", "--allow-private-addresses"])
         .args(["--from-sitemap", &site.url("/sitemap.xml")])
         .output()
         .expect("the binary runs");

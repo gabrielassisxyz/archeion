@@ -985,6 +985,105 @@ mod tests {
         assert_eq!(recovered, 0);
     }
 
+    /// A server this run has already given up on is not waited out again for the next
+    /// address on it. The second call here is given a budget with room for several waits,
+    /// and the only reason it takes none is the first call's own answer: without that
+    /// memory, the address after a refusal that could not be waited out pays another share
+    /// of the budget to reach the same conclusion, and a hundred owed addresses pay it a
+    /// hundred times.
+    #[test]
+    fn wait_out_rate_limit_asks_nothing_of_a_server_it_has_already_given_up_on() {
+        let mut state = RateLimitMemory::default();
+        let mut recovered = 0;
+        let mut calls = 0;
+        let event = refused(429, Vec::new());
+
+        // A budget no wait fits inside, which is what makes this first call give up.
+        let _ = wait_out_rate_limit(
+            event.clone(),
+            Some(Duration::from_millis(10)),
+            Instant::now(),
+            Duration::ZERO,
+            &mut state,
+            &mut recovered,
+            |_url| {
+                calls += 1;
+                ok()
+            },
+        );
+        assert_eq!(calls, 0, "the first call waited when nothing fitted");
+
+        let second = refused_at("https://example.com/another", 429, Vec::new());
+        let started = Instant::now();
+        let result = wait_out_rate_limit(
+            second.clone(),
+            Some(Duration::from_secs(60)),
+            started,
+            Duration::ZERO,
+            &mut state,
+            &mut recovered,
+            |_url| {
+                calls += 1;
+                ok()
+            },
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            result, second,
+            "the refusal was not handed back for the caller to record as owed"
+        );
+        assert_eq!(
+            calls, 0,
+            "a server already given up on was asked again for the next address on it"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a server already given up on was waited out again, took {elapsed:?}"
+        );
+        assert_eq!(recovered, 0);
+    }
+
+    /// A different server is not given up on by another one's answer: the memory is keyed by
+    /// origin, so a run that stopped waiting for one host still waits the smallest wait out
+    /// for the next host that refuses it.
+    #[test]
+    fn giving_up_on_one_server_leaves_another_s_first_refusal_alone() {
+        let mut state = RateLimitMemory::default();
+        let mut recovered = 0;
+        let mut calls = 0;
+
+        let _ = wait_out_rate_limit(
+            refused(429, Vec::new()),
+            Some(Duration::from_millis(10)),
+            Instant::now(),
+            Duration::ZERO,
+            &mut state,
+            &mut recovered,
+            |_url| ok(),
+        );
+
+        let result = wait_out_rate_limit(
+            refused_at("https://other.example/page", 429, Vec::new()),
+            Some(Duration::from_secs(60)),
+            Instant::now(),
+            Duration::ZERO,
+            &mut state,
+            &mut recovered,
+            |_url| {
+                calls += 1;
+                refused_at("https://other.example/page", 200, Vec::new())
+            },
+        );
+
+        assert!(
+            matches!(&result, PageEvent::Response(page) if page.status == 200),
+            "{result:?}"
+        );
+        assert_eq!(calls, 1, "the second server was never asked again");
+        assert_eq!(recovered, 1);
+    }
+
     /// A run with no deadline has nothing for a bound to be measured against, so it does not
     /// grow one of its own: the address is handed back exactly as refused as it arrived, and
     /// the fetch this was given is never called. A host that refuses forever in this run costs

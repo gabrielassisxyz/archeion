@@ -190,6 +190,7 @@ fn a_seed_is_crawled_into_an_archive_that_the_run_creates() {
              pages dropped 0\n  \
              links lost    0\n  \
              recovered     0\n  \
+             waited out    0\n  \
              stopped       nothing was left to fetch\n",
             archive = archive_path.display(),
             seed = site.url("/index.html"),
@@ -3857,6 +3858,7 @@ fn no_progress_level_changes_a_single_byte_of_stdout() {
              pages dropped 0\n  \
              links lost    0\n  \
              recovered     0\n  \
+             waited out    0\n  \
              stopped       nothing was left to fetch\n"
         )
     );
@@ -3871,7 +3873,8 @@ fn no_progress_level_changes_a_single_byte_of_stdout() {
              \"captures_written\":2,\"items_appended\":null,\"responses_refused\":{{}},\
              \"articles_extracted\":1,\"extractions_refused\":0,\"assets_stored\":1,\
              \"assets_missed\":0,\"asset_fetches\":1,\"pages_dropped\":0,\
-             \"links_never_followed\":[],\"links_recovered\":0,\"stopped\":\"exhausted\",\
+             \"links_never_followed\":[],\"links_recovered\":0,\
+             \"pages_recovered_from_rate_limit\":0,\"stopped\":\"exhausted\",\
              \"session\":null,\"sitemap\":null,\"resume\":null,\"failed_fetches\":[],\
              \"unaddressable_pages\":[],\"pages_inside_a_network\":[],\"unreadable_pages\":[],\
              \"unreadable_articles\":[]}}\n"

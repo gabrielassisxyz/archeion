@@ -959,6 +959,11 @@ struct CaptureReport {
     pages_dropped: usize,
     links_never_followed: Vec<String>,
     links_recovered: usize,
+    /// Pages a host answered 429 that were archived anyway, once waiting for it stopped
+    /// being refused. Published beside `links_recovered` because it answers the same
+    /// question about a different door: what the run got back that an earlier one would
+    /// have left owed.
+    pages_recovered_from_rate_limit: usize,
     stopped: &'static str,
     session: Option<SessionReport>,
     sitemap: Option<SitemapReport>,
@@ -997,6 +1002,7 @@ fn report_of(
         pages_dropped: run.pages_dropped,
         links_never_followed: run.links_never_followed.clone(),
         links_recovered: run.links_recovered,
+        pages_recovered_from_rate_limit: run.pages_recovered_from_rate_limit,
         stopped: stop_name(run.stopped),
         session: seed.session_cookie.as_ref().map(|cookie| SessionReport {
             origin: cookie.origin(),
@@ -1126,6 +1132,10 @@ fn human_report(report: &CaptureReport, stopped: CrawlStop) -> String {
         ("pages dropped", report.pages_dropped.to_string()),
         ("links lost", report.links_never_followed.len().to_string()),
         ("recovered", report.links_recovered.to_string()),
+        (
+            "waited out",
+            report.pages_recovered_from_rate_limit.to_string(),
+        ),
         ("stopped", stop_sentence(stopped).to_owned()),
     ];
     for (label, value) in rows {

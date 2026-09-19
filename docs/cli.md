@@ -112,6 +112,8 @@ A page response whose status is 400 or above does not become an item, and its bo
 
 The run's report is unaffected by where the response ends up: `responses_refused`, the count by status printed as `host refused` and carried by `--json`, still counts every one of these, exactly as before.
 
+A 429 is the exception to moving straight on, because it says the address exists and only the pace is wrong: the run waits and asks again, growing the wait across a server's successive refusals, honouring a `Retry-After` the server sent, and giving up on the address once a further wait would cost more than a quarter of the run's whole deadline. A page recovered that way is an ordinary capture and owes nothing, and the report says how many there were: the `waited out` row, carried by `--json` as `pages_recovered_from_rate_limit`. At zero it says the run met no rate limit it had to wait out, which is worth reading beside a run that took twenty minutes. [`crawl-boundary.md`](crawl-boundary.md) has the policy and its bounds.
+
 ### Resuming a refused run
 
 `--resume` reads `owed.json` and asks only for the addresses it names, instead of crawling a seed: a publication that answered 429 on 160 of its 250 pages is finished by one command that makes 160 requests, not by capturing all 250 again. No seed url is given alongside it, and `--from-sitemap` and `--cookie-file` are refused the same way, since neither has an origin or a listing a resume adds to.

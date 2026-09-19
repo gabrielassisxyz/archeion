@@ -1518,8 +1518,9 @@ enum LinkBase {
     /// A base that exists and must not be used. Either the frontier has already resolved
     /// the page's links its own way, so a second answer here could only disagree with the
     /// request that actually went out, or the declaration points at another origin, whose
-    /// `robots.txt` this run never read and whose addresses are outside the crawl. Nothing
-    /// about such a page's links is recorded.
+    /// `robots.txt` this run never read and whose addresses are outside the crawl. Only the
+    /// links that spell out their own absolute address are recorded, since those do not
+    /// depend on any base.
     Unusable,
 }
 
@@ -1556,11 +1557,14 @@ fn record_discovered_links(
     // `<base href>` and the caller is one that read it: a page's own declaration is what
     // every link on it resolves against, and a caller that hands it over here is one whose
     // page nothing else resolved links for.
-    let base = match link_base {
-        LinkBase::Unusable => return discovered,
-        LinkBase::Declared(declared) => declared.clone(),
-        LinkBase::PageUrl => match Url::parse(page_url) {
-            Ok(parsed) => parsed,
+    //
+    // An unusable base still leaves the links that name their own absolute address: those
+    // resolve the same against any base, so the page's own URL stands in for it and only
+    // the hrefs that would have needed the base are skipped.
+    let (base, absolute_hrefs_only) = match link_base {
+        LinkBase::Declared(declared) => (declared.clone(), false),
+        LinkBase::PageUrl | LinkBase::Unusable => match Url::parse(page_url) {
+            Ok(parsed) => (parsed, *link_base == LinkBase::Unusable),
             Err(_) => return discovered,
         },
     };
@@ -1568,6 +1572,9 @@ fn record_discovered_links(
         return discovered;
     };
     for link in links.iter() {
+        if absolute_hrefs_only && Url::parse(link.as_ref()).is_err() {
+            continue;
+        }
         let Some(resolved) = base.join(link.as_ref()).ok() else {
             continue;
         };
@@ -2811,6 +2818,36 @@ mod tests {
             ),
             LinkBase::Unusable
         );
+    }
+
+    /// A base this crawl may not use says nothing about a link that names its own absolute
+    /// address: that link resolves the same against any base, so it is recorded like any
+    /// other, and only the links that would have needed the base are left out. Dropping
+    /// them all is how a page declaring a base on a content network lost every same-origin
+    /// article it linked to, with nothing recorded as owed or unfollowed.
+    #[test]
+    fn an_unusable_base_still_records_the_links_that_name_their_own_address() {
+        let mut links = PageLinkSet::new();
+        links.insert(CaseInsensitiveString::from("https://example.com/article"));
+        links.insert(CaseInsensitiveString::from("relative-needs-the-base"));
+        links.insert(CaseInsensitiveString::from(
+            "https://elsewhere.example/off-host",
+        ));
+        let mut depths = HashMap::new();
+
+        let discovered = record_discovered_links(
+            "https://example.com/index.html",
+            &LinkBase::Unusable,
+            Some(&links),
+            Some("example.com"),
+            "https",
+            0,
+            &mut depths,
+            None,
+        );
+
+        assert_eq!(discovered, vec!["https://example.com/article".to_owned()]);
+        assert_eq!(depths.len(), 1, "{depths:?}");
     }
 
     #[test]

@@ -577,7 +577,21 @@ pub(crate) fn wait_out_rate_limit(
             // ends this address alone. A run with no deadline gave up on nothing either:
             // `fits` is false there because nothing bounds a wait, not because a wait was
             // refused.
-            if deadline.is_some() && !fits(rate_limit_backoff(consecutive, floor, None)) {
+            //
+            // The same goes for what this address has already spent: a fresh address starts
+            // its share from nothing, so the question is whether it could take this wait,
+            // not whether this one still can. Asking the latter gave up on a whole server
+            // because one earlier `Retry-After` had used up this address's share.
+            let a_fresh_address_could_wait = |wait: Duration| match deadline {
+                Some(budget) => {
+                    started.elapsed().saturating_add(wait) < budget
+                        && wait <= budget / RATE_LIMIT_SHARE_OF_THE_BUDGET
+                }
+                None => false,
+            };
+            if deadline.is_some()
+                && !a_fresh_address_could_wait(rate_limit_backoff(consecutive, floor, None))
+            {
                 state.give_up_on(&host);
             }
             break;
@@ -993,6 +1007,42 @@ mod tests {
         );
         assert_eq!(calls, 0, "a wait was taken past the run's own deadline");
         assert_eq!(recovered, 0);
+    }
+
+    /// What one address has already spent is that address's own cost, not the server's
+    /// verdict. Here a `Retry-After` of two seconds spends most of this address's three
+    /// second share, so the next refusal's two second wait no longer fits it; a fresh
+    /// address, starting from none of that spent, would still take that same wait, so the
+    /// server is not given up on.
+    #[test]
+    fn a_share_spent_on_one_address_does_not_give_up_on_the_server() {
+        let mut state = RateLimitMemory::default();
+        let mut recovered = 0;
+        let mut calls = 0;
+
+        // A twelve second budget gives one address a three second share.
+        let result = wait_out_rate_limit(
+            refused(429, vec![retry_after("2")]),
+            Some(Duration::from_secs(12)),
+            Instant::now(),
+            Duration::ZERO,
+            &mut state,
+            &mut recovered,
+            |_url| {
+                calls += 1;
+                refused(429, Vec::new())
+            },
+        );
+
+        assert!(
+            matches!(&result, PageEvent::Response(page) if page.status == 429),
+            "{result:?}"
+        );
+        assert_eq!(calls, 1, "the header's own wait was not taken");
+        assert!(
+            !state.given_up_on(&rate_limit_key("https://example.com/rate-limited")),
+            "the server was given up on for what one address had already spent"
+        );
     }
 
     /// A server this run has already given up on is not waited out again for the next

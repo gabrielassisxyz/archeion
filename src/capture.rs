@@ -292,6 +292,7 @@ impl CaptureRun {
         self.extractions_refused += other.extractions_refused;
         self.unreadable_articles.extend(other.unreadable_articles);
         self.pages_dropped += other.pages_dropped;
+        self.links_never_followed.extend(other.links_never_followed);
         self.links_recovered += other.links_recovered;
         self.pages_recovered_from_rate_limit += other.pages_recovered_from_rate_limit;
         self.assets_stored += other.assets_stored;
@@ -610,6 +611,16 @@ pub fn capture_sitemap_reporting(
             // out exactly as a crawl does, and a page it recovered that way is an archived
             // page this phase would otherwise report nothing about.
             run.pages_recovered_from_rate_limit += outcome.pages_recovered_from_rate_limit;
+            // A sub-crawl discovers links and can lose them exactly as the seed's own crawl
+            // does, and what it reports about them is this run's to report. Dropped here,
+            // the phase printed `links lost 0` over a link it had been told about, which is
+            // a run exiting zero while a link it discovered went unfetched. A page the crawl
+            // waited out of a 429 makes that reachable rather than theoretical: its links are
+            // written into the crawl's own bookkeeping by this project rather than by the
+            // frontier, so a sub-crawl that never had a link to lose before can have one now.
+            run.links_never_followed
+                .extend(outcome.links_never_followed);
+            run.links_recovered += outcome.links_recovered;
             if write_failure.is_some() {
                 break;
             }
@@ -3358,6 +3369,44 @@ mod tests {
             "three pages at a 60ms delay wait twice, took {:?}",
             started.elapsed()
         );
+    }
+
+    /// A link a sitemap sub-crawl discovered and never fetched is the run's to report. The
+    /// phase used to read the sub-crawl's `pages_dropped` and throw away everything it said
+    /// about links, so a run whose sub-crawl lost one printed `links lost 0` and left with a
+    /// success: the first sentence of `Report honesty` in `AGENTS.md` says a run never exits
+    /// zero while a link it discovered went unfetched.
+    #[test]
+    fn a_link_a_sitemap_sub_crawl_never_followed_is_reported_by_the_run() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/");
+        let url = "https://example.com/listed".to_owned();
+        let mut engine = ScriptedCrawlEngine::new(vec![page(
+            &url,
+            200,
+            "<html><head><title>Listed</title></head><body>listed</body></html>",
+        )]);
+        engine.outcome.links_never_followed = vec!["https://example.com/lost".to_owned()];
+        engine.outcome.links_recovered = 2;
+
+        let run = capture_sitemap(
+            &engine,
+            &archive,
+            &seed,
+            &SiteRules::default(),
+            &[url],
+            true,
+            RunSoFar::nothing_yet(&HashSet::new()),
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(
+            run.links_never_followed,
+            vec!["https://example.com/lost".to_owned()],
+            "the phase kept a link the sub-crawl told it about to itself"
+        );
+        assert_eq!(run.links_recovered, 2);
     }
 
     /// The wait is paid for a request and not for a loop iteration. A URL the run already

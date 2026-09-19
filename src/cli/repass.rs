@@ -2,15 +2,61 @@
 
 use std::error::Error;
 use std::fmt::Write as _;
+use std::io::{self, IsTerminal, Write as _};
 use std::path::PathBuf;
 
 use archeion::crawl::SpiderEngine;
 use archeion::readability::SiteRules;
-use archeion::repass::{RepassError, RepassOptions, RepassRun, repass_archive};
+use archeion::repass::{RepassError, RepassOptions, RepassOutcome, RepassRun, repass_archive_reporting};
 use archeion::storage::Archive;
 use serde::Serialize;
 
+use super::progress::{ProgressLevel, ProgressLine};
 use super::{warn, write_stdout};
+
+/// The live progress a repass prints while it runs. There is no page limit and no deadline to
+/// weigh it against, the way `capture`'s bar does: a repass walks an archive it already has, so
+/// the one denominator it can know before the walk starts is how many items the walk found,
+/// `archeion::repass::repass_archive_reporting`'s own `total` argument.
+struct RepassProgress {
+    level: ProgressLevel,
+    line: ProgressLine,
+}
+
+impl RepassProgress {
+    fn new(level: ProgressLevel) -> Self {
+        Self {
+            level,
+            line: ProgressLine::new(io::stderr().is_terminal()),
+        }
+    }
+
+    /// What one capture produced, named the word the end-of-run report already uses for it:
+    /// see `RepassOutcome`. `items_done` counts items, not captures, the same denominator
+    /// `total_items` is; an item with several captures reports each capture's own outcome
+    /// on `Lines` while the bar keeps counting the item they share only once each.
+    fn capture(&mut self, url: &str, outcome: RepassOutcome, items_done: usize, total_items: usize) {
+        let mut stderr = io::stderr();
+        match self.level {
+            ProgressLevel::Lines => {
+                let _ = writeln!(stderr, "{url}: {}", outcome.as_word());
+            }
+            ProgressLevel::Bar => {
+                self.line
+                    .update(&mut stderr, &format!("{items_done}/{total_items} items"));
+            }
+        }
+    }
+
+    /// See `CaptureProgress::warn` in `cli::capture`: the same reasoning, over the same risk.
+    fn warn(&mut self, lines: impl IntoIterator<Item = String>) {
+        let mut stderr = io::stderr();
+        self.line.clear_for_interruption(&mut stderr);
+        for line in lines {
+            let _ = writeln!(stderr, "warning: {line}");
+        }
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct Loss {
@@ -42,6 +88,7 @@ struct RepassReport {
 pub fn repass(
     archive_path: PathBuf,
     allow_private_addresses: bool,
+    progress: Option<ProgressLevel>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let archive = Archive::open_existing(&archive_path)?;
@@ -51,7 +98,19 @@ pub fn repass(
     let options = RepassOptions {
         allow_private_addresses,
     };
-    let (run, failure) = match repass_archive(&SpiderEngine::default(), &archive, &rules, options) {
+    let mut progress = progress.map(RepassProgress::new);
+    let mut on_capture = |url: &str, outcome: RepassOutcome, done: usize, total: usize| {
+        if let Some(progress) = progress.as_mut() {
+            progress.capture(url, outcome, done, total);
+        }
+    };
+    let (run, failure) = match repass_archive_reporting(
+        &SpiderEngine::default(),
+        &archive,
+        &rules,
+        options,
+        &mut on_capture,
+    ) {
         Ok(run) => (run, None),
         Err(RepassError::Storage { source, run }) => (*run, Some(source)),
     };
@@ -62,7 +121,12 @@ pub fn repass(
         human_report(&report)
     };
     write_stdout(&output)?;
-    warn(losses(&report));
+    // See `finish` in `cli::capture`: this can be the first thing printed since the bar last
+    // redrew, so it goes through the bar's own line rather than straight to `warn`.
+    match progress.as_mut() {
+        Some(progress) => progress.warn(losses(&report)),
+        None => warn(losses(&report)),
+    }
 
     if let Some(source) = failure {
         return Err(source.into());

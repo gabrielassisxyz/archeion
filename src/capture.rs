@@ -69,6 +69,45 @@ pub struct RefusedResponse {
     pub retry_after: Option<String>,
 }
 
+/// What one page produced, for a caller that wants to say so while the run is still going
+/// rather than only in the report at the end.
+///
+/// Each word is the one the end-of-run report already uses for the same fate, so a live line
+/// and the summary printed after it never disagree about what to call the same thing:
+/// `Refused` is `responses_refused`'s own word, reused again for `extractions_refused` since
+/// the report already spends "refused" on both a host's answer and a reading of it; `Extracted`
+/// matches `articles_extracted`; `NoResponse` and `InsideANetwork` quote `losses` below
+/// verbatim, `Unaddressable` shortens its "has no address" to match. `NotArticle` is the one
+/// exception: the report never counts it at all, so there is no existing word to reuse and this
+/// one is new.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageOutcome {
+    /// A capture was written and its prose extraction said nothing distinguishing: no
+    /// article, no refusal, no explicit non-article marker. `docs/cli.md` already calls a
+    /// captured page's body "stored" when describing what a refused response is not.
+    Stored,
+    Extracted,
+    NotArticle,
+    Refused,
+    NoResponse,
+    InsideANetwork,
+    Unaddressable,
+}
+
+impl PageOutcome {
+    pub fn as_word(self) -> &'static str {
+        match self {
+            Self::Stored => "stored",
+            Self::Extracted => "extracted",
+            Self::NotArticle => "not an article",
+            Self::Refused => "refused",
+            Self::NoResponse => "no response",
+            Self::InsideANetwork => "inside a network",
+            Self::Unaddressable => "no address",
+        }
+    }
+}
+
 /// What one seed left behind. Every URL the engine reported is in exactly one of these,
 /// so a run that archived less than expected says where the rest went.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -224,6 +263,22 @@ pub fn capture_seed(
     seed: &Seed,
     rules: &SiteRules,
 ) -> Result<CaptureRun, CaptureError> {
+    capture_seed_reporting(engine, archive, seed, rules, &mut |_, _, _| {})
+}
+
+/// `capture_seed`, with a caller told what each page produced as the crawl goes rather than
+/// only once it ends. Split out rather than folded into an optional parameter on the function
+/// above so that every existing caller, in this file's own tests and in the two other test
+/// files that drive `capture_seed` directly, keeps compiling unchanged: the CLI is the one
+/// caller that has anything to say while a page arrives, and it is the one caller that reaches
+/// this name instead.
+pub fn capture_seed_reporting(
+    engine: &dyn CrawlEngine,
+    archive: &Archive,
+    seed: &Seed,
+    rules: &SiteRules,
+    progress: &mut dyn FnMut(&str, PageOutcome, usize),
+) -> Result<CaptureRun, CaptureError> {
     let mut run = CaptureRun::default();
     let mut write_failure: Option<StorageError> = None;
     let started = Instant::now();
@@ -242,6 +297,7 @@ pub fn capture_seed(
             &mut assets,
             &mut run,
             &mut write_failure,
+            &mut *progress,
         );
         if answer.is_break() {
             return ControlFlow::Break(());
@@ -356,6 +412,32 @@ pub fn capture_sitemap(
     follow_links: bool,
     so_far: RunSoFar<'_>,
 ) -> Result<CaptureRun, CaptureError> {
+    capture_sitemap_reporting(
+        engine,
+        archive,
+        seed,
+        rules,
+        urls,
+        follow_links,
+        so_far,
+        &mut |_, _, _| {},
+    )
+}
+
+/// `capture_sitemap`, with the same per-page progress `capture_seed_reporting` carries. See
+/// that function for why this is a second name rather than a parameter every existing caller
+/// of `capture_sitemap` would have had to grow.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_sitemap_reporting(
+    engine: &dyn CrawlEngine,
+    archive: &Archive,
+    seed: &Seed,
+    rules: &SiteRules,
+    urls: &[String],
+    follow_links: bool,
+    so_far: RunSoFar<'_>,
+    progress: &mut dyn FnMut(&str, PageOutcome, usize),
+) -> Result<CaptureRun, CaptureError> {
     let mut run = CaptureRun::default();
     let mut write_failure: Option<StorageError> = None;
     // The run's own instant rather than this phase's, because a deadline bounds the run. Taken
@@ -432,6 +514,7 @@ pub fn capture_sitemap(
                     &mut assets,
                     &mut run,
                     &mut write_failure,
+                    &mut *progress,
                 )
             }) {
                 Ok(outcome) => outcome,
@@ -461,6 +544,7 @@ pub fn capture_sitemap(
                 &mut assets,
                 &mut run,
                 &mut write_failure,
+                &mut *progress,
             );
             if answer.is_break() {
                 break;
@@ -519,6 +603,20 @@ pub fn capture_owed(
     rules: &SiteRules,
     urls: &[String],
 ) -> Result<CaptureRun, CaptureError> {
+    capture_owed_reporting(engine, archive, seed, rules, urls, &mut |_, _, _| {})
+}
+
+/// `capture_owed`, with the same per-page progress `capture_seed_reporting` carries. See
+/// that function for why this is a second name rather than a parameter every existing caller
+/// of `capture_owed` would have had to grow.
+pub fn capture_owed_reporting(
+    engine: &dyn CrawlEngine,
+    archive: &Archive,
+    seed: &Seed,
+    rules: &SiteRules,
+    urls: &[String],
+    progress: &mut dyn FnMut(&str, PageOutcome, usize),
+) -> Result<CaptureRun, CaptureError> {
     let started = Instant::now();
     let mut run = CaptureRun::default();
     let mut archived: HashSet<String> = HashSet::new();
@@ -540,7 +638,16 @@ pub fn capture_owed(
         resumed_seed.max_depth = 0;
         resumed_seed.delay = seed.delay.max(crawl_delay_of(engine, seed, &origin));
 
-        match capture_sitemap(engine, archive, &resumed_seed, rules, &group, true, so_far) {
+        match capture_sitemap_reporting(
+            engine,
+            archive,
+            &resumed_seed,
+            rules,
+            &group,
+            true,
+            so_far,
+            &mut *progress,
+        ) {
             Ok(group_run) => {
                 archived.extend(group_run.archived_urls.iter().cloned());
                 archived.extend(group_run.refused_urls.iter().cloned());
@@ -726,10 +833,12 @@ fn capture_page(
     assets: &mut AssetCapture<'_>,
     run: &mut CaptureRun,
     write_failure: &mut Option<StorageError>,
+    progress: &mut dyn FnMut(&str, PageOutcome, usize),
 ) -> ControlFlow<()> {
     let page = match event {
         PageEvent::Response(page) => page,
         PageEvent::NoResponse(failure) => {
+            progress(&failure.url, PageOutcome::NoResponse, run.pages_spent);
             run.failed_fetches.push(failure);
             return ControlFlow::Continue(());
         }
@@ -742,6 +851,7 @@ fn capture_page(
     // the archive runs on. The run that asked for local addresses gets them, which is the
     // only way a locally served site is archived at all.
     if !seed.allow_private_addresses && points_inside_a_network(&page.final_url) {
+        progress(&page.final_url, PageOutcome::InsideANetwork, run.pages_spent);
         run.pages_inside_a_network.push(page.final_url);
         return ControlFlow::Continue(());
     }
@@ -752,6 +862,7 @@ fn capture_page(
     let canonical = match CanonicalUrl::parse(&page.final_url) {
         Ok(canonical) => canonical,
         Err(reason) => {
+            progress(&page.final_url, PageOutcome::Unaddressable, run.pages_spent);
             run.unaddressable_pages.push(UnaddressablePage {
                 url: page.final_url,
                 reason,
@@ -773,6 +884,7 @@ fn capture_page(
         let canonical_url = canonical.to_string();
         run.refused_urls.insert(canonical_url.clone());
         *run.responses_refused.entry(page.status).or_default() += 1;
+        progress(&canonical_url, PageOutcome::Refused, run.pages_spent);
         run.refused_responses.push(RefusedResponse {
             retry_after: retry_after_of(&page.headers),
             url: canonical_url,
@@ -840,6 +952,12 @@ fn capture_page(
         return ControlFlow::Break(());
     }
 
+    let outcome = match &prose {
+        Extraction::Article(_) => PageOutcome::Extracted,
+        Extraction::Refused(_) => PageOutcome::Refused,
+        Extraction::NotArticle(_) => PageOutcome::NotArticle,
+        Extraction::Nothing => PageOutcome::Stored,
+    };
     let stored_prose = match &prose {
         Extraction::Article(article) => archive.write_article(&canonical, &capture.id, article),
         Extraction::Refused(refused) => {
@@ -854,6 +972,7 @@ fn capture_page(
         *write_failure = Some(error);
         return ControlFlow::Break(());
     }
+    progress(&canonical.to_string(), outcome, run.pages_spent);
     ControlFlow::Continue(())
 }
 
@@ -1298,6 +1417,182 @@ mod tests {
         assert!(article.markdown.contains("Bread is mostly patience"));
         assert!(!article.markdown.contains("Subscribe to our newsletter"));
         assert!(article.record.word_count > 0);
+    }
+
+    /// A page whose content type is neither HTML nor Markdown never reaches the extractor at
+    /// all, `read_prose` answers `Extraction::Nothing`, and that is the one case `PageOutcome`
+    /// has no more specific word for: the capture is on disk and nothing about its prose was
+    /// decided, which is `docs/cli.md`'s own "stored" for a page whose body is on disk.
+    fn plain_text_page(url: &str, body: &str) -> PageEvent {
+        let mut event = page(url, 200, body);
+        response_of(&mut event).headers = vec![Header {
+            name: "content-type".to_owned(),
+            value: "text/plain".to_owned(),
+        }];
+        event
+    }
+
+    /// A closure that records every `(url, outcome, pages_spent)` this run reports as it goes,
+    /// so a test can assert on the live sequence rather than only on the counts left behind
+    /// once the run is over.
+    fn recording_progress() -> (
+        std::rc::Rc<RefCell<Vec<(String, PageOutcome, usize)>>>,
+        impl FnMut(&str, PageOutcome, usize),
+    ) {
+        let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let recorder = std::rc::Rc::clone(&seen);
+        let on_page = move |url: &str, outcome: PageOutcome, pages_spent: usize| {
+            recorder
+                .borrow_mut()
+                .push((url.to_owned(), outcome, pages_spent));
+        };
+        (seen, on_page)
+    }
+
+    #[test]
+    fn a_page_with_no_prose_verdict_is_reported_stored() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![plain_text_page(
+            "https://example.com/a",
+            "just words, no markup",
+        )]);
+        let (seen, mut on_page) = recording_progress();
+
+        capture_seed_reporting(
+            &engine,
+            &archive,
+            &Seed::new("https://example.com/"),
+            &SiteRules::default(),
+            &mut on_page,
+        )
+        .expect("the run completes");
+
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [("https://example.com/a".to_owned(), PageOutcome::Stored, 1)]
+        );
+    }
+
+    #[test]
+    fn an_article_page_is_reported_extracted() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/a",
+            200,
+            &format!(
+                r#"<html><head><title>How to bake bread</title></head>
+                   <body><article>{}</article></body></html>"#,
+                "<p>Bread is mostly patience, and the dough will tell you when it is ready.</p>"
+                    .repeat(8)
+            ),
+        )]);
+        let (seen, mut on_page) = recording_progress();
+
+        capture_seed_reporting(
+            &engine,
+            &archive,
+            &Seed::new("https://example.com/"),
+            &SiteRules::default(),
+            &mut on_page,
+        )
+        .expect("the run completes");
+
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [(
+                "https://example.com/a".to_owned(),
+                PageOutcome::Extracted,
+                1
+            )]
+        );
+    }
+
+    #[test]
+    fn a_page_of_only_navigation_is_reported_not_an_article() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/a",
+            200,
+            r#"<html><head><title>A page</title></head>
+               <body><a href="/b">b</a></body></html>"#,
+        )]);
+        let (seen, mut on_page) = recording_progress();
+
+        capture_seed_reporting(
+            &engine,
+            &archive,
+            &Seed::new("https://example.com/"),
+            &SiteRules::default(),
+            &mut on_page,
+        )
+        .expect("the run completes");
+
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [(
+                "https://example.com/a".to_owned(),
+                PageOutcome::NotArticle,
+                1
+            )]
+        );
+    }
+
+    #[test]
+    fn a_response_the_host_refused_is_reported_refused() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/a",
+            429,
+            "Too Many Requests",
+        )]);
+        let (seen, mut on_page) = recording_progress();
+
+        capture_seed_reporting(
+            &engine,
+            &archive,
+            &Seed::new("https://example.com/"),
+            &SiteRules::default(),
+            &mut on_page,
+        )
+        .expect("the run completes");
+
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [("https://example.com/a".to_owned(), PageOutcome::Refused, 1)]
+        );
+    }
+
+    #[test]
+    fn a_url_nobody_answered_is_reported_no_response() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![PageEvent::NoResponse(FetchFailure {
+            url: "https://example.com/a".to_owned(),
+            reason: "connection reset".to_owned(),
+        })]);
+        let (seen, mut on_page) = recording_progress();
+
+        capture_seed_reporting(
+            &engine,
+            &archive,
+            &Seed::new("https://example.com/"),
+            &SiteRules::default(),
+            &mut on_page,
+        )
+        .expect("the run completes");
+
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [(
+                "https://example.com/a".to_owned(),
+                PageOutcome::NoResponse,
+                0
+            )]
+        );
     }
 
     /// The rules reach the stored article, which is the only part of them this module owns. A

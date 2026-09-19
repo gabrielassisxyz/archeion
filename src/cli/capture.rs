@@ -8,14 +8,15 @@
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Write as _};
+use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use archeion::CanonicalUrl;
 use archeion::capture::{
-    CaptureError, CaptureRun, RunSoFar, capture_owed, capture_seed, capture_sitemap,
-    owed_addresses, owed_but_not_yet_filed,
+    CaptureError, CaptureRun, PageOutcome, RunSoFar, capture_owed_reporting,
+    capture_seed_reporting, capture_sitemap_reporting, owed_addresses, owed_but_not_yet_filed,
 };
 use archeion::crawl::{
     CrawlEngine, CrawlStop, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_USER_AGENT,
@@ -26,6 +27,7 @@ use archeion::sitemap::{SitemapListing, read_sitemap};
 use archeion::storage::{Archive, StorageError};
 use serde::Serialize;
 
+use super::progress::{ProgressLevel, ProgressLine};
 use super::session_cookie::{COOKIE_HEADER_VARIABLE, cookie_header_value};
 use super::{warn, write_stdout};
 
@@ -101,6 +103,12 @@ pub struct CaptureArgs {
     /// here exactly as an ordinary run does.
     #[arg(long, conflicts_with_all = ["from_sitemap", "seed_url", "cookie_file"])]
     resume: bool,
+    /// Says something on stderr while the run goes, instead of only once at the end. Stdout
+    /// never carries any of it, at any level: see docs/cli.md. The bare flag is `lines`, one
+    /// line per page naming what it produced; `bar` is a single line, redrawn in place on a
+    /// terminal, naming how far along the run is against its page limit and its deadline.
+    #[arg(long, value_name = "LEVEL", num_args = 0..=1, default_missing_value = "lines")]
+    progress: Option<ProgressLevel>,
 }
 
 impl CaptureArgs {
@@ -117,6 +125,71 @@ impl CaptureArgs {
 /// library is a number changed here rather than a second opinion about it.
 fn defaults() -> Seed {
     Seed::new(String::new())
+}
+
+/// The live progress a capture prints while it runs. Built once, after the run's own clock
+/// starts, and threaded as a callback into every phase that can fetch a page: the ordinary
+/// crawl, a sitemap phase, and a resume, since all three call into the same `capture_page`
+/// underneath and a page arriving from any of them is a page this is told about.
+struct CaptureProgress {
+    level: ProgressLevel,
+    line: ProgressLine,
+    max_pages: u32,
+    deadline: Option<Duration>,
+    started: Instant,
+}
+
+impl CaptureProgress {
+    fn new(level: ProgressLevel, seed: &Seed, started: Instant) -> Self {
+        Self {
+            level,
+            line: ProgressLine::new(io::stderr().is_terminal()),
+            max_pages: seed.max_pages,
+            deadline: seed.deadline,
+            started,
+        }
+    }
+
+    /// What one page produced, named the word the end-of-run report already uses for it: see
+    /// `PageOutcome`. `Lines` prints one line per call; `Bar` folds the count into the one
+    /// line it keeps redrawing and never mentions the URL, since "what happened to each URL"
+    /// is the other level's question.
+    fn page(&mut self, url: &str, outcome: PageOutcome, pages_spent: usize) {
+        let mut stderr = io::stderr();
+        match self.level {
+            ProgressLevel::Lines => {
+                let _ = writeln!(stderr, "{url}: {}", outcome.as_word());
+            }
+            ProgressLevel::Bar => self.line.update(&mut stderr, &self.bar_text(pages_spent)),
+        }
+    }
+
+    fn bar_text(&self, pages_spent: usize) -> String {
+        match self.deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_sub(self.started.elapsed());
+                format!(
+                    "{pages_spent}/{} pages, {}s left",
+                    self.max_pages,
+                    remaining.as_secs()
+                )
+            }
+            None => format!("{pages_spent}/{} pages", self.max_pages),
+        }
+    }
+
+    /// What a warning becomes once there is a line on stderr it might land on top of. Off the
+    /// bar level this is `warn` with nothing else to do, since a `Lines` line always ends in
+    /// its own newline and a warning beside it is only ever another complete line. At the bar
+    /// level, whatever this last drew is cleared first: a warning sharing a line with a redraw
+    /// is exactly the corruption this exists to rule out, not merely reduce.
+    fn warn(&mut self, lines: impl IntoIterator<Item = String>) {
+        let mut stderr = io::stderr();
+        self.line.clear_for_interruption(&mut stderr);
+        for line in lines {
+            let _ = writeln!(stderr, "warning: {line}");
+        }
+    }
 }
 
 fn response_ceiling_help() -> String {
@@ -317,13 +390,25 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
     // the run and the run is what starts here. A phase reading its own clock measures how long
     // that phase took, which is the same number only when there is one phase.
     let run_started = Instant::now();
+    let mut progress = args
+        .progress
+        .map(|level| CaptureProgress::new(level, &seed, run_started));
+    // Threaded into every phase below rather than built fresh in each: `progress` cannot be
+    // captured by more than one closure at a time, and this is the one closure every phase
+    // borrows in turn. Absent, it does nothing, which is how a run with no `--progress` costs
+    // this feature exactly the one branch it takes to learn that.
+    let mut on_page = |url: &str, outcome: PageOutcome, pages_spent: usize| {
+        if let Some(progress) = progress.as_mut() {
+            progress.page(url, outcome, pages_spent);
+        }
+    };
 
     // A sitemap exists for a site whose pages do not link one another, so crawling such a site
     // anyway spends the run's budget on the listing, navigation and comment pages the sitemap
     // was reached for in order to skip, and files the pages both phases find twice. Asking for
     // a depth explicitly is asking for both, and then both run.
     let (mut run, mut failure) = if traverses_from_the_seed(&args) {
-        match capture_seed(&engine, &archive, &seed, &rules) {
+        match capture_seed_reporting(&engine, &archive, &seed, &rules, &mut on_page) {
             Ok(run) => (run, None),
             // The report is the point of carrying the run inside the error: the archive holds
             // whatever was written before the disk refused, and a caller told only that a write
@@ -359,7 +444,16 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
             pages_written: run.pages_spent,
             archived: &archived,
         };
-        sitemap_phase(&args, &engine, &archive, &seed, &rules, &mut run, so_far)
+        sitemap_phase(
+            &args,
+            &engine,
+            &archive,
+            &seed,
+            &rules,
+            &mut run,
+            so_far,
+            &mut on_page,
+        )
     } else {
         SitemapOutcome::default()
     };
@@ -383,6 +477,7 @@ pub fn capture(args: CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> {
         &run,
         failure,
         sitemap.warning.into_iter().chain(losses(&run)),
+        progress.as_mut(),
     )
 }
 
@@ -408,7 +503,22 @@ fn capture_resume(args: &CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> 
     let urls = owed_but_not_yet_filed(&archive, &owed);
     let requested = urls.len();
 
-    let (run, mut failure) = match capture_owed(&engine, &archive, &seed, &rules, &urls) {
+    let mut progress = args
+        .progress
+        .map(|level| CaptureProgress::new(level, &seed, Instant::now()));
+    let mut on_page = |url: &str, outcome: PageOutcome, pages_spent: usize| {
+        if let Some(progress) = progress.as_mut() {
+            progress.page(url, outcome, pages_spent);
+        }
+    };
+    let (run, mut failure) = match capture_owed_reporting(
+        &engine,
+        &archive,
+        &seed,
+        &rules,
+        &urls,
+        &mut on_page,
+    ) {
         Ok(run) => (run, None),
         Err(CaptureError::Storage { source, run }) => (*run, Some(source)),
         Err(other) => return Err(other.into()),
@@ -437,7 +547,14 @@ fn capture_resume(args: &CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> 
             still_owed,
         }),
     );
-    finish(json, &report, &run, failure, losses(&run).into_iter())
+    finish(
+        json,
+        &report,
+        &run,
+        failure,
+        losses(&run).into_iter(),
+        progress.as_mut(),
+    )
 }
 
 /// Prints the report, then turns what the run left behind into the command's own exit.
@@ -454,6 +571,7 @@ fn finish(
     run: &CaptureRun,
     failure: Option<StorageError>,
     warnings: impl Iterator<Item = String>,
+    progress: Option<&mut CaptureProgress>,
 ) -> Result<(), Box<dyn Error>> {
     let output = if json {
         format!("{}\n", serde_json::to_string(report)?)
@@ -461,7 +579,14 @@ fn finish(
         human_report(report, run.stopped)
     };
     write_stdout(&output)?;
-    warn(warnings);
+    // Routed through the bar's own line when one is active, since this can be the first
+    // warning printed since the bar last redrew: `warn` on its own would leave that redraw
+    // sharing a line with whatever this prints, which is the corruption the bar level's own
+    // acceptance criterion rules out.
+    match progress {
+        Some(progress) => progress.warn(warnings),
+        None => warn(warnings),
+    }
 
     if let Some(source) = failure {
         return Err(source.into());
@@ -597,6 +722,7 @@ fn traverses_from_the_seed(args: &CaptureArgs) -> bool {
 /// The captures land in `run`, which is the run both phases share. Everything else the phase
 /// produced comes back in `SitemapOutcome`, the write failure included: a phase that took the
 /// failure as an out parameter needed an eighth argument to also be told when the run began.
+#[allow(clippy::too_many_arguments)]
 fn sitemap_phase(
     args: &CaptureArgs,
     engine: &dyn CrawlEngine,
@@ -605,6 +731,7 @@ fn sitemap_phase(
     rules: &SiteRules,
     run: &mut CaptureRun,
     so_far: RunSoFar<'_>,
+    on_page: &mut dyn FnMut(&str, PageOutcome, usize),
 ) -> SitemapOutcome {
     let Some(requested) = &args.from_sitemap else {
         return SitemapOutcome::default();
@@ -640,7 +767,7 @@ fn sitemap_phase(
     // on its own, since a depth bound has no meaning for a page nobody linked to.
     let follow_links = args.max_depth.is_some();
     let report = listing.as_ref().map(SitemapReport::from);
-    match capture_sitemap(engine, archive, seed, rules, &urls, follow_links, so_far) {
+    match capture_sitemap_reporting(engine, archive, seed, rules, &urls, follow_links, so_far, on_page) {
         Ok(sitemap_run) => {
             run.merge(sitemap_run);
             SitemapOutcome {

@@ -55,11 +55,61 @@ pub enum RepassError {
     },
 }
 
+/// What one capture's derived records became, named the way the end-of-run report already
+/// names the same fate: `Written`, `Refused` and `NotArticle` are `articles_written`,
+/// `extractions_refused` and the report's own "not article", `Unchanged` is
+/// `derived_unchanged`, and `Unreadable` is the word the report's own warnings already use for
+/// a body, a page or a prose reading that could not be refreshed: "unreadable item", "body for
+/// ... could not be refreshed". Every branch a repass can take already has a row or a warning
+/// to borrow a word from; nothing here is new the way `PageOutcome::NotArticle` had to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepassOutcome {
+    Written,
+    Refused,
+    NotArticle,
+    Unchanged,
+    Unreadable,
+}
+
+impl RepassOutcome {
+    pub fn as_word(self) -> &'static str {
+        match self {
+            Self::Written => "written",
+            Self::Refused => "refused",
+            Self::NotArticle => "not article",
+            Self::Unchanged => "unchanged",
+            Self::Unreadable => "unreadable",
+        }
+    }
+}
+
 pub fn repass_archive(
     engine: &dyn CrawlEngine,
     archive: &Archive,
     rules: &SiteRules,
     options: RepassOptions,
+) -> Result<RepassRun, RepassError> {
+    repass_archive_reporting(engine, archive, rules, options, &mut |_, _, _, _| {})
+}
+
+/// `repass_archive`, with a caller told what each capture produced as the walk goes rather
+/// than only once it ends. Split out for the same reason `capture_seed_reporting` is: every
+/// existing caller of `repass_archive`, here and in `tests/repass.rs`, keeps compiling
+/// unchanged, and the CLI is the one caller that reaches this name instead.
+///
+/// The progress closure is handed the item's own URL, what this capture produced, which item
+/// this is (one-based) and how many the walk found in total. It fires once per capture rather
+/// than once per item, since an item can hold several and each can land on a different
+/// outcome, while the item count is what a caller can know before the walk starts and is
+/// what the counted-against total means: `walk.items.len()`, not a count of every capture,
+/// which is only known by asking the same directory listing this loop already asks once and
+/// would otherwise ask twice for no reason a large archive should pay for.
+pub fn repass_archive_reporting(
+    engine: &dyn CrawlEngine,
+    archive: &Archive,
+    rules: &SiteRules,
+    options: RepassOptions,
+    progress: &mut dyn FnMut(&str, RepassOutcome, usize, usize),
 ) -> Result<RepassRun, RepassError> {
     let mut run = RepassRun::default();
     let walk = archive.walk().map_err(|source| RepassError::Storage {
@@ -67,6 +117,7 @@ pub fn repass_archive(
         run: Box::new(RepassRun::default()),
     })?;
     run.unreadable_items = walk.unreadable.iter().map(ToString::to_string).collect();
+    let total_items = walk.items.len();
 
     // A seed with no URL and no session. A credential binds to the origin of the address that was
     // typed, and there is none here: this walks an archive that may hold captures of any number of
@@ -75,7 +126,8 @@ pub fn repass_archive(
     seed.allow_private_addresses = options.allow_private_addresses;
     let mut assets = AssetCapture::new(engine, archive, &seed, Instant::now());
 
-    for item in walk.items {
+    for (item_index, item) in walk.items.into_iter().enumerate() {
+        let items_done = item_index + 1;
         let captures = match archive.list_captures(&item.canonical_url) {
             Ok(captures) => captures,
             Err(source) => {
@@ -108,7 +160,7 @@ pub fn repass_archive(
                 continue;
             }
             run.captures_seen += 1;
-            if let Err(source) = repass_one(
+            match repass_one(
                 archive,
                 rules,
                 &item.canonical_url,
@@ -116,11 +168,21 @@ pub fn repass_archive(
                 &mut assets,
                 &mut run,
             ) {
-                run.asset_fetches = assets.fetches();
-                return Err(RepassError::Storage {
-                    source,
-                    run: Box::new(run),
-                });
+                Ok(outcome) => {
+                    progress(
+                        item.canonical_url.as_str(),
+                        outcome,
+                        items_done,
+                        total_items,
+                    );
+                }
+                Err(source) => {
+                    run.asset_fetches = assets.fetches();
+                    return Err(RepassError::Storage {
+                        source,
+                        run: Box::new(run),
+                    });
+                }
             }
         }
     }
@@ -141,7 +203,7 @@ fn repass_one(
     capture: &Capture,
     assets: &mut AssetCapture<'_>,
     run: &mut RepassRun,
-) -> Result<(), StorageError> {
+) -> Result<RepassOutcome, StorageError> {
     let metadata = archive.read_metadata(url, &capture.id)?;
     recover_assets(archive, url, capture, metadata.as_ref(), assets, run)?;
     repass_capture(archive, rules, url, capture, metadata, run)
@@ -225,7 +287,7 @@ fn repass_capture(
     capture: &Capture,
     metadata: Option<PageMetadata>,
     run: &mut RepassRun,
-) -> Result<(), StorageError> {
+) -> Result<RepassOutcome, StorageError> {
     let article_state = ArticleState::read(archive, url, &capture.id)?;
     let metadata_stale = metadata
         .as_ref()
@@ -239,7 +301,7 @@ fn repass_capture(
     let article_stale = metadata_stale || article_state.is_stale(capture, rules, metadata.as_ref());
     if !metadata_stale && !article_stale {
         run.derived_unchanged += 1;
-        return Ok(());
+        return Ok(RepassOutcome::Unchanged);
     }
 
     let body = match archive.read_body(&capture.body.sha256) {
@@ -247,7 +309,7 @@ fn repass_capture(
         Err(source) => {
             run.unreadable_bodies
                 .push(loss(url, Some(&capture.id), source));
-            return Ok(());
+            return Ok(RepassOutcome::Unreadable);
         }
     };
     let source = PageSource {
@@ -286,16 +348,25 @@ fn repass_capture(
             .and_then(|metadata| readability::declared_accessible_for_free(&metadata.json_ld));
         match readability::extract(source, title, accessible_for_free, rules) {
             Ok(extracted) => {
-                write_extraction(archive, url, capture, article_state, extracted, run)?
+                write_extraction(archive, url, capture, article_state, extracted, run)
             }
-            Err(unreadable) => run.unreadable_articles.push(RepassLoss {
-                url: unreadable.url,
-                capture: Some(capture.id.to_string()),
-                reason: unreadable.reason,
-            }),
+            Err(unreadable) => {
+                run.unreadable_articles.push(RepassLoss {
+                    url: unreadable.url,
+                    capture: Some(capture.id.to_string()),
+                    reason: unreadable.reason,
+                });
+                Ok(RepassOutcome::Unreadable)
+            }
         }
+    } else {
+        // Unreachable in practice: `article_stale` is `metadata_stale || ...`, so this arm
+        // is only reached when neither is true, which the early return above already
+        // answered. Kept rather than asserted away, since the two conditions living in one
+        // `bool` is what stops a future edit from splitting them without noticing this falls
+        // through to something that never runs today.
+        Ok(RepassOutcome::Unchanged)
     }
-    Ok(())
 }
 
 fn write_extraction(
@@ -305,35 +376,44 @@ fn write_extraction(
     known: ArticleState,
     extracted: Extraction,
     run: &mut RepassRun,
-) -> Result<(), StorageError> {
-    match extracted {
+) -> Result<RepassOutcome, StorageError> {
+    let outcome = match extracted {
         Extraction::Article(article) => {
             if known == ArticleState::Article(article.clone()) {
                 run.derived_unchanged += 1;
+                RepassOutcome::Unchanged
             } else {
                 archive.write_article(url, &capture.id, &article)?;
                 run.articles_written += 1;
+                RepassOutcome::Written
             }
         }
         Extraction::Refused(refused) => {
             if known == ArticleState::Refused(refused.clone()) {
                 run.derived_unchanged += 1;
+                RepassOutcome::Unchanged
             } else {
                 archive.write_refused_extraction(url, &capture.id, &refused)?;
                 run.extractions_refused += 1;
+                RepassOutcome::Refused
             }
         }
         Extraction::NotArticle(non_article) => {
             if known == ArticleState::NotArticle(non_article.clone()) {
                 run.derived_unchanged += 1;
+                RepassOutcome::Unchanged
             } else {
                 archive.write_non_article(url, &capture.id, &non_article)?;
                 run.non_articles_marked += 1;
+                RepassOutcome::NotArticle
             }
         }
-        Extraction::Nothing => run.derived_unchanged += 1,
-    }
-    Ok(())
+        Extraction::Nothing => {
+            run.derived_unchanged += 1;
+            RepassOutcome::Unchanged
+        }
+    };
+    Ok(outcome)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

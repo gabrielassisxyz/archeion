@@ -9,6 +9,7 @@ use archeion::crawl::settle_response_byte_ceiling;
 use clap::{Parser, Subcommand};
 
 use cli::capture::CaptureArgs;
+use cli::progress::ProgressLevel;
 
 /// The whole point of publishing these is that a script can tell the two failures apart. An
 /// archive that came up short is a reason to stop a pipeline; a URL nobody answered is the
@@ -48,6 +49,10 @@ enum Command {
         /// Let recovered subresources reach addresses that exist only inside a network.
         #[arg(long)]
         allow_private_addresses: bool,
+        /// Says something on stderr while the pass goes, instead of only once at the end.
+        /// The same levels `capture` takes: see its own `--progress` for what each one means.
+        #[arg(long, value_name = "LEVEL", num_args = 0..=1, default_missing_value = "lines")]
+        progress: Option<ProgressLevel>,
         /// Archive directory to update.
         archive: PathBuf,
     },
@@ -92,8 +97,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Capture(args) => cli::capture::capture(args, cli.json),
         Command::Repass {
             allow_private_addresses,
+            progress,
             archive,
-        } => cli::repass::repass(archive, allow_private_addresses, cli.json),
+        } => cli::repass::repass(archive, allow_private_addresses, progress, cli.json),
         Command::List { archive } => cli::list::list(archive, cli.json),
         Command::Export {
             all_captures,

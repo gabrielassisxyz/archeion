@@ -1732,6 +1732,7 @@ fn a_crowd_of_siblings_in_flight_survives_the_wait_a_refusal_costs() {
 /// that value rather than against the index's own address. `/robots.txt` answers 404.
 fn serve_a_refusing_page_that_declares_an_absolute_base_href(
     refusals: u32,
+    base_port: Option<u16>,
 ) -> (u16, Arc<Mutex<HashMap<String, u32>>>) {
     let requests = Arc::new(Mutex::new(HashMap::new()));
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
@@ -1741,7 +1742,12 @@ fn serve_a_refusing_page_that_declares_an_absolute_base_href(
         for stream in listener.incoming().flatten() {
             let requests = Arc::clone(&counted);
             thread::spawn(move || {
-                answer_a_refusal_then_a_declared_base(stream, requests, refusals, port)
+                answer_a_refusal_then_a_declared_base(
+                    stream,
+                    requests,
+                    refusals,
+                    base_port.unwrap_or(port),
+                )
             });
         }
     });
@@ -1752,7 +1758,7 @@ fn answer_a_refusal_then_a_declared_base(
     mut stream: TcpStream,
     requests: Arc<Mutex<HashMap<String, u32>>>,
     refusals: u32,
-    port: u16,
+    base_port: u16,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -1788,7 +1794,7 @@ fn answer_a_refusal_then_a_declared_base(
             "200 OK",
             format!(
                 r#"<html><head><title>An index</title>
-                <base href="http://127.0.0.1:{port}/sub/"></head>
+                <base href="http://127.0.0.1:{base_port}/sub/"></head>
                 <body><a href="child.html">the child</a></body></html>"#
             )
             .into_bytes(),
@@ -1818,7 +1824,7 @@ fn answer_a_refusal_then_a_declared_base(
 #[test]
 fn a_rate_limited_page_declaring_a_base_keeps_the_links_that_base_resolves() {
     let dir = TempDir::new().expect("temp dir");
-    let (port, requests) = serve_a_refusing_page_that_declares_an_absolute_base_href(2);
+    let (port, requests) = serve_a_refusing_page_that_declares_an_absolute_base_href(2, None);
     let seed_url = format!("http://127.0.0.1:{port}/index.html");
 
     let output = archeion()
@@ -1860,6 +1866,89 @@ fn a_rate_limited_page_declaring_a_base_keeps_the_links_that_base_resolves() {
         report["links_never_followed"].as_array().map(Vec::len),
         Some(0)
     );
+}
+
+/// A base naming another origin is not a base this crawl may resolve against. A port is
+/// part of an origin, and the link screen in `record_discovered_links` compares hosts, so
+/// honouring such a declaration would record addresses on a server this run never read
+/// `robots.txt` for and send recovery to fetch them. The page itself is still archived, and
+/// the other server is never asked for anything.
+#[test]
+fn a_rate_limited_page_declaring_a_base_on_another_origin_sends_no_request_there() {
+    let dir = TempDir::new().expect("temp dir");
+    let elsewhere = Arc::new(Mutex::new(0u32));
+    let elsewhere_port = serve_a_site_counting_every_request(Arc::clone(&elsewhere));
+    let (port, _requests) =
+        serve_a_refusing_page_that_declares_an_absolute_base_href(2, Some(elsewhere_port));
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let output = archeion()
+        .arg("capture")
+        .arg("--json")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args(["--max-pages", "5", "--max-depth", "1", "--max-retries", "0"])
+        .args(["--deadline", "60s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let archive = Archive::open_existing(dir.path()).expect("the run created an archive");
+    let canonical = CanonicalUrl::parse(&seed_url).expect("valid url");
+    assert!(
+        !archive
+            .list_captures(&canonical)
+            .expect("captures are listed")
+            .is_empty(),
+        "the page itself was lost along with the base it declared"
+    );
+    assert_eq!(
+        *elsewhere
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        0,
+        "one attribute on one page aimed the run at a server it never read robots.txt for"
+    );
+}
+
+/// A loopback site that counts every request it receives and serves an ordinary page, which
+/// is what a test uses to prove nothing was asked of it.
+fn serve_a_site_counting_every_request(requests: Arc<Mutex<u32>>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let requests = Arc::clone(&requests);
+            thread::spawn(move || {
+                let mut counted = requests
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *counted += 1;
+                drop(counted);
+                answer_with_an_ordinary_page(stream)
+            });
+        }
+    });
+    port
+}
+
+fn answer_with_an_ordinary_page(mut stream: TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+    let body = b"<html><head><title>Elsewhere</title></head><body>a page</body></html>".to_vec();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()
 }
 
 /// What the engine's own retry budget does with a 429, measured rather than read: the

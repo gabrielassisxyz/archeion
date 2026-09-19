@@ -667,7 +667,7 @@ fn refetch_a_rate_limited_page(
     seed_scheme: &str,
     depths: &Mutex<HashMap<String, usize>>,
 ) -> PageEvent {
-    let (event, declared_base, page_links) = fetch_recovered_page(url, seed, selectors);
+    let (event, link_base, page_links) = fetch_recovered_page(url, seed, selectors);
     if !matches!(&event, PageEvent::Response(page) if page.status < 400) {
         return event;
     }
@@ -685,7 +685,7 @@ fn refetch_a_rate_limited_page(
     }
     record_discovered_links(
         url,
-        declared_base.as_ref(),
+        &link_base,
         page_links.as_deref(),
         seed_host,
         seed_scheme,
@@ -802,7 +802,7 @@ fn recover_lost_links(
         }
 
         let mut attempts = 0u8;
-        let (event, mut declared_base, mut page_links) = loop {
+        let (event, mut link_base, mut page_links) = loop {
             let attempt = fetch_recovered_page(&url, seed, selectors);
             let should_retry = matches!(
                 &attempt.0,
@@ -837,7 +837,7 @@ fn recover_lost_links(
             },
         );
         if let Some((base, links)) = links_of_the_last_attempt {
-            declared_base = base;
+            link_base = base;
             page_links = links;
         }
 
@@ -851,7 +851,7 @@ fn recover_lost_links(
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let children = record_discovered_links(
                     &url,
-                    declared_base.as_ref(),
+                    &link_base,
                     page_links.as_deref(),
                     seed_host,
                     seed_scheme,
@@ -907,7 +907,7 @@ fn fetch_recovered_page(
     selectors: &RelativeSelectors,
 ) -> (
     PageEvent,
-    Option<Url>,
+    LinkBase,
     Option<Box<PageLinkSet<CaseInsensitiveString>>>,
 ) {
     std::thread::scope(|threads| {
@@ -921,7 +921,7 @@ fn fetch_recovered_page(
                     url: url.to_owned(),
                     reason: "the crawl engine panicked while fetching".to_owned(),
                 }),
-                None,
+                LinkBase::PageUrl,
                 None,
             ),
         }
@@ -934,7 +934,7 @@ fn fetch_recovered_page_on_this_thread(
     selectors: &RelativeSelectors,
 ) -> (
     PageEvent,
-    Option<Url>,
+    LinkBase,
     Option<Box<PageLinkSet<CaseInsensitiveString>>>,
 ) {
     let runtime = match Builder::new_current_thread().enable_all().build() {
@@ -945,7 +945,7 @@ fn fetch_recovered_page_on_this_thread(
                     url: url.to_owned(),
                     reason: format!("the crawl engine could not be started: {source}"),
                 }),
-                None,
+                LinkBase::PageUrl,
                 None,
             );
         }
@@ -961,9 +961,9 @@ fn fetch_recovered_page_on_this_thread(
         // directly has nothing to seed it, so this is that seeding's one other call site.
         page.page_links = Some(Default::default());
         let _ = page.links(selectors, &None).await;
-        let declared_base = absolute_base_href_of(&page);
+        let link_base = link_base_of(url, absolute_base_href_of(&page));
         let page_links = page.page_links.clone();
-        (page_event(page), declared_base, page_links)
+        (page_event(page), link_base, page_links)
     })
 }
 async fn robots_rules(
@@ -1492,7 +1492,7 @@ fn hop_depth_guard(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         record_discovered_links(
             page.get_url(),
-            None,
+            &LinkBase::PageUrl,
             page.page_links.as_deref(),
             seed_host.as_deref(),
             &seed_scheme,
@@ -1502,6 +1502,25 @@ fn hop_depth_guard(
         );
         true
     }
+}
+
+/// What a fetched page's own links resolve against, which is not always the page's address
+/// and is not always knowable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinkBase {
+    /// The page's own URL, which is what every page that declares no `<base href>` resolves
+    /// against, and what the engine's own frontier resolves such a page's links against too.
+    PageUrl,
+    /// An absolute `<base href>` the page declared, honoured. Only a page this project
+    /// fetched directly gets this: nothing else has read that page's links, so this
+    /// resolution is the only account of them there will ever be.
+    Declared(Url),
+    /// A base that exists and must not be used. Either the frontier has already resolved
+    /// the page's links its own way, so a second answer here could only disagree with the
+    /// request that actually went out, or the declaration points at another origin, whose
+    /// `robots.txt` this run never read and whose addresses are outside the crawl. Nothing
+    /// about such a page's links is recorded.
+    Unusable,
 }
 
 /// Records, into `depths`, every same-host in-scope link a fetched page discovered, one hop
@@ -1521,7 +1540,7 @@ fn hop_depth_guard(
 #[allow(clippy::too_many_arguments)]
 fn record_discovered_links(
     page_url: &str,
-    declared_base: Option<&Url>,
+    link_base: &LinkBase,
     page_links: Option<&PageLinkSet<CaseInsensitiveString>>,
     seed_host: Option<&str>,
     seed_scheme: &str,
@@ -1537,9 +1556,10 @@ fn record_discovered_links(
     // `<base href>` and the caller is one that read it: a page's own declaration is what
     // every link on it resolves against, and a caller that hands it over here is one whose
     // page nothing else resolved links for.
-    let base = match declared_base {
-        Some(declared) => declared.clone(),
-        None => match Url::parse(page_url) {
+    let base = match link_base {
+        LinkBase::Unusable => return discovered,
+        LinkBase::Declared(declared) => declared.clone(),
+        LinkBase::PageUrl => match Url::parse(page_url) {
             Ok(parsed) => parsed,
             Err(_) => return discovered,
         },
@@ -1721,6 +1741,26 @@ fn absolute_base_href_of(page: &Page) -> Option<Url> {
     let _ = rewriter.write(page.get_html_bytes_u8());
     let _ = rewriter.end();
     found
+}
+
+/// What the links of a page this project fetched directly resolve against, given whatever
+/// `<base href>` the page declared.
+///
+/// A declaration naming another origin is refused rather than honoured. Its links belong to
+/// a server this run never read `robots.txt` for and never pointed itself at, and recording
+/// them would turn one attribute on one page into requests aimed somewhere no other door of
+/// this crawl can go: `record_discovered_links` screens a link by host alone, so a base on
+/// the seed's own host under another port or scheme would pass that screen while being a
+/// different server under RFC 9309. One page's `<base>` moving every link on it at once is
+/// what makes this worth refusing outright rather than filtering link by link.
+fn link_base_of(page_url: &str, declared: Option<Url>) -> LinkBase {
+    let Some(declared) = declared else {
+        return LinkBase::PageUrl;
+    };
+    match Url::parse(page_url) {
+        Ok(page) if page.origin() == declared.origin() => LinkBase::Declared(declared),
+        _ => LinkBase::Unusable,
+    }
 }
 
 /// The URL a page event is filed under before any redirect, which is the spelling
@@ -2738,6 +2778,47 @@ mod tests {
     fn a_relative_base_href_is_not_mistaken_for_an_absolute_one() {
         let page = page_with_html(r#"<html><head><base href="/"></head><body></body></html>"#);
         assert_eq!(absolute_base_href_of(&page), None);
+    }
+
+    /// A declaration on the page's own origin is the case this exists to honour: the links
+    /// of a page fetched outside the frontier resolve against it and nothing else has read
+    /// them.
+    #[test]
+    fn a_base_on_the_page_s_own_origin_is_the_base_its_links_resolve_against() {
+        let declared = Url::parse("https://example.com/sub/").expect("valid url");
+        assert_eq!(
+            link_base_of("https://example.com/index.html", Some(declared.clone())),
+            LinkBase::Declared(declared)
+        );
+    }
+
+    /// A port is part of an origin, and `record_discovered_links` screens a link by host
+    /// alone: honouring a base on another port would record addresses on a server this run
+    /// never read `robots.txt` for, and recovery would then ask that server for them.
+    #[test]
+    fn a_base_on_another_port_of_the_same_host_is_not_a_base_this_crawl_may_use() {
+        assert_eq!(
+            link_base_of(
+                "https://example.com/index.html",
+                Url::parse("https://example.com:8080/sub/").ok()
+            ),
+            LinkBase::Unusable
+        );
+        assert_eq!(
+            link_base_of(
+                "https://example.com/index.html",
+                Url::parse("https://elsewhere.example/").ok()
+            ),
+            LinkBase::Unusable
+        );
+    }
+
+    #[test]
+    fn a_page_that_declares_nothing_resolves_its_links_against_its_own_address() {
+        assert_eq!(
+            link_base_of("https://example.com/index.html", None),
+            LinkBase::PageUrl
+        );
     }
 
     #[test]

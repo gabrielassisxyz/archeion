@@ -33,6 +33,7 @@ Every option is one field of the seed the library crawls with, spelled the same,
 | `--cookie-file <PATH>` | the `Cookie` header of an authenticated request, sent to the seed's own origin |
 | `--from-sitemap [<URL>]` | additionally archive what the site's sitemap lists |
 | `--resume` | ask only for the addresses `owed.json` names, instead of crawling a seed |
+| `--progress[=LEVEL]` | say something on stderr while the run goes, instead of only at the end |
 
 A span carries its unit: `250ms`, `30s`, `5m`, `1h`. A bare number would have to mean seconds on the deadline and milliseconds on the delay, and a run whose budget was read in the wrong unit is either over before it starts or never over at all.
 
@@ -41,6 +42,28 @@ A zero is refused everywhere it would not mean zero, which is everywhere except 
 A crawl that really should take everything says so with a large number. The one unbounded thing that can be asked for by name is the wall clock, with `--deadline none`.
 
 The archive is created when the path holds no archive yet, since `capture` is the only verb that writes and a first collection has to start somewhere. It says so on the line above the report, because a path typed wrong is otherwise a new empty archive nobody was told about. The seed is screened before that happens: a run the engine will not dial leaves no directory behind on the path it was pointed at.
+
+### Saying something while the run goes
+
+A capture of a real site takes minutes. With no `--progress` it prints nothing until it is over, which is the default and is unchanged: there is then no way to tell a crawl working through pages from one stuck on a host that stopped answering.
+
+`--progress` asks for one of two accounts of the run, and all of it goes to stderr. Stdout is not touched at any level, in either mode: under `--json` it still carries exactly the one object a pipeline parses, and a run at the highest level produces the same stdout as the same run with the flag absent. That is the whole reason stderr is where this goes, and it is the same reason warnings already go there.
+
+| level | what it says |
+|---|---|
+| flag absent | nothing, which is the default |
+| `--progress` or `--progress=lines` | one line per page: the URL, and what it produced |
+| `--progress=bar` | one line about the whole run, redrawn in place |
+
+A level is named with an equals sign. `--progress=bar` and `--progress=lines` are the two spellings, and a bare `--progress` means `lines`. The equals sign is required so that a bare flag written before the archive path cannot swallow the path as a level and refuse the run.
+
+The two levels answer different questions and a run wants one of them, not both. `lines` answers what happened to each URL, naming the same outcome the end-of-run report names: `stored`, `extracted`, `not article`, `article refused`, `host refused`, `no response`, `inside a network`, `no address`. A host declining to serve a page and a reading declining to call a page an article are two different fates and print as two different words. Lines arrive in whatever order pages do, which is not a path through the site: several requests are in flight at once.
+
+`bar` answers how far along the run is, against both its page limit and its deadline, and it counts the whole run rather than one phase of it: a run with a sitemap phase after its crawl keeps counting up instead of restarting. It also carries how long since the last page arrived, and that figure keeps moving on its own about once a second, so a host that stopped answering reads as a stalled run rather than as a finished one. Nothing about it changes what the run asks for, or when.
+
+With stderr on a pipe or in a log file, the bar degrades rather than writing control characters nothing will ever erase: every update is a plain complete line, with no carriage return and no ANSI escape, and the line that moves on its own is emitted far more rarely there, only after several seconds in which nothing else was printed.
+
+Warnings keep their place at every level. A warning is written with the bar taken down first and never on the same line as a redraw, and the report on stdout is printed with the bar taken down too.
 
 ### Capturing the same seed twice
 
@@ -140,6 +163,8 @@ For article extraction, an existing article can become an article again, a refus
 A capture with no article beside it is re-read when it holds something the extractor now reads, which is how an archive filled before a media type was understood catches up. A response the site served as Markdown is the case that exists today: captures already on disk produce their articles on the next pass, from the stored bytes and without fetching anything.
 
 For subresources, the pass only asks for URLs already listed in `assets_missed` where the archive's own policy stopped the original asset capture, such as a count ceiling, byte ceiling, deadline or a host that had stopped answering before that URL was tried. A URL that directly answered nothing is not retried blindly. Recovered assets, and retry results that are still missing, are written beside the capture and folded into `Archive::read_capture`; the original capture record is not rewritten because its id includes the assets present when it was filed.
+
+`--progress` is the same flag with the same levels, spelled the same way: `--progress=bar`, `--progress=lines`, or bare for `lines`. It goes to stderr and stdout is unaffected, exactly as it is on `capture`. What `lines` names is one capture and what its derived records became, `written`, `article refused`, `not article`, `metadata written`, `unchanged` or `unreadable`, and what `bar` counts is items of the archive against how many the walk found. Every item advances the bar, including one whose captures could not be read at all, so the bar reaches its own total rather than stopping short of it.
 
 `--allow-private-addresses` has the same meaning as it does on `capture`, but only for recovered subresources. It is off by default, so a stored page still cannot make a later pass read the local machine or network around it.
 

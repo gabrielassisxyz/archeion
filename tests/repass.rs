@@ -11,8 +11,8 @@ use archeion::readability::{
     self, AdmissionCost, Article, ArticleBound, ArticleRecord, ExtractionRules, ProseShare,
     RefusedExtraction, SiteRules,
 };
-use archeion::repass::{RepassOptions, repass_archive};
-use archeion::storage::{Archive, AssetMiss, Header, MissedAsset, NewCapture};
+use archeion::repass::{RepassEvent, RepassOptions, repass_archive, repass_archive_reporting};
+use archeion::storage::{Archive, AssetMiss, Header, ItemId, MissedAsset, NewCapture};
 use jiff::Timestamp;
 use tempfile::TempDir;
 
@@ -981,5 +981,116 @@ fn an_article_built_on_metadata_this_pass_replaces_is_rebuilt_with_it() {
         article.markdown.starts_with("# Isn't Efficient"),
         "the heading is rebuilt from the metadata this pass rewrote, got {:?}",
         article.markdown.lines().next()
+    );
+}
+
+/// A bar counts items, so every item the walk found has to finish, whatever it turned out to
+/// hold. An item with no capture this pass could read used to pass through the loop silently,
+/// which left the bar at "1/2 items" on an archive with nothing wrong that the report did not
+/// already name, and a bar that stops below its own total reads as a pass that hung.
+#[test]
+fn an_item_with_nothing_to_read_still_finishes_against_the_walk_s_own_total() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let readable = CanonicalUrl::parse("https://example.com/readable").expect("valid URL");
+    let empty = CanonicalUrl::parse("https://example.com/empty").expect("valid URL");
+    archive
+        .write_capture(html_capture(
+            &readable,
+            "<html><head><title>Readable</title></head><body>prose</body></html>",
+        ))
+        .expect("capture is written");
+    archive
+        .write_capture(html_capture(
+            &empty,
+            "<html><head><title>Emptied</title></head><body>prose</body></html>",
+        ))
+        .expect("capture is written");
+    // The item stays, its captures do not. `list_captures` answers an absent directory with an
+    // empty list rather than an error, which is exactly the shape that reported nothing at all.
+    std::fs::remove_dir_all(
+        dir.path()
+            .join("items")
+            .join(empty.host_dir())
+            .join(ItemId::of(&empty).as_str())
+            .join("captures"),
+    )
+    .expect("the captures of one item are removed");
+
+    let mut finished: Vec<(usize, usize)> = Vec::new();
+    repass_archive_reporting(
+        &ScriptedEngine::new(Vec::new()),
+        &archive,
+        &SiteRules::default(),
+        RepassOptions::default(),
+        &mut |event| {
+            if let RepassEvent::ItemFinished {
+                items_done,
+                total_items,
+            } = event
+            {
+                finished.push((items_done, total_items));
+            }
+        },
+    )
+    .expect("repass succeeds");
+
+    assert_eq!(
+        finished,
+        [(1, 2), (2, 2)],
+        "an item the walk counted did not finish"
+    );
+}
+
+/// A capture whose metadata this pass rewrote is not a capture this pass left alone, even when
+/// the article over it came out identical. The report counts the rewrite under
+/// `metadata_written`, so a progress line calling the same capture unchanged is the live
+/// account contradicting the summary printed a moment later.
+#[test]
+fn a_capture_whose_metadata_was_rewritten_is_not_reported_unchanged() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive = archive_in(&dir);
+    let url = CanonicalUrl::parse("https://example.com/a").expect("valid URL");
+    let page = article_page("");
+    let capture = archive
+        .write_capture(html_capture(&url, &page))
+        .expect("capture is written");
+    // One pass to bring every derived record current, so that the second pass below has
+    // nothing left to change about the article and only the metadata to rewrite.
+    repass_archive(
+        &ScriptedEngine::new(Vec::new()),
+        &archive,
+        &SiteRules::default(),
+        RepassOptions::default(),
+    )
+    .expect("repass succeeds");
+    let mut current = archive
+        .read_metadata(&url, &capture.id)
+        .expect("metadata reads")
+        .expect("metadata exists");
+    current.extractor_version = metadata::EXTRACTOR_VERSION - 1;
+    archive
+        .write_metadata(&url, &capture.id, &current)
+        .expect("the metadata is aged back");
+
+    let mut outcomes = Vec::new();
+    let run = repass_archive_reporting(
+        &ScriptedEngine::new(Vec::new()),
+        &archive,
+        &SiteRules::default(),
+        RepassOptions::default(),
+        &mut |event| {
+            if let RepassEvent::Capture { outcome, .. } = event {
+                outcomes.push(outcome);
+            }
+        },
+    )
+    .expect("repass succeeds");
+
+    assert_eq!(run.metadata_written, 1, "the metadata was not rewritten");
+    assert_eq!(run.articles_written, 0, "the article was not left alone");
+    assert_eq!(
+        outcomes.iter().map(|o| o.as_word()).collect::<Vec<_>>(),
+        ["metadata written"]
     );
 }

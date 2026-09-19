@@ -2,15 +2,114 @@
 
 use std::error::Error;
 use std::fmt::Write as _;
+use std::io::{self, IsTerminal, Write as _};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use archeion::crawl::SpiderEngine;
 use archeion::readability::SiteRules;
-use archeion::repass::{RepassError, RepassOptions, RepassRun, repass_archive};
+use archeion::repass::{
+    RepassError, RepassEvent, RepassOptions, RepassRun, repass_archive_reporting,
+};
+use archeion::report_words;
 use archeion::storage::Archive;
 use serde::Serialize;
 
+use super::progress::{BarFacts, ProgressLevel, TickingBar};
 use super::{warn, write_stdout};
+
+/// The live progress a repass prints while it runs. There is no page limit and no deadline to
+/// weigh it against, the way `capture`'s bar does: a repass walks an archive it already has, so
+/// the one denominator it can know before the walk starts is how many items the walk found.
+enum RepassProgress {
+    /// One complete line per capture, naming the item and what its derived records became.
+    Lines,
+    /// One line about the whole walk, redrawn in place on a terminal and kept moving by a
+    /// thread of its own, since a repass that fetches a missed subresource can wait on a host
+    /// exactly as a capture does.
+    Bar(TickingBar<RepassPace>),
+}
+
+/// How far a walk has got, as the bar states it. Items rather than captures, because the item
+/// count is the only denominator the walk knows before it starts.
+struct RepassPace {
+    items_done: usize,
+    total_items: usize,
+    started: Instant,
+    /// When the last item finished, or `None` while none has. See `CapturePace` in
+    /// `cli::capture`: the two read differently on purpose.
+    last_item: Option<Instant>,
+}
+
+impl BarFacts for RepassPace {
+    fn line(&self) -> String {
+        let since = match self.last_item {
+            Some(last_item) => format!("{}s since the last item", last_item.elapsed().as_secs()),
+            None => format!("{}s since the pass began", self.started.elapsed().as_secs()),
+        };
+        format!("{}/{} items, {since}", self.items_done, self.total_items)
+    }
+}
+
+impl RepassProgress {
+    fn new(level: ProgressLevel) -> Self {
+        match level {
+            ProgressLevel::Lines => Self::Lines,
+            ProgressLevel::Bar => Self::Bar(TickingBar::new(
+                io::stderr().is_terminal(),
+                RepassPace {
+                    items_done: 0,
+                    total_items: 0,
+                    started: Instant::now(),
+                    last_item: None,
+                },
+            )),
+        }
+    }
+
+    /// What the walk just said. A capture's own fate is the `Lines` level's whole question and
+    /// nothing the bar counts; an item finishing is the bar's whole question and nothing
+    /// `Lines` prints, since the URL was already named by the captures under it and an item
+    /// with none has nothing to say. Splitting them is what lets an item the walk could not
+    /// read at all still advance the bar to its own total.
+    fn event(&mut self, event: RepassEvent<'_>) {
+        match (self, event) {
+            (Self::Lines, RepassEvent::Capture { url, outcome }) => {
+                let _ = writeln!(io::stderr(), "{url}: {}", outcome.as_word());
+            }
+            (
+                Self::Bar(bar),
+                RepassEvent::ItemFinished {
+                    items_done,
+                    total_items,
+                },
+            ) => bar.advance(|pace| {
+                pace.items_done = items_done;
+                pace.total_items = total_items;
+                pace.last_item = Some(Instant::now());
+            }),
+            (Self::Bar(bar), RepassEvent::WalkStarted { total_items }) => {
+                bar.advance(|pace| pace.total_items = total_items)
+            }
+            _ => {}
+        }
+    }
+
+    /// See `CaptureProgress::warn` in `cli::capture`: the same reasoning, over the same risk.
+    fn warn(&mut self, lines: impl IntoIterator<Item = String>) {
+        match self {
+            Self::Lines => warn(lines),
+            Self::Bar(bar) => bar.interrupt(lines),
+        }
+    }
+
+    /// See `CaptureProgress::clear`.
+    fn clear(&mut self) {
+        if let Self::Bar(bar) = self {
+            bar.clear();
+        }
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct Loss {
@@ -42,16 +141,34 @@ struct RepassReport {
 pub fn repass(
     archive_path: PathBuf,
     allow_private_addresses: bool,
+    progress: Option<ProgressLevel>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let archive = Archive::open_existing(&archive_path)?;
     let (rules, unused_rules) = SiteRules::read(&archive.extraction_rules_path());
-    warn(unused_rules.iter().map(ToString::to_string));
 
     let options = RepassOptions {
         allow_private_addresses,
     };
-    let (run, failure) = match repass_archive(&SpiderEngine::default(), &archive, &rules, options) {
+    let mut progress = progress.map(RepassProgress::new);
+    // Held until there is a progress writer to print through rather than printed where it was
+    // found, so a bar cannot be drawn over it. See the same move in `cli::capture`.
+    emit_warnings(
+        progress.as_mut(),
+        unused_rules.iter().map(ToString::to_string),
+    );
+    let mut on_capture = |event: RepassEvent<'_>| {
+        if let Some(progress) = progress.as_mut() {
+            progress.event(event);
+        }
+    };
+    let (run, failure) = match repass_archive_reporting(
+        &SpiderEngine::default(),
+        &archive,
+        &rules,
+        options,
+        &mut on_capture,
+    ) {
         Ok(run) => (run, None),
         Err(RepassError::Storage { source, run }) => (*run, Some(source)),
     };
@@ -61,8 +178,14 @@ pub fn repass(
     } else {
         human_report(&report)
     };
+    // Before the report and not after it: see `finish` in `cli::capture`.
+    if let Some(progress) = progress.as_mut() {
+        progress.clear();
+    }
     write_stdout(&output)?;
-    warn(losses(&report));
+    // See `finish` in `cli::capture`: this can be the first thing printed since the bar last
+    // redrew, so it goes through the bar's own line rather than straight to `warn`.
+    emit_warnings(progress.as_mut(), losses(&report));
 
     if let Some(source) = failure {
         return Err(source.into());
@@ -71,6 +194,14 @@ pub fn repass(
         return Err("archive has unreadable records the repass could not refresh".into());
     }
     Ok(())
+}
+
+/// See `emit_warnings` in `cli::capture`: the same reasoning, over this verb's own writer.
+fn emit_warnings(progress: Option<&mut RepassProgress>, lines: impl IntoIterator<Item = String>) {
+    match progress {
+        Some(progress) => progress.warn(lines),
+        None => warn(lines),
+    }
 }
 
 fn report_of(path: &std::path::Path, run: &RepassRun) -> RepassReport {
@@ -114,12 +245,20 @@ fn human_report(report: &RepassReport) -> String {
     )
     .expect("writing to a string cannot fail");
     let rows = [
-        ("metadata", format!("{} written", report.metadata_written)),
+        (
+            "metadata",
+            format!("{} {}", report.metadata_written, report_words::WRITTEN),
+        ),
         (
             "articles",
             format!(
-                "{} written, {} refused, {} not article",
-                report.articles_written, report.extractions_refused, report.non_articles_marked
+                "{} {}, {} {}, {} {}",
+                report.articles_written,
+                report_words::WRITTEN,
+                report.extractions_refused,
+                report_words::REFUSED_IN_ARTICLES_ROW,
+                report.non_articles_marked,
+                report_words::NOT_ARTICLE
             ),
         ),
         (
@@ -133,7 +272,7 @@ fn human_report(report: &RepassReport) -> String {
             ),
         ),
         (
-            "unchanged",
+            report_words::UNCHANGED,
             format!("{} derived record(s)", report.derived_unchanged),
         ),
     ];

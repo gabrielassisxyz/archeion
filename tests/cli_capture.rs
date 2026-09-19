@@ -11,6 +11,7 @@
 //! difference the exit codes are built around: the archive being wrong is a failure, the web
 //! being the web is not.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Output};
@@ -20,7 +21,7 @@ use std::time::Duration;
 
 use archeion::CanonicalUrl;
 use archeion::crawl::DEFAULT_USER_AGENT;
-use archeion::storage::{Archive, OwedReason};
+use archeion::storage::{Archive, OwedAddress, OwedReason};
 use tempfile::TempDir;
 
 const INDEX: &str = r#"<html><head><title>An index</title></head>
@@ -189,6 +190,7 @@ fn a_seed_is_crawled_into_an_archive_that_the_run_creates() {
              pages dropped 0\n  \
              links lost    0\n  \
              recovered     0\n  \
+             waited out    0\n  \
              stopped       nothing was left to fetch\n",
             archive = archive_path.display(),
             seed = site.url("/index.html"),
@@ -812,10 +814,16 @@ fn recovery_waits_the_configured_delay_between_its_own_fetches() {
 /// capture is what the server answered, but `recover_lost_links` does not let a status the
 /// crawl's own retry policy would have repeated clear a URL off `still_missing`. One
 /// candidate, the same deterministic "Allow outranks a shorter Disallow" shape used above so
-/// there is no race to wait out, answers 429 to every request it receives; `--max-retries 2`
-/// is what lets this also pin that recovery spends that budget rather than giving up on the
-/// first attempt, since the request count the server keeps has to reach three, one initial
-/// attempt and two retries, before the run gives up on it.
+/// there is no race to wait out, answers 429 to every request it receives.
+///
+/// The request count is what pins the two layers recovery spends on such an address, in
+/// order. `--max-retries 2` buys the first three, one attempt and two retries, taken back to
+/// back because `--delay` is not set. Backoff then waits the refusal out on the crawl's own
+/// per-host counter, and the five second deadline is what decides how far that gets: one or
+/// two further requests, depending on how much of that budget the crawl ahead of recovery
+/// already spent, and never more, since the four second wait after those cannot fit. Three
+/// requests exactly is what a recovery exempt from backoff would leave behind, which is why
+/// the count is asserted as a range with a floor rather than as an upper bound alone.
 #[test]
 fn recovery_answered_with_a_status_the_crawl_would_have_retried_stays_lost() {
     let dir = TempDir::new().expect("temp dir");
@@ -841,7 +849,7 @@ fn recovery_answered_with_a_status_the_crawl_would_have_retried_stays_lost() {
             "--max-retries",
             "2",
         ])
-        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .args(["--deadline", "5s", "--allow-private-addresses"])
         .output()
         .expect("the binary runs");
 
@@ -864,10 +872,12 @@ fn recovery_answered_with_a_status_the_crawl_would_have_retried_stays_lost() {
         "a link that never answered under 400 was counted as recovered: {}",
         stdout_of(&output)
     );
-    assert_eq!(
-        *requests.lock().expect("no poison"),
-        3,
-        "the retry budget was not spent: one attempt plus two retries is three requests"
+    let asked = *requests.lock().expect("no poison");
+    assert!(
+        (4..=5).contains(&asked),
+        "the retry budget and the backoff after it were not both spent, {asked} request(s): \
+         three is the budget alone, and a five second deadline leaves room for one further \
+         wait or two depending on what the crawl ahead of recovery already spent"
     );
 
     // Not archived, and this is the one place recovery and the refusal rule have to agree:
@@ -953,6 +963,1034 @@ fn answer_always_429(mut stream: TcpStream, requests: Arc<Mutex<u32>>) -> std::i
     stream.write_all(head.as_bytes())?;
     stream.write_all(body)?;
     stream.flush()
+}
+
+/// A loopback site whose one page answers 429 a fixed number of times and then 200, so a run
+/// against it proves whether waiting out a rate limit is what recovered the page. Every test
+/// built on this passes `--max-retries 0`, which turns off the engine's own small retry
+/// budget: without it, a refusal count at or under that budget would be recovered by the
+/// mechanism `docs/crawl-boundary.md` already documented before this bead, and the test would
+/// prove nothing about the backoff this bead adds. `/robots.txt` answers 404 and is not
+/// counted, so the refusal count named by a test is exactly the count of requests for the
+/// page itself.
+fn serve_a_page_that_refuses_a_fixed_number_of_times(
+    refusals: u32,
+    retry_after: Option<String>,
+) -> (u16, Arc<Mutex<u32>>) {
+    let requests = Arc::new(Mutex::new(0u32));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    let counted = Arc::clone(&requests);
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let requests = Arc::clone(&counted);
+            let retry_after = retry_after.clone();
+            thread::spawn(move || {
+                answer_a_fixed_number_of_refusals(stream, requests, refusals, retry_after)
+            });
+        }
+    });
+    (port, requests)
+}
+
+fn answer_a_fixed_number_of_refusals(
+    mut stream: TcpStream,
+    requests: Arc<Mutex<u32>>,
+    refusals: u32,
+    retry_after: Option<String>,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    if path == "/robots.txt" {
+        stream.write_all(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return stream.flush();
+    }
+    let attempt = {
+        let mut count = requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *count += 1;
+        *count
+    };
+    let refused = attempt <= refusals;
+    let (status, body): (&str, &[u8]) = if refused {
+        ("429 Too Many Requests", b"Too Many Requests")
+    } else {
+        (
+            "200 OK",
+            b"<html><head><title>ok</title></head><body>ok</body></html>",
+        )
+    };
+    let retry_after_header = if refused {
+        retry_after
+            .map(|value| format!("Retry-After: {value}\r\n"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let head = format!(
+        "HTTP/1.1 {status}\r\n{retry_after_header}Content-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
+/// The "Done when" of `arch-u59`: a page that refuses the first two requests it answers, and
+/// serves the third, is captured whole in one run, and nothing about it is left owed.
+#[test]
+fn a_page_that_refuses_twice_and_then_serves_is_captured_with_nothing_owed() {
+    let dir = TempDir::new().expect("temp dir");
+    let (port, requests) = serve_a_page_that_refuses_a_fixed_number_of_times(2, None);
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args(["--max-pages", "1", "--max-retries", "0"])
+        // Thirty seconds rather than ten: one address may spend a quarter of the budget
+        // being waited out, and the second of this page's two waits does not fit inside a
+        // quarter of ten.
+        .args(["--deadline", "30s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(
+        *requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        3,
+        "two refusals and the request that finally served"
+    );
+
+    let archive = Archive::open_existing(dir.path()).expect("the run created an archive");
+    let canonical = CanonicalUrl::parse(&seed_url).expect("valid url");
+    assert!(
+        !archive
+            .list_captures(&canonical)
+            .expect("captures are listed")
+            .is_empty(),
+        "the page waited out and served is archived"
+    );
+    let owed = archive.read_owed().expect("the owed record reads back");
+    assert!(
+        owed.is_empty(),
+        "nothing is owed once waiting recovered the page: {owed:?}"
+    );
+}
+
+/// A `Retry-After` naming a wait longer than backoff would have chosen on its own, in
+/// seconds, is what the run actually waits: the header asks for eight seconds and the page
+/// is served on the very next request.
+///
+/// The bound is well clear of the second `RATE_LIMIT_BASE_BACKOFF` chooses when it reads no
+/// header at all, and it has to be: a run's own startup, its `robots.txt` request and the
+/// process spawn are between one and two seconds here, so a bound set a little over that
+/// second is a bound a run ignoring the header entirely still clears. That was the case
+/// with a three second header and a 2.8 second bound, measured by deleting the header read
+/// and watching both of these pass.
+#[test]
+fn a_retry_after_given_in_seconds_and_longer_than_the_default_backoff_is_honoured() {
+    let dir = TempDir::new().expect("temp dir");
+    let (port, _requests) =
+        serve_a_page_that_refuses_a_fixed_number_of_times(1, Some("8".to_owned()));
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let started = std::time::Instant::now();
+    let output = archeion()
+        .arg("capture")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args(["--max-pages", "1", "--max-retries", "0"])
+        // Room for four times the header's own wait: backoff refuses a wait that would not
+        // fit inside the deadline, and refuses one that would spend more than a quarter of
+        // the budget on a single address, so a budget merely larger than the header asks
+        // for is still a budget the header loses against.
+        .args(["--deadline", "60s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+    let elapsed = started.elapsed();
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    // A lower bound, which is the only kind a sleep can be held to: it never returns early,
+    // and asserting an upper bound would be asserting that this machine was not busy.
+    assert!(
+        elapsed >= Duration::from_millis(6_500),
+        "an eight second Retry-After was not honoured, took {elapsed:?}"
+    );
+
+    let owed = archive_owed(dir.path());
+    assert!(
+        owed.is_empty(),
+        "nothing is owed once waiting recovered the page: {owed:?}"
+    );
+}
+
+/// The same wait, asked for in the other form the header may take: an HTTP-date naming the
+/// moment to come back rather than a count of seconds. The bound is far from the wait
+/// backoff takes unprompted for the reason stated above.
+#[test]
+fn a_retry_after_given_as_an_http_date_and_longer_than_the_default_backoff_is_honoured() {
+    let dir = TempDir::new().expect("temp dir");
+    // Nine seconds rather than eight: `fmt_http_date` truncates to a whole second, and the
+    // header is read back a moment after it was written, so a target picked exactly at the
+    // assertion's own bound would round down under it on an unlucky run.
+    let target = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(9));
+    let (port, _requests) = serve_a_page_that_refuses_a_fixed_number_of_times(1, Some(target));
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let started = std::time::Instant::now();
+    let output = archeion()
+        .arg("capture")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args(["--max-pages", "1", "--max-retries", "0"])
+        // Room for four times the header's own wait: backoff refuses a wait that would not
+        // fit inside the deadline, and refuses one that would spend more than a quarter of
+        // the budget on a single address, so a budget merely larger than the header asks
+        // for is still a budget the header loses against.
+        .args(["--deadline", "60s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+    let elapsed = started.elapsed();
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        elapsed >= Duration::from_millis(6_500),
+        "a nine second Retry-After HTTP-date was not honoured, took {elapsed:?}"
+    );
+
+    let owed = archive_owed(dir.path());
+    assert!(
+        owed.is_empty(),
+        "nothing is owed once waiting recovered the page: {owed:?}"
+    );
+}
+
+fn archive_owed(path: &std::path::Path) -> Vec<OwedAddress> {
+    Archive::open_existing(path)
+        .expect("the run created an archive")
+        .read_owed()
+        .expect("the owed record reads back")
+}
+
+/// A host that never stops refusing is waited out only as far as the share of the budget
+/// one address may spend allows, and the address is then owed. It is that share and not the
+/// deadline that ends the waiting here: the run gives up around the third second of a
+/// twenty second budget, with seventeen of them still unspent.
+///
+/// The request count is what pins where it stopped, and a duration alone cannot: with a
+/// twenty second budget one address may spend five, so the one and two second waits are
+/// taken, the four second wait after them is refused, and the site sees exactly three
+/// requests. A flat wait that never grew would also take two of them and reach the same
+/// clock reading, which is why the elapsed bounds below are a check on the bound rather
+/// than the whole assertion: the lower one refuses a run that gave up on the first refusal,
+/// and the upper one refuses a deadline check made after the sleep instead of before, which
+/// would take the four second wait too and land past ten.
+#[test]
+fn a_host_that_never_stops_refusing_is_bounded_by_one_address_s_share_of_the_budget() {
+    let dir = TempDir::new().expect("temp dir");
+    let (port, requests) = serve_a_page_that_refuses_a_fixed_number_of_times(u32::MAX, None);
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let started = std::time::Instant::now();
+    let output = archeion()
+        .arg("capture")
+        .arg("--json")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args(["--max-pages", "1", "--max-retries", "0"])
+        .args(["--deadline", "20s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+    let elapsed = started.elapsed();
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(
+        *requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        3,
+        "the run asked for the refusing address other than once plus the two waits its \
+         share of the budget pays for"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(2_500),
+        "the run gave up before backoff had grown past its first two waits, took {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the run waited past the share of its budget one address may spend, took {elapsed:?}"
+    );
+
+    // Backoff giving up on the one address this run had is a decision about that address,
+    // and `stopped` names the bound that ended the run. Nothing was left to fetch once the
+    // address was recorded as owed, and the deadline still had budget on it when the run
+    // ended, so `exhausted` is what actually happened; the owed record below is where the
+    // refusal is reported.
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout_of(&output)).expect("one object and nothing else");
+    assert_eq!(
+        report["stopped"], "exhausted",
+        "a run that gave up on one address named a bound that never ended it: {report}"
+    );
+
+    let owed = archive_owed(dir.path());
+    assert_eq!(
+        owed.len(),
+        1,
+        "the address waiting never resolved is owed: {owed:?}"
+    );
+    assert_eq!(
+        owed[0].reason,
+        OwedReason::Refused {
+            status: 429,
+            retry_after: None,
+        }
+    );
+}
+
+const EVERY_ROUTE_REFUSES_INDEX: &str = r#"<html><head><title>An index</title></head><body><ul>
+    <li><a href="/a.html">a</a></li>
+    <li><a href="/b.html">b</a></li>
+    <li><a href="/c.html">c</a></li>
+    </ul></body></html>"#;
+
+/// A loopback site where every route, the index included, answers 429 to its first
+/// `refusals` requests and serves afterwards. Counted per path rather than across the site,
+/// so one route's refusals never stand in for another's and a test can name what each route
+/// was asked for. `/robots.txt` answers 404 and is never counted.
+fn serve_a_site_whose_every_route_refuses_a_fixed_number_of_times(
+    refusals: u32,
+) -> (u16, Arc<Mutex<HashMap<String, u32>>>) {
+    let requests = Arc::new(Mutex::new(HashMap::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    let counted = Arc::clone(&requests);
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let requests = Arc::clone(&counted);
+            thread::spawn(move || {
+                answer_a_route_that_refuses_a_fixed_number_of_times(stream, requests, refusals)
+            });
+        }
+    });
+    (port, requests)
+}
+
+fn answer_a_route_that_refuses_a_fixed_number_of_times(
+    mut stream: TcpStream,
+    requests: Arc<Mutex<HashMap<String, u32>>>,
+    refusals: u32,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    if path == "/robots.txt" {
+        stream.write_all(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return stream.flush();
+    }
+    let attempt = {
+        let mut counts = requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seen = counts.entry(path.clone()).or_insert(0);
+        *seen += 1;
+        *seen
+    };
+    let (status, body): (&str, Vec<u8>) = if attempt <= refusals {
+        ("429 Too Many Requests", b"Too Many Requests".to_vec())
+    } else if path == "/index.html" {
+        ("200 OK", EVERY_ROUTE_REFUSES_INDEX.as_bytes().to_vec())
+    } else {
+        (
+            "200 OK",
+            format!("<html><head><title>{path}</title></head><body>a page</body></html>")
+                .into_bytes(),
+        )
+    };
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()
+}
+
+/// The "Done when" of `arch-u59` over more than one route, at the default concurrency: a
+/// site whose every route answers 429 to its first two requests and serves the third is
+/// captured whole by one run, and nothing is owed.
+///
+/// The seed refusing is what makes this more than the single-page case repeated four times.
+/// A 429 is handed up by the engine's frontier as the page it fetched, so the frontier never
+/// sees the index's markup and never queues the three links in it; the re-fetch that waits
+/// the refusal out goes around the frontier by construction, so the links reach the crawl
+/// only because `refetch_a_rate_limited_page` writes them into the same depth map a page the
+/// frontier did fetch would have filled. Without that, this site is a one page archive that
+/// reports `exhausted`, owes nothing, and never mentions the three pages it did not fetch.
+#[test]
+fn a_site_whose_every_route_refuses_twice_is_captured_whole_with_nothing_owed() {
+    let dir = TempDir::new().expect("temp dir");
+    let (port, requests) = serve_a_site_whose_every_route_refuses_a_fixed_number_of_times(2);
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let output = archeion()
+        .arg("capture")
+        .arg("--json")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args(["--max-pages", "5", "--max-depth", "1", "--max-retries", "0"])
+        .args(["--deadline", "60s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+
+    let archive = Archive::open_existing(dir.path()).expect("the run created an archive");
+    for path in ["/index.html", "/a.html", "/b.html", "/c.html"] {
+        let url = format!("http://127.0.0.1:{port}{path}");
+        let canonical = CanonicalUrl::parse(&url).expect("valid url");
+        assert!(
+            !archive
+                .list_captures(&canonical)
+                .expect("captures are listed")
+                .is_empty(),
+            "{path} was not captured, though waiting would have got it"
+        );
+    }
+    let owed = archive.read_owed().expect("the owed record reads back");
+    assert!(
+        owed.is_empty(),
+        "nothing is owed once waiting recovered every route: {owed:?}"
+    );
+
+    let asked = requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    for path in ["/index.html", "/a.html", "/b.html", "/c.html"] {
+        assert_eq!(
+            asked.get(path),
+            Some(&3),
+            "{path} was not asked for twice and then a third time: {asked:?}"
+        );
+    }
+
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout_of(&output)).expect("one object and nothing else");
+    assert_eq!(report["captures_written"], 4);
+    assert_eq!(
+        report["pages_recovered_from_rate_limit"], 4,
+        "the run archived four pages by waiting and reported some other number of them: {report}"
+    );
+    assert_eq!(
+        report["stopped"], "exhausted",
+        "a run that finished the site named something else as its bound: {report}"
+    );
+}
+
+/// A retried page is one page against `--max-pages`, not one per attempt. The site's every
+/// route refuses twice before serving, so a ceiling that counted attempts would be spent by
+/// the seed alone and the archive would hold one item; counting addresses leaves room for
+/// exactly one more.
+#[test]
+fn a_page_asked_for_three_times_spends_one_of_the_page_ceiling() {
+    let dir = TempDir::new().expect("temp dir");
+    let (port, _requests) = serve_a_site_whose_every_route_refuses_a_fixed_number_of_times(2);
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let output = archeion()
+        .arg("capture")
+        .arg("--json")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args(["--max-pages", "2", "--max-depth", "1", "--max-retries", "0"])
+        .args(["--deadline", "60s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout_of(&output)).expect("one object and nothing else");
+    assert_eq!(
+        report["captures_written"], 2,
+        "a page asked for three times was charged more than once against the ceiling: {report}"
+    );
+}
+
+const ONE_ROUTE_REFUSES_FOREVER_INDEX: &str = r#"<html><head><title>An index</title></head><body><ul>
+    <li><a href="/refusing.html">refusing</a></li>
+    <li><a href="/serving.html">serving</a></li>
+    </ul></body></html>"#;
+
+/// A site whose index and one child serve normally while the other child answers 429 with a
+/// `Retry-After` far beyond anything the run's deadline could contain.
+fn serve_a_site_with_one_route_refusing_beyond_the_deadline() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || answer_with_one_route_refusing_beyond_the_deadline(stream));
+        }
+    });
+    port
+}
+
+fn answer_with_one_route_refusing_beyond_the_deadline(
+    mut stream: TcpStream,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    let head_and_body: (String, Vec<u8>) = match path.as_str() {
+        "/robots.txt" => (
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+            Vec::new(),
+        ),
+        "/refusing.html" => {
+            let body = b"Too Many Requests".to_vec();
+            (
+                format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3600\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                ),
+                body,
+            )
+        }
+        "/index.html" => {
+            let body = ONE_ROUTE_REFUSES_FOREVER_INDEX.as_bytes().to_vec();
+            (
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                ),
+                body,
+            )
+        }
+        _ => {
+            let body =
+                b"<html><head><title>Serving</title></head><body>served</body></html>".to_vec();
+            (
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                ),
+                body,
+            )
+        }
+    };
+    stream.write_all(head_and_body.0.as_bytes())?;
+    stream.write_all(&head_and_body.1)?;
+    stream.flush()
+}
+
+/// Report honesty on the crawl path: one address whose `Retry-After` is an hour is given up
+/// on within the first second of a twenty second run, and that is a decision about one
+/// address, not about the run. The run keeps its remaining budget, captures the rest of the
+/// site, records the refused address as owed, and says `exhausted`, because the deadline did
+/// not end anything. Naming the deadline here would be naming a bound that never decided.
+#[test]
+fn an_address_given_up_on_for_want_of_budget_is_owed_without_ending_the_run() {
+    let dir = TempDir::new().expect("temp dir");
+    let port = serve_a_site_with_one_route_refusing_beyond_the_deadline();
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let output = archeion()
+        .arg("capture")
+        .arg("--json")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args(["--max-pages", "5", "--max-depth", "1", "--max-retries", "0"])
+        .args(["--deadline", "20s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout_of(&output)).expect("one object and nothing else");
+    assert_eq!(
+        report["stopped"], "exhausted",
+        "a run that spent none of its deadline blamed it anyway: {report}"
+    );
+
+    let archive = Archive::open_existing(dir.path()).expect("the run created an archive");
+    for path in ["/index.html", "/serving.html"] {
+        let url = format!("http://127.0.0.1:{port}{path}");
+        let canonical = CanonicalUrl::parse(&url).expect("valid url");
+        assert!(
+            !archive
+                .list_captures(&canonical)
+                .expect("captures are listed")
+                .is_empty(),
+            "{path} was lost to another address being given up on"
+        );
+    }
+    let owed = archive.read_owed().expect("the owed record reads back");
+    assert_eq!(owed.len(), 1, "{owed:?}");
+    assert_eq!(
+        owed[0].url,
+        format!("http://127.0.0.1:{port}/refusing.html")
+    );
+}
+
+/// How many siblings the refusing page has. Larger than the queue between the engine and
+/// this project's own drain of it, which holds four pages per unit of concurrency, so that
+/// the crowd served while the run waits out the refusal is a crowd that queue cannot hold.
+const SIBLINGS_BEHIND_A_REFUSAL: usize = 20;
+
+/// The index of that site, listing `/slow.html` first so the engine reaches the refusal
+/// while the siblings behind it are still being served.
+fn a_crowd_behind_a_refusal_index() -> String {
+    let mut index = String::from("<html><head><title>An index</title></head><body><ul>\n");
+    index.push_str("<li><a href=\"/slow.html\">slow</a></li>\n");
+    for n in 1..=SIBLINGS_BEHIND_A_REFUSAL {
+        index.push_str(&format!("<li><a href=\"/p{n}.html\">page {n}</a></li>\n"));
+    }
+    index.push_str("</ul></body></html>");
+    index
+}
+
+/// A loopback site whose index and every numbered page serve at once, while `/slow.html`
+/// answers 429 to its first `refusals` requests. `/robots.txt` answers 404 and is not counted.
+fn serve_a_site_whose_first_child_refuses_while_its_siblings_serve(
+    refusals: u32,
+) -> (u16, Arc<Mutex<HashMap<String, u32>>>) {
+    let requests = Arc::new(Mutex::new(HashMap::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    let counted = Arc::clone(&requests);
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let requests = Arc::clone(&counted);
+            thread::spawn(move || answer_a_crowd_behind_a_refusal(stream, requests, refusals));
+        }
+    });
+    (port, requests)
+}
+
+fn answer_a_crowd_behind_a_refusal(
+    mut stream: TcpStream,
+    requests: Arc<Mutex<HashMap<String, u32>>>,
+    refusals: u32,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    if path == "/robots.txt" {
+        stream.write_all(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return stream.flush();
+    }
+    let attempt = {
+        let mut counts = requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seen = counts.entry(path.clone()).or_insert(0);
+        *seen += 1;
+        *seen
+    };
+    let (status, body): (&str, Vec<u8>) = if path == "/slow.html" && attempt <= refusals {
+        ("429 Too Many Requests", b"Too Many Requests".to_vec())
+    } else if path == "/index.html" {
+        ("200 OK", a_crowd_behind_a_refusal_index().into_bytes())
+    } else {
+        (
+            "200 OK",
+            format!("<html><head><title>{path}</title></head><body>a page</body></html>")
+                .into_bytes(),
+        )
+    };
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()
+}
+
+/// Pages already in flight survive the wait a 429 costs. The wait sleeps on the thread that
+/// drains the queue between the engine and the archive, and that queue holds four pages per
+/// unit of concurrency, so a refusal met while a crowd of siblings is being served is the
+/// shape that can overflow it: an overflow is counted into `pages_dropped`, which switches
+/// lost-link recovery off and makes the run exit with an error over pages it did fetch.
+///
+/// A concurrency of two is what makes the queue small enough for this crowd to fill, and
+/// `--max-retries 0` turns off the engine's own budget so the wait under test is this
+/// project's own.
+#[test]
+fn a_crowd_of_siblings_in_flight_survives_the_wait_a_refusal_costs() {
+    let dir = TempDir::new().expect("temp dir");
+    let (port, requests) = serve_a_site_whose_first_child_refuses_while_its_siblings_serve(2);
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let output = archeion()
+        .arg("capture")
+        .arg("--json")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args([
+            "--max-pages",
+            "40",
+            "--max-depth",
+            "1",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--concurrency", "2"])
+        .args(["--deadline", "60s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout_of(&output)).expect("one object and nothing else");
+    assert_eq!(
+        report["pages_dropped"], 0,
+        "a page in flight was lost while the run waited out a refusal: {report}"
+    );
+
+    let archive = Archive::open_existing(dir.path()).expect("the run created an archive");
+    let mut expected: Vec<String> = vec!["/index.html".to_owned(), "/slow.html".to_owned()];
+    expected.extend((1..=SIBLINGS_BEHIND_A_REFUSAL).map(|n| format!("/p{n}.html")));
+    for path in &expected {
+        let url = format!("http://127.0.0.1:{port}{path}");
+        let canonical = CanonicalUrl::parse(&url).expect("valid url");
+        assert!(
+            !archive
+                .list_captures(&canonical)
+                .expect("captures are listed")
+                .is_empty(),
+            "{path} is missing from an archive that reported no drops: {report}"
+        );
+    }
+    let owed = archive.read_owed().expect("the owed record reads back");
+    assert!(owed.is_empty(), "{owed:?}");
+    let asked = requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert_eq!(
+        asked.get("/slow.html"),
+        Some(&3),
+        "the refusing page was not waited out twice and then served: {asked:?}"
+    );
+}
+
+/// A loopback site whose index answers 429 to its first `refusals` requests and then serves
+/// a page that declares an absolute `<base href>`, so every link it carries resolves against
+/// that value rather than against the index's own address. `/robots.txt` answers 404.
+fn serve_a_refusing_page_that_declares_an_absolute_base_href(
+    refusals: u32,
+    base_port: Option<u16>,
+) -> (u16, Arc<Mutex<HashMap<String, u32>>>) {
+    let requests = Arc::new(Mutex::new(HashMap::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    let counted = Arc::clone(&requests);
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let requests = Arc::clone(&counted);
+            thread::spawn(move || {
+                answer_a_refusal_then_a_declared_base(
+                    stream,
+                    requests,
+                    refusals,
+                    base_port.unwrap_or(port),
+                )
+            });
+        }
+    });
+    (port, requests)
+}
+
+fn answer_a_refusal_then_a_declared_base(
+    mut stream: TcpStream,
+    requests: Arc<Mutex<HashMap<String, u32>>>,
+    refusals: u32,
+    base_port: u16,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    if path == "/robots.txt" {
+        stream.write_all(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return stream.flush();
+    }
+    let attempt = {
+        let mut counts = requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seen = counts.entry(path.clone()).or_insert(0);
+        *seen += 1;
+        *seen
+    };
+    let (status, body): (&str, Vec<u8>) = if path == "/index.html" && attempt <= refusals {
+        ("429 Too Many Requests", b"Too Many Requests".to_vec())
+    } else if path == "/index.html" {
+        (
+            "200 OK",
+            format!(
+                r#"<html><head><title>An index</title>
+                <base href="http://127.0.0.1:{base_port}/sub/"></head>
+                <body><a href="child.html">the child</a></body></html>"#
+            )
+            .into_bytes(),
+        )
+    } else {
+        (
+            "200 OK",
+            format!("<html><head><title>{path}</title></head><body>a page</body></html>")
+                .into_bytes(),
+        )
+    };
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()
+}
+
+/// A page waited out of a 429 and then served with an absolute `<base href>` keeps its
+/// links. The re-fetch goes around the frontier, so the engine's own link-finding hook
+/// never sees the answer and this project is the only reader those links will ever have:
+/// resolving them against the page's own address would ask for `/child.html`, an address
+/// the site does not have, and leaving them out entirely would archive the index alone
+/// while the run reported `exhausted` and owed nothing.
+#[test]
+fn a_rate_limited_page_declaring_a_base_keeps_the_links_that_base_resolves() {
+    let dir = TempDir::new().expect("temp dir");
+    let (port, requests) = serve_a_refusing_page_that_declares_an_absolute_base_href(2, None);
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let output = archeion()
+        .arg("capture")
+        .arg("--json")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args(["--max-pages", "5", "--max-depth", "1", "--max-retries", "0"])
+        .args(["--deadline", "60s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout_of(&output)).expect("one object and nothing else");
+
+    let archive = Archive::open_existing(dir.path()).expect("the run created an archive");
+    let child = format!("http://127.0.0.1:{port}/sub/child.html");
+    let canonical = CanonicalUrl::parse(&child).expect("valid url");
+    assert!(
+        !archive
+            .list_captures(&canonical)
+            .expect("captures are listed")
+            .is_empty(),
+        "the link of a page recovered from a 429 was lost to its own base href: {report}"
+    );
+    let asked = requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert_eq!(
+        asked.get("/child.html"),
+        None,
+        "a link was resolved against the page's own address instead of its base: {asked:?}"
+    );
+    let owed = archive.read_owed().expect("the owed record reads back");
+    assert!(owed.is_empty(), "{owed:?}");
+    assert_eq!(
+        report["links_never_followed"].as_array().map(Vec::len),
+        Some(0)
+    );
+}
+
+/// A base naming another origin is not a base this crawl may resolve against. A port is
+/// part of an origin, and the link screen in `record_discovered_links` compares hosts, so
+/// honouring such a declaration would record addresses on a server this run never read
+/// `robots.txt` for and send recovery to fetch them. The page itself is still archived, and
+/// the other server is never asked for anything.
+#[test]
+fn a_rate_limited_page_declaring_a_base_on_another_origin_sends_no_request_there() {
+    let dir = TempDir::new().expect("temp dir");
+    let elsewhere = Arc::new(Mutex::new(0u32));
+    let elsewhere_port = serve_a_site_counting_every_request(Arc::clone(&elsewhere));
+    let (port, _requests) =
+        serve_a_refusing_page_that_declares_an_absolute_base_href(2, Some(elsewhere_port));
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let output = archeion()
+        .arg("capture")
+        .arg("--json")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args(["--max-pages", "5", "--max-depth", "1", "--max-retries", "0"])
+        .args(["--deadline", "60s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let archive = Archive::open_existing(dir.path()).expect("the run created an archive");
+    let canonical = CanonicalUrl::parse(&seed_url).expect("valid url");
+    assert!(
+        !archive
+            .list_captures(&canonical)
+            .expect("captures are listed")
+            .is_empty(),
+        "the page itself was lost along with the base it declared"
+    );
+    assert_eq!(
+        *elsewhere
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        0,
+        "one attribute on one page aimed the run at a server it never read robots.txt for"
+    );
+}
+
+/// A loopback site that counts every request it receives and serves an ordinary page, which
+/// is what a test uses to prove nothing was asked of it.
+fn serve_a_site_counting_every_request(requests: Arc<Mutex<u32>>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let requests = Arc::clone(&requests);
+            thread::spawn(move || {
+                let mut counted = requests
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *counted += 1;
+                drop(counted);
+                answer_with_an_ordinary_page(stream)
+            });
+        }
+    });
+    port
+}
+
+fn answer_with_an_ordinary_page(mut stream: TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+    let body = b"<html><head><title>Elsewhere</title></head><body>a page</body></html>".to_vec();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()
+}
+
+/// What the engine's own retry budget does with a 429, measured rather than read: the
+/// finding `docs/crawl-boundary.md` states about the layer underneath this bead's backoff.
+///
+/// `--deadline none` is what isolates it. A seed with no deadline has nothing for a bound to
+/// be measured against, so `wait_out_rate_limit` takes no wait at all and every request the
+/// site sees is the engine's own. `--max-retries 2` is the default budget written out.
+#[test]
+fn the_engine_s_own_retry_budget_asks_again_for_a_429_and_waits_between_attempts() {
+    let dir = TempDir::new().expect("temp dir");
+    let (port, requests) = serve_a_page_that_refuses_a_fixed_number_of_times(u32::MAX, None);
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let started = std::time::Instant::now();
+    let output = archeion()
+        .arg("capture")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args(["--max-pages", "1", "--max-retries", "2"])
+        .args(["--deadline", "none", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+    let elapsed = started.elapsed();
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let asked = *requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(
+        asked, 3,
+        "the engine spent its budget of two retries on the 429 and no more"
+    );
+    // The gap is what the doc sentence claims and the count alone cannot show: three
+    // requests fired back to back would land here in milliseconds. The engine's own
+    // fallback for a 429 carrying no `Retry-After` is two and a half seconds, so two waits
+    // are five; four is a floor well clear of a machine merely being slow in the other
+    // direction.
+    assert!(
+        elapsed >= Duration::from_secs(4),
+        "the engine repeated a 429 without waiting between attempts, took {elapsed:?}"
+    );
 }
 
 const ROBOTS_TXT_ALLOW_OUTRANKING_A_SHORTER_DISALLOW: &str = "User-agent: *\n\
@@ -2713,8 +3751,12 @@ fn a_refusal_with_no_retry_after_records_its_absence() {
             "1",
             "--max-retries",
             "0",
+            // Short enough that the rate limit backoff gives up well before this run would
+            // otherwise sit through several minutes of growing waits on a host that never
+            // stops refusing: this test is about what a refusal with no header records, not
+            // about how long waiting one out takes.
             "--deadline",
-            "30s",
+            "5s",
             "--allow-private-addresses",
         ])
         .output()
@@ -2810,8 +3852,11 @@ fn a_mixed_run_lists_only_the_pages_the_host_served() {
             "1",
             "--max-retries",
             "0",
+            // Short enough that `/refused`'s rate limit backoff gives up well before this run
+            // would otherwise sit through several minutes of growing waits: this test is about
+            // what `list` prints afterward, not about the wait itself.
             "--deadline",
-            "30s",
+            "5s",
             "--allow-private-addresses",
         ])
         .output()
@@ -2906,6 +3951,7 @@ fn no_progress_level_changes_a_single_byte_of_stdout() {
              pages dropped 0\n  \
              links lost    0\n  \
              recovered     0\n  \
+             waited out    0\n  \
              stopped       nothing was left to fetch\n"
         )
     );
@@ -2920,7 +3966,8 @@ fn no_progress_level_changes_a_single_byte_of_stdout() {
              \"captures_written\":2,\"items_appended\":null,\"responses_refused\":{{}},\
              \"articles_extracted\":1,\"extractions_refused\":0,\"assets_stored\":1,\
              \"assets_missed\":0,\"asset_fetches\":1,\"pages_dropped\":0,\
-             \"links_never_followed\":[],\"links_recovered\":0,\"stopped\":\"exhausted\",\
+             \"links_never_followed\":[],\"links_recovered\":0,\
+             \"pages_recovered_from_rate_limit\":0,\"stopped\":\"exhausted\",\
              \"session\":null,\"sitemap\":null,\"resume\":null,\"failed_fetches\":[],\
              \"unaddressable_pages\":[],\"pages_inside_a_network\":[],\"unreadable_pages\":[],\
              \"unreadable_articles\":[]}}\n"

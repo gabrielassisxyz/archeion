@@ -119,6 +119,7 @@ dependencies = [
  "encoding_rs",
  "htmd",
  "html-escape",
+ "httpdate",
  "jiff",
  "lol_html 3.0.1",
  "pulldown-cmark",

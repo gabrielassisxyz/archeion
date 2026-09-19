@@ -888,7 +888,24 @@ fn a_write_failure_in_the_sitemap_phase_does_not_drop_the_crawl_phases_own_owed_
     ];
     site.serve(listener, routes);
 
-    let output = capture_command(&archive_path, &site.url("/index.html"))
+    // Built directly rather than through `capture_command`, whose own baked-in `--deadline
+    // 30s` cannot be overridden by a second occurrence of the same flag: the seed page always
+    // answers 429, so at that deadline the crawl phase would now wait out the refusal for
+    // most of it before giving up, which this test has no need to sit through to prove what
+    // it is actually about.
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(site.url("/index.html"))
+        .args([
+            "--max-pages",
+            "10",
+            "--concurrency",
+            "4",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "5s", "--allow-private-addresses"])
         .args(["--from-sitemap", &site.url("/sitemap.xml")])
         .output()
         .expect("the binary runs");
@@ -905,4 +922,86 @@ fn a_write_failure_in_the_sitemap_phase_does_not_drop_the_crawl_phases_own_owed_
             .any(|address| address.url == site.url("/index.html")),
         "the crawl phase's own refusal survives a write failure in a later phase: {owed:?}"
     );
+}
+
+/// Report honesty on the sitemap path, which is where giving up on one address used to cost
+/// the most: the plain-fetch branch reads its list in order, so an address it abandons for
+/// want of budget must abandon that address and not the entries behind it. The first listed
+/// URL refuses forever and the budget is small enough that the share of it one address may
+/// spend on being waited out buys no wait at all; the two URLs after it are still asked for
+/// and archived, and the run reports one refusal rather than a deadline.
+#[test]
+fn a_listed_url_given_up_on_for_want_of_budget_does_not_cost_the_rest_of_the_list() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let (listener, site) = Site::bind();
+    let refusing = site.url("/posts/refusing");
+    let listed = vec![
+        refusing.clone(),
+        site.url("/posts/second"),
+        site.url("/posts/third"),
+    ];
+    let routes = vec![
+        route("/index.html", "text/html; charset=utf-8", LONE_PAGE),
+        route("/sitemap.xml", "application/xml", urlset(&listed)),
+        Route {
+            path: "/posts/refusing",
+            status: "429 Too Many Requests",
+            media_type: "text/plain",
+            body: "Too Many Requests".to_owned(),
+        },
+        route("/posts/second", "text/html; charset=utf-8", LONE_PAGE),
+        route("/posts/third", "text/html; charset=utf-8", LONE_PAGE),
+    ];
+    site.serve(listener, routes);
+
+    // Built directly rather than through `capture_command`, whose baked-in `--deadline 30s`
+    // a second occurrence of the flag cannot override, and short on purpose: three seconds
+    // is under four times the smallest wait backoff takes, so one address's share of the
+    // budget buys no wait at all. That is what this test needs the refusing route to do and
+    // it is also what keeps the test off the clock, since a budget that bought one wait
+    // would leave the loop guard racing the rest of the list under load.
+    let output = archeion()
+        .arg("capture")
+        .arg(&archive_path)
+        .arg(site.url("/index.html"))
+        .args([
+            "--max-pages",
+            "10",
+            "--concurrency",
+            "4",
+            "--max-retries",
+            "0",
+        ])
+        .args(["--deadline", "3s", "--allow-private-addresses"])
+        .args(["--from-sitemap", &site.url("/sitemap.xml")])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stdout_of(&output).contains("archived 3 capture(s)"),
+        "one address given up on took the rest of the list with it: {}",
+        stdout_of(&output)
+    );
+    assert!(
+        stdout_of(&output).contains("stopped       nothing was left to fetch"),
+        "a phase that read its whole list named a bound that never decided: {}",
+        stdout_of(&output)
+    );
+
+    let archive = Archive::open_existing(&archive_path).expect("the archive exists");
+    for path in ["/posts/second", "/posts/third"] {
+        let url = CanonicalUrl::parse(&site.url(path)).expect("valid url");
+        assert!(
+            !archive
+                .list_captures(&url)
+                .expect("captures are listed")
+                .is_empty(),
+            "{path} was never asked for, though the run still had budget for it"
+        );
+    }
+    let owed = archive.read_owed().expect("the owed record reads back");
+    assert_eq!(owed.len(), 1, "{owed:?}");
+    assert_eq!(owed[0].url, refusing);
 }

@@ -37,8 +37,8 @@ use spider::website::{OnLinkFindCallback, Website};
 use url::Url;
 
 use super::boundary::{
-    CrawlEngine, CrawlError, CrawlOutcome, CrawlStop, FetchFailure, PageEvent, PageResponse, Seed,
-    is_internal_host,
+    CrawlEngine, CrawlError, CrawlOutcome, CrawlStop, FetchFailure, PageEvent, PageResponse,
+    RateLimitMemory, Seed, is_internal_host, wait_out_rate_limit,
 };
 use super::robots::{Group, RobotRules, Rule};
 use crate::storage::Header;
@@ -112,6 +112,12 @@ type CachedForOrigin = (String, Website, Option<Vec<RawRuleLine>>);
 #[derive(Default)]
 pub struct SpiderEngine {
     reused: Mutex<Option<CachedForOrigin>>,
+    /// What every crawl this engine drives has learned about the servers that answered it
+    /// 429, shared across all of them rather than begun again with each. One run builds one
+    /// engine, and a resume turns one run into a sub-crawl per owed address: a memory scoped
+    /// to a crawl would be no memory at all on exactly the path that needs one. See
+    /// `RateLimitMemory`.
+    rate_limits: Mutex<RateLimitMemory>,
 }
 
 impl SpiderEngine {
@@ -170,13 +176,19 @@ impl CrawlEngine for SpiderEngine {
         let start = usable_seed_url(seed)?;
         let runtime = Runtime::new().map_err(|source| CrawlError::EngineUnavailable { source })?;
         let (mut website, mut raw_lines_cache) = self.cached_for(&start);
+        let mut rate_limits = self
+            .rate_limits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let outcome = runtime.block_on(crawl_seed(
             &start,
             seed,
             &mut website,
             &mut raw_lines_cache,
+            &mut rate_limits,
             on_page,
         ));
+        drop(rate_limits);
         self.keep(&start, website, raw_lines_cache);
         Ok(outcome)
     }
@@ -321,6 +333,7 @@ async fn crawl_seed(
     seed: &Seed,
     website: &mut Website,
     raw_lines_cache: &mut Option<Vec<RawRuleLine>>,
+    rate_limit_state: &mut RateLimitMemory,
     on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
 ) -> CrawlOutcome {
     // The same clock `seed.deadline` counts from, read once here rather than let recovery
@@ -336,6 +349,12 @@ async fn crawl_seed(
     let depths: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     configure_for_seed(website, start, seed, Arc::clone(&depths));
     let robots = robots_rules(website, raw_lines_cache, user_agent_of(seed)).await;
+    // The larger of the two, never the site's alone: `robots_rules` above already overwrote
+    // `website`'s own delay with the site's `Crawl-delay` whenever one was declared. Read
+    // once here, ahead of the crawl itself, so a 429 met on the very first page backs off no
+    // faster than the pace this run is already honouring on every other request; recovery
+    // below reuses this same value rather than asking `website` for its delay a second time.
+    let effective_delay = seed.delay.max(website.get_delay());
     // The engine fetches while the caller writes to disk, so the queue between them has to
     // absorb the difference. Sizing it to the fetch concurrency alone drops pages the
     // moment a write is slower than a fetch; sizing it to the page limit would hold a
@@ -348,12 +367,53 @@ async fn crawl_seed(
     // dropped in its own frontier apart from one this adapter never promised to follow.
     let mut fetched: HashSet<String> = HashSet::new();
     let scheme = frontier_scheme(start);
+    // What the run, not this crawl, has learned about the servers that have answered it 429:
+    // the engine hands the same memory to every crawl it drives. Recovery below shares it
+    // too rather than starting a count of its own, for the same reason at a smaller scale: a
+    // server still refusing when the crawl ended is the server recovery is about to ask, and
+    // a fresh counter there would answer it at the pace the crawl already outgrew.
+    let mut pages_recovered_from_rate_limit = 0usize;
+    // Both read here rather than after the crawl, because the backoff re-fetch below needs
+    // them while the crawl is still running and recovery needs the same two values once it
+    // has finished. Nothing between the two points changes either: `configure_for_seed` and
+    // `robots_rules` above are the last things to touch the website's own configuration.
+    let seed_host = Url::parse(start)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned));
+    let selectors = website.setup_selectors();
     // Named apart from the caller's own `on_page`, and not a shadow of it, because
     // `recover_lost_links` below needs a second closure built the same way once this one's
     // own borrow of `fetched` has ended; a shadow could not be told apart from the
     // parameter it wraps once this scope needed to build another.
-    let mut filtered_on_page =
-        |event: PageEvent| filter_and_forward(event, &robots, &mut fetched, &scheme, on_page);
+    //
+    // Backoff is applied here and not inside `filter_and_forward`, because recovery reaches
+    // `filter_and_forward` too and applies backoff at its own point, after its own retry
+    // budget rather than after the engine's: putting it in the shared path would wait out a
+    // 429 twice for one address.
+    let mut filtered_on_page = |event: PageEvent| {
+        forward_after_rate_limit_backoff(
+            event,
+            &robots,
+            &mut fetched,
+            &scheme,
+            seed,
+            seed_started,
+            effective_delay,
+            rate_limit_state,
+            &mut pages_recovered_from_rate_limit,
+            |url| {
+                refetch_a_rate_limited_page(
+                    url,
+                    seed,
+                    &selectors,
+                    seed_host.as_deref(),
+                    &scheme,
+                    &depths,
+                )
+            },
+            on_page,
+        )
+    };
 
     // Scoped so the borrow of the website ends with the crawl it was driving.
     let mut stopped = {
@@ -455,15 +515,10 @@ async fn crawl_seed(
         // own count starting over from zero: a run that spent eight of its ten pages
         // before the frontier lost anything has two left for recovery, not ten.
         let already_fetched = fetched.len();
-        let seed_host = Url::parse(start)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_owned));
-        let selectors = website.setup_selectors();
-        // The larger of the two, never the site's alone: `robots_rules` already overwrote
-        // `website`'s own delay with the site's `Crawl-delay` whenever one was declared,
-        // which on a site asking for less than `--delay` would otherwise let recovery run
-        // faster than the crawl itself just did.
-        let effective_delay = seed.delay.max(website.get_delay());
+        // Computed once, above, right after `robots_rules` overwrote `website`'s own delay
+        // with the site's `Crawl-delay` whenever one was declared: the same value the crawl
+        // itself already paced against, reused here rather than read from `website` a second
+        // time, since nothing between there and here changes what it should be.
 
         // `filtered_on_page`'s own borrow of `fetched` ended with its last use above, so a
         // second closure built the same way, over the same `robots`, `fetched` and
@@ -481,6 +536,8 @@ async fn crawl_seed(
             effective_delay,
             &depths,
             &robots,
+            rate_limit_state,
+            &mut pages_recovered_from_rate_limit,
             &mut recovery_on_page,
         );
         outcome.links_recovered = links_recovered;
@@ -491,6 +548,7 @@ async fn crawl_seed(
             RecoveryStop::CallerStopped => CrawlStop::CallerStopped,
         };
     }
+    outcome.pages_recovered_from_rate_limit = pages_recovered_from_rate_limit;
     outcome
 }
 
@@ -527,11 +585,115 @@ fn filter_and_forward(
     scheme: &str,
     on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
 ) -> ControlFlow<()> {
-    if !robots.allows(requested_url_of(&event)) {
+    if !admitted(&event, robots, fetched, scheme) {
         return ControlFlow::Continue(());
     }
-    fetched.insert(depth_key(requested_url_of(&event), scheme));
     on_page(event)
+}
+
+/// Whether a page event is this project's own decision to deliver at all, and marks it
+/// fetched if so. Shared by the crawl's own forwarding and by recovery's: a page this
+/// project's robots decision refuses is not delivered by either door, and `fetched` never
+/// gains an entry for one either way.
+fn admitted(
+    event: &PageEvent,
+    robots: &RobotRules,
+    fetched: &mut HashSet<String>,
+    scheme: &str,
+) -> bool {
+    if !robots.allows(requested_url_of(event)) {
+        return false;
+    }
+    fetched.insert(depth_key(requested_url_of(event), scheme));
+    true
+}
+
+/// What `filter_and_forward` is for the ordinary crawl path, with one further step between
+/// admission and delivery: a page a host answered 429 is not handed over yet, it is waited
+/// out and asked for again first. Recovery does not go through this one, and not because it
+/// is exempt: it waits a 429 out at its own point inside `recover_lost_links`, after its own
+/// retry budget rather than after the engine's, so routing it through here as well would
+/// wait the same address out twice.
+#[allow(clippy::too_many_arguments)]
+fn forward_after_rate_limit_backoff(
+    event: PageEvent,
+    robots: &RobotRules,
+    fetched: &mut HashSet<String>,
+    scheme: &str,
+    seed: &Seed,
+    seed_started: Instant,
+    effective_delay: Duration,
+    rate_limit_state: &mut RateLimitMemory,
+    pages_recovered_from_rate_limit: &mut usize,
+    fetch_again: impl FnMut(&str) -> PageEvent,
+    on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
+) -> ControlFlow<()> {
+    if !admitted(&event, robots, fetched, scheme) {
+        return ControlFlow::Continue(());
+    }
+    let event = wait_out_rate_limit(
+        event,
+        seed.deadline,
+        seed_started,
+        effective_delay,
+        rate_limit_state,
+        pages_recovered_from_rate_limit,
+        fetch_again,
+    );
+    on_page(event)
+}
+
+/// Asks a rate-limited address again, once `wait_out_rate_limit` has waited out the refusal,
+/// and folds whatever the answer links to into the crawl's own depth bookkeeping.
+///
+/// The re-fetch has to go around the frontier, which already handed this address up as
+/// refused and will not ask for it a second time, and going around it is what would
+/// otherwise lose the page's own links: the engine's `on_link_find_callback` never sees a
+/// response this adapter fetched itself, so nothing records what the page names and the
+/// crawl ends believing the page was a leaf. Writing those links into `depths` here puts
+/// them exactly where a page the frontier did fetch would have put them, which is what makes
+/// `links_discovered_but_never_fetched` notice them and `recover_lost_links` go and get
+/// them, inside the same `--max-pages`, deadline, delay and robots decision every other
+/// address of this run is inside. A publication that answers 429 on its first page is
+/// therefore captured whole by one slower run rather than reduced to that one page.
+///
+/// A page the site answered with a failure is left out of the bookkeeping entirely: what it
+/// names is an error document's links, not the site's.
+fn refetch_a_rate_limited_page(
+    url: &str,
+    seed: &Seed,
+    selectors: &RelativeSelectors,
+    seed_host: Option<&str>,
+    seed_scheme: &str,
+    depths: &Mutex<HashMap<String, usize>>,
+) -> PageEvent {
+    let (event, link_base, page_links) = fetch_recovered_page(url, seed, selectors);
+    if !matches!(&event, PageEvent::Response(page) if page.status < 400) {
+        return event;
+    }
+    let mut discovered = depths
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // An address the crawl reached but nothing linked to is the seed, which is zero hops
+    // out; every other page arrives here already placed by `hop_depth_guard`.
+    let depth = discovered
+        .get(&depth_key(url, seed_scheme))
+        .copied()
+        .unwrap_or(0);
+    if depth >= seed.max_depth {
+        return event;
+    }
+    record_discovered_links(
+        url,
+        &link_base,
+        page_links.as_deref(),
+        seed_host,
+        seed_scheme,
+        depth,
+        &mut discovered,
+        None,
+    );
+    event
 }
 
 /// Whether a status is worth asking again, the same three shapes `configure_for_seed`'s own
@@ -579,8 +741,10 @@ fn is_retryable_status(status: u16) -> bool {
 ///
 /// A response the site sent is delivered like any other, archived and counted, because a
 /// capture is what the server answered; a status of 400 or higher is retried up to the
-/// seed's own retry budget and, if it is still refusing past that budget, does not count as
-/// having recovered the link. A page nothing answered is delivered as the failure it is and
+/// seed's own retry budget, a 429 still standing past that budget is waited out by
+/// `wait_out_rate_limit` on the crawl's own per-host counter exactly as the crawl path waits
+/// one out past the engine's budget, and an address still refusing after both does not count
+/// as having recovered the link. A page nothing answered is delivered as the failure it is and
 /// does not count either. Only a status under 400 clears a URL from what this returns.
 ///
 /// What comes back is the URLs still missing once the attempt is over, how many were
@@ -603,6 +767,8 @@ fn recover_lost_links(
     effective_delay: Duration,
     depths: &Mutex<HashMap<String, usize>>,
     robots: &RobotRules,
+    rate_limit_state: &mut RateLimitMemory,
+    pages_recovered_from_rate_limit: &mut usize,
     on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
 ) -> (Vec<String>, usize, RecoveryStop) {
     let mut seen: HashSet<String> = initial.iter().map(|(url, _)| url.clone()).collect();
@@ -636,7 +802,7 @@ fn recover_lost_links(
         }
 
         let mut attempts = 0u8;
-        let (event, has_absolute_base_href, page_links) = loop {
+        let (event, mut link_base, mut page_links) = loop {
             let attempt = fetch_recovered_page(&url, seed, selectors);
             let should_retry = matches!(
                 &attempt.0,
@@ -651,6 +817,30 @@ fn recover_lost_links(
             }
         };
 
+        // A 429 still standing once the loop above has spent the seed's retry budget is the
+        // same refusal the crawl path hands to backoff once the engine has spent the same
+        // budget, and it gets the same answer here. The counter is the crawl's own, so a
+        // host that was already refusing during the crawl keeps the wait it had grown rather
+        // than starting over the moment the address is reached by this door instead.
+        let mut links_of_the_last_attempt = None;
+        let event = wait_out_rate_limit(
+            event,
+            seed.deadline,
+            seed_started,
+            effective_delay,
+            rate_limit_state,
+            pages_recovered_from_rate_limit,
+            |url| {
+                let (attempt, base, links) = fetch_recovered_page(url, seed, selectors);
+                links_of_the_last_attempt = Some((base, links));
+                attempt
+            },
+        );
+        if let Some((base, links)) = links_of_the_last_attempt {
+            link_base = base;
+            page_links = links;
+        }
+
         let recovered = matches!(&event, PageEvent::Response(response) if response.status < 400);
         if recovered {
             total_fetched += 1;
@@ -661,7 +851,7 @@ fn recover_lost_links(
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let children = record_discovered_links(
                     &url,
-                    has_absolute_base_href,
+                    &link_base,
                     page_links.as_deref(),
                     seed_host,
                     seed_scheme,
@@ -695,14 +885,13 @@ fn recover_lost_links(
 /// page, so a page `recover_lost_links` reaches directly is not a dead end for the links it
 /// names.
 ///
-/// `base` is always `None`: the vendored `Page::base` field, which the engine's own crawl
-/// loop reads to resolve against an absolute `<base href>`, is private to that crate and
-/// unreachable from here. `None` is also what the overwhelming majority of pages, which
-/// declare no `<base>` at all, already resolve against during an ordinary crawl, and the
-/// one page shape it is not is excluded before this project ever reads `page.page_links`
-/// at all: `page_declares_an_absolute_base_href` is computed straight off the response
-/// body, independently of whatever `Page::links` resolved its own return value against,
-/// which is discarded here and never read.
+/// The `base` handed to `Page::links` is always `None`: the vendored `Page::base` field,
+/// which the engine's own crawl loop reads to resolve against an absolute `<base href>`, is
+/// private to that crate and unreachable from here. That costs nothing, because whatever
+/// `Page::links` resolved its own return value against is discarded here and never read:
+/// the hrefs this hands back are the ones the page wrote, and the base they are resolved
+/// against is decided by the caller, out of the `<base href>` this reads off the response
+/// body itself.
 ///
 /// A runtime, a `Website` and a client of its own, one per call, exactly like `fetch_one_url`
 /// beside it: neither reuses a connection across candidates. That is free at the one lost
@@ -718,7 +907,7 @@ fn fetch_recovered_page(
     selectors: &RelativeSelectors,
 ) -> (
     PageEvent,
-    bool,
+    LinkBase,
     Option<Box<PageLinkSet<CaseInsensitiveString>>>,
 ) {
     std::thread::scope(|threads| {
@@ -732,7 +921,7 @@ fn fetch_recovered_page(
                     url: url.to_owned(),
                     reason: "the crawl engine panicked while fetching".to_owned(),
                 }),
-                false,
+                LinkBase::PageUrl,
                 None,
             ),
         }
@@ -745,7 +934,7 @@ fn fetch_recovered_page_on_this_thread(
     selectors: &RelativeSelectors,
 ) -> (
     PageEvent,
-    bool,
+    LinkBase,
     Option<Box<PageLinkSet<CaseInsensitiveString>>>,
 ) {
     let runtime = match Builder::new_current_thread().enable_all().build() {
@@ -756,7 +945,7 @@ fn fetch_recovered_page_on_this_thread(
                     url: url.to_owned(),
                     reason: format!("the crawl engine could not be started: {source}"),
                 }),
-                false,
+                LinkBase::PageUrl,
                 None,
             );
         }
@@ -772,9 +961,9 @@ fn fetch_recovered_page_on_this_thread(
         // directly has nothing to seed it, so this is that seeding's one other call site.
         page.page_links = Some(Default::default());
         let _ = page.links(selectors, &None).await;
-        let has_absolute_base_href = page_declares_an_absolute_base_href(&page);
+        let link_base = link_base_of(url, absolute_base_href_of(&page));
         let page_links = page.page_links.clone();
-        (page_event(page), has_absolute_base_href, page_links)
+        (page_event(page), link_base, page_links)
     })
 }
 async fn robots_rules(
@@ -1289,12 +1478,21 @@ fn hop_depth_guard(
             // chance to spend this crawl's memory on addresses the crawl will never visit.
             return false;
         }
+        // The frontier has already resolved this page's links against that base and queued
+        // them itself, so a second resolution here could only disagree with the one the
+        // engine actually requested, and a disagreement is reported as a link the crawl
+        // lost. Leaving the page out of the map costs nothing the frontier is not already
+        // carrying: see `absolute_base_href_of` for why the page fetched directly is the
+        // opposite case.
+        if absolute_base_href_of(page).is_some() {
+            return true;
+        }
         let mut corrections_guard = corrections
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         record_discovered_links(
             page.get_url(),
-            page_declares_an_absolute_base_href(page),
+            &LinkBase::PageUrl,
             page.page_links.as_deref(),
             seed_host.as_deref(),
             &seed_scheme,
@@ -1304,6 +1502,26 @@ fn hop_depth_guard(
         );
         true
     }
+}
+
+/// What a fetched page's own links resolve against, which is not always the page's address
+/// and is not always knowable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinkBase {
+    /// The page's own URL, which is what every page that declares no `<base href>` resolves
+    /// against, and what the engine's own frontier resolves such a page's links against too.
+    PageUrl,
+    /// An absolute `<base href>` the page declared, honoured. Only a page this project
+    /// fetched directly gets this: nothing else has read that page's links, so this
+    /// resolution is the only account of them there will ever be.
+    Declared(Url),
+    /// A base that exists and must not be used. Either the frontier has already resolved
+    /// the page's links its own way, so a second answer here could only disagree with the
+    /// request that actually went out, or the declaration points at another origin, whose
+    /// `robots.txt` this run never read and whose addresses are outside the crawl. Only the
+    /// links that spell out their own absolute address are recorded, since those do not
+    /// depend on any base.
+    Unusable,
 }
 
 /// Records, into `depths`, every same-host in-scope link a fetched page discovered, one hop
@@ -1323,7 +1541,7 @@ fn hop_depth_guard(
 #[allow(clippy::too_many_arguments)]
 fn record_discovered_links(
     page_url: &str,
-    has_absolute_base_href: bool,
+    link_base: &LinkBase,
     page_links: Option<&PageLinkSet<CaseInsensitiveString>>,
     seed_host: Option<&str>,
     seed_scheme: &str,
@@ -1332,26 +1550,31 @@ fn record_discovered_links(
     mut corrections: Option<&mut HashMap<String, String>>,
 ) -> Vec<String> {
     let mut discovered = Vec::new();
-    // A page that declares an absolute `<base href>` resolves every one of its links
-    // against that value rather than against its own URL, and this has no way to resolve
-    // against the same base without reimplementing the engine's own rule for it. Leaving
-    // this page's links out of the map entirely is cheaper than reporting an address the
-    // site never had as one the crawl lost: see `page_declares_an_absolute_base_href` for
-    // why that is the trade being made.
-    if has_absolute_base_href {
-        return discovered;
-    }
     // `page_links` holds hrefs as the page wrote them, which is relative as often as not,
     // while every page later arrives here identified by its absolute URL: without resolving
-    // against this page's own address first, a relative link never matches the key its own
-    // fetch looks it up under.
-    let Some(base) = Url::parse(page_url).ok() else {
-        return discovered;
+    // against a base first, a relative link never matches the key its own fetch looks it up
+    // under. That base is the page's own address, unless the page declared an absolute
+    // `<base href>` and the caller is one that read it: a page's own declaration is what
+    // every link on it resolves against, and a caller that hands it over here is one whose
+    // page nothing else resolved links for.
+    //
+    // An unusable base still leaves the links that name their own absolute address: those
+    // resolve the same against any base, so the page's own URL stands in for it and only
+    // the hrefs that would have needed the base are skipped.
+    let (base, absolute_hrefs_only) = match link_base {
+        LinkBase::Declared(declared) => (declared.clone(), false),
+        LinkBase::PageUrl | LinkBase::Unusable => match Url::parse(page_url) {
+            Ok(parsed) => (parsed, *link_base == LinkBase::Unusable),
+            Err(_) => return discovered,
+        },
     };
     let Some(links) = page_links else {
         return discovered;
     };
     for link in links.iter() {
+        if absolute_hrefs_only && Url::parse(link.as_ref()).is_err() {
+            continue;
+        }
         let Some(resolved) = base.join(link.as_ref()).ok() else {
             continue;
         };
@@ -1486,21 +1709,23 @@ fn frontier_scheme(seed_url: &str) -> String {
 /// metadata scan.
 const MAX_BASE_HREF_SCAN_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 
-/// Whether a page declared a `<base href>` that parses as an absolute URL, which is exactly
+/// The `<base href>` a page declared, when it parses as an absolute URL, which is exactly
 /// the condition under which the engine's own base-href handler fires and switches every
 /// later link on the page to resolve against that value instead of the page's own address.
 /// A relative value, `<base href="/">` included, never parses as absolute and is inert on
 /// both sides, so it is not a case this has to detect.
 ///
-/// `hop_depth_guard` resolves a page's links against the page's own URL, and has no way to
-/// resolve against the engine's base without reimplementing the engine's own rule for it. A
-/// page this reports true for has its links left out of the depth map entirely rather than
-/// recorded under the wrong resolution: a link this project can no longer place is read as
-/// one hop from the seed the same way a page this cannot place already is, which is the
-/// direction this whole guard already fails open in, and it costs far less than reporting an
-/// address the site never had as one the crawl lost.
-fn page_declares_an_absolute_base_href(page: &Page) -> bool {
-    let mut found = false;
+/// The two callers do opposite things with the answer, and the difference is whether there
+/// is an engine resolution to disagree with. `hop_depth_guard` runs over a page the engine
+/// fetched and queued links out of itself, and resolving those links here against this base
+/// would be this project's second answer to a question the frontier has already answered its
+/// own way; a disagreement between the two is reported as a link the crawl lost, so that
+/// page's links are left out of the depth map entirely. A page fetched directly, by the
+/// rate-limit re-fetch or by recovery, went nowhere near the frontier: nothing else has read
+/// its links, so resolving them against the base the page itself declared is the only
+/// account of them there will ever be, and leaving it out is a link silently lost.
+fn absolute_base_href_of(page: &Page) -> Option<Url> {
+    let mut found: Option<Url> = None;
     let mut rewriter = HtmlRewriter::new(
         Settings::new()
             .with_memory_settings(
@@ -1509,10 +1734,10 @@ fn page_declares_an_absolute_base_href(page: &Page) -> bool {
             )
             .with_strict(false)
             .append_element_content_handler(element!("base[href]", |el| {
-                if !found {
+                if found.is_none() {
                     found = el
                         .get_attribute("href")
-                        .is_some_and(|href| Url::parse(&href).is_ok());
+                        .and_then(|href| Url::parse(&href).ok());
                 }
                 Ok(())
             })),
@@ -1523,6 +1748,26 @@ fn page_declares_an_absolute_base_href(page: &Page) -> bool {
     let _ = rewriter.write(page.get_html_bytes_u8());
     let _ = rewriter.end();
     found
+}
+
+/// What the links of a page this project fetched directly resolve against, given whatever
+/// `<base href>` the page declared.
+///
+/// A declaration naming another origin is refused rather than honoured. Its links belong to
+/// a server this run never read `robots.txt` for and never pointed itself at, and recording
+/// them would turn one attribute on one page into requests aimed somewhere no other door of
+/// this crawl can go: `record_discovered_links` screens a link by host alone, so a base on
+/// the seed's own host under another port or scheme would pass that screen while being a
+/// different server under RFC 9309. One page's `<base>` moving every link on it at once is
+/// what makes this worth refusing outright rather than filtering link by link.
+fn link_base_of(page_url: &str, declared: Option<Url>) -> LinkBase {
+    let Some(declared) = declared else {
+        return LinkBase::PageUrl;
+    };
+    match Url::parse(page_url) {
+        Ok(page) if page.origin() == declared.origin() => LinkBase::Declared(declared),
+        _ => LinkBase::Unusable,
+    }
 }
 
 /// The URL a page event is filed under before any redirect, which is the spelling
@@ -2528,7 +2773,10 @@ mod tests {
         let page = page_with_html(
             r#"<html><head><base href="https://example.com/"></head><body></body></html>"#,
         );
-        assert!(page_declares_an_absolute_base_href(&page));
+        assert_eq!(
+            absolute_base_href_of(&page),
+            Url::parse("https://example.com/").ok()
+        );
     }
 
     /// A relative value never parses as absolute, so it never fires the engine's handler
@@ -2536,13 +2784,84 @@ mod tests {
     #[test]
     fn a_relative_base_href_is_not_mistaken_for_an_absolute_one() {
         let page = page_with_html(r#"<html><head><base href="/"></head><body></body></html>"#);
-        assert!(!page_declares_an_absolute_base_href(&page));
+        assert_eq!(absolute_base_href_of(&page), None);
+    }
+
+    /// A declaration on the page's own origin is the case this exists to honour: the links
+    /// of a page fetched outside the frontier resolve against it and nothing else has read
+    /// them.
+    #[test]
+    fn a_base_on_the_page_s_own_origin_is_the_base_its_links_resolve_against() {
+        let declared = Url::parse("https://example.com/sub/").expect("valid url");
+        assert_eq!(
+            link_base_of("https://example.com/index.html", Some(declared.clone())),
+            LinkBase::Declared(declared)
+        );
+    }
+
+    /// A port is part of an origin, and `record_discovered_links` screens a link by host
+    /// alone: honouring a base on another port would record addresses on a server this run
+    /// never read `robots.txt` for, and recovery would then ask that server for them.
+    #[test]
+    fn a_base_on_another_port_of_the_same_host_is_not_a_base_this_crawl_may_use() {
+        assert_eq!(
+            link_base_of(
+                "https://example.com/index.html",
+                Url::parse("https://example.com:8080/sub/").ok()
+            ),
+            LinkBase::Unusable
+        );
+        assert_eq!(
+            link_base_of(
+                "https://example.com/index.html",
+                Url::parse("https://elsewhere.example/").ok()
+            ),
+            LinkBase::Unusable
+        );
+    }
+
+    /// A base this crawl may not use says nothing about a link that names its own absolute
+    /// address: that link resolves the same against any base, so it is recorded like any
+    /// other, and only the links that would have needed the base are left out. Dropping
+    /// them all is how a page declaring a base on a content network lost every same-origin
+    /// article it linked to, with nothing recorded as owed or unfollowed.
+    #[test]
+    fn an_unusable_base_still_records_the_links_that_name_their_own_address() {
+        let mut links = PageLinkSet::new();
+        links.insert(CaseInsensitiveString::from("https://example.com/article"));
+        links.insert(CaseInsensitiveString::from("relative-needs-the-base"));
+        links.insert(CaseInsensitiveString::from(
+            "https://elsewhere.example/off-host",
+        ));
+        let mut depths = HashMap::new();
+
+        let discovered = record_discovered_links(
+            "https://example.com/index.html",
+            &LinkBase::Unusable,
+            Some(&links),
+            Some("example.com"),
+            "https",
+            0,
+            &mut depths,
+            None,
+        );
+
+        assert_eq!(discovered, vec!["https://example.com/article".to_owned()]);
+        assert_eq!(depths.len(), 1, "{depths:?}");
+    }
+
+    #[test]
+    fn a_page_that_declares_nothing_resolves_its_links_against_its_own_address() {
+        assert_eq!(
+            link_base_of("https://example.com/index.html", None),
+            LinkBase::PageUrl
+        );
     }
 
     #[test]
     fn a_page_with_no_base_element_at_all_is_not_flagged() {
         let page = page_with_html("<html><head></head><body><a href=\"/a\">a</a></body></html>");
-        assert!(!page_declares_an_absolute_base_href(&page));
+        assert_eq!(absolute_base_href_of(&page), None);
     }
 
     /// What makes combining groups reachable rather than theoretical: the parse this project
@@ -2791,6 +3110,8 @@ mod tests {
             Duration::ZERO,
             &depths,
             &robots,
+            &mut RateLimitMemory::default(),
+            &mut 0,
             &mut |_event| ControlFlow::Break(()),
         );
 

@@ -25,6 +25,11 @@ htmd = "0.5"
 # readability's own output. Already reachable through dom_smoothie, so this only names a
 # transitive dependency directly rather than adding a new one.
 html-escape = "0.2"
+# Parses the HTTP-date form of a `Retry-After` header. Already reachable through `spider`'s
+# own `reqwest` dependency, which uses it for the same header on its own retry path; named
+# directly here rather than hand-rolling a second parser for a format this project also has
+# to read, from the other side of the same header.
+httpdate = "1.0.3"
 jiff = { version = "0.2.35", default-features = false, features = ["std", "serde"] }
 # A streaming rewriter rather than a DOM, used here only to read. Everything metadata
 # extraction looks at is a tag and an attribute, and a page arriving from the open web is

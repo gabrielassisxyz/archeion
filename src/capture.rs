@@ -13,8 +13,8 @@ use url::Url;
 use crate::assets::{AssetCapture, CapturedAssets};
 use crate::canonical_url::{CanonicalUrl, InvalidCanonicalUrl};
 use crate::crawl::{
-    CrawlEngine, CrawlError, CrawlStop, FetchFailure, PageEvent, PageResponse, Seed,
-    points_inside_a_network,
+    CrawlEngine, CrawlError, CrawlStop, FetchFailure, PageEvent, PageResponse, RateLimitMemory,
+    Seed, points_inside_a_network, wait_out_rate_limit,
 };
 use crate::metadata::{self, PageMetadata, PageSource, ReferencedAsset, UnreadablePage};
 use crate::readability::{self, Extraction, SiteRules, UnreadableArticle};
@@ -244,6 +244,11 @@ pub struct CaptureRun {
     /// engine. Counted rather than listed: a recovered link is an ordinary capture the
     /// moment it lands, so `list` already names it.
     pub links_recovered: usize,
+    /// Pages a host answered 429 that were archived anyway, once waiting for it stopped
+    /// being refused. Counted rather than listed, on the same reasoning as `links_recovered`
+    /// above: once one is archived it is an ordinary capture like any other, and it is not
+    /// owed.
+    pub pages_recovered_from_rate_limit: usize,
     /// Subresources stored beside the captures of this run.
     pub assets_stored: usize,
     /// Subresources a page referenced and its capture does not hold. Each one is in the
@@ -287,7 +292,9 @@ impl CaptureRun {
         self.extractions_refused += other.extractions_refused;
         self.unreadable_articles.extend(other.unreadable_articles);
         self.pages_dropped += other.pages_dropped;
+        self.links_never_followed.extend(other.links_never_followed);
         self.links_recovered += other.links_recovered;
+        self.pages_recovered_from_rate_limit += other.pages_recovered_from_rate_limit;
         self.assets_stored += other.assets_stored;
         self.assets_missed += other.assets_missed;
         self.asset_fetches += other.asset_fetches;
@@ -365,6 +372,7 @@ pub fn capture_seed_reporting(
     run.pages_dropped = outcome.pages_dropped;
     run.links_never_followed = outcome.links_never_followed;
     run.links_recovered = outcome.links_recovered;
+    run.pages_recovered_from_rate_limit = outcome.pages_recovered_from_rate_limit;
     run.asset_fetches = assets.fetches();
     // The engine reports that its caller stopped it. This is that caller, and it knows why.
     run.stopped = if engine_overran {
@@ -511,6 +519,13 @@ pub fn capture_sitemap_reporting(
     let mut reporter = PageReporter::new(progress, so_far.pages_written);
 
     let mut asked_the_host_for_something = false;
+    // Scoped to this phase rather than shared with the ordinary crawl: a listed URL fetched
+    // here never goes through a crawl's own frontier, so nothing upstream has already waited
+    // out a 429 against it the way `crawl_seed` does for the `follow_links` branch below. The
+    // floor is `--delay` alone, not the larger of it and a site's `Crawl-delay`, on the same
+    // limit `docs/crawl-boundary.md` already states for this phase: nothing outside a crawl
+    // reads `robots.txt` at all, so there is no `Crawl-delay` here to be larger than.
+    let mut rate_limit_state = RateLimitMemory::default();
 
     for url in urls {
         if let Some(bound) = bound_reached(seed, so_far.pages_written_including(&run), started) {
@@ -592,6 +607,20 @@ pub fn capture_sitemap_reporting(
                 }
             };
             run.pages_dropped += outcome.pages_dropped;
+            // Counted here as well as on the ordinary crawl path: a sub-crawl waits a 429
+            // out exactly as a crawl does, and a page it recovered that way is an archived
+            // page this phase would otherwise report nothing about.
+            run.pages_recovered_from_rate_limit += outcome.pages_recovered_from_rate_limit;
+            // A sub-crawl discovers links and can lose them exactly as the seed's own crawl
+            // does, and what it reports about them is this run's to report. Dropped here,
+            // the phase printed `links lost 0` over a link it had been told about, which is
+            // a run exiting zero while a link it discovered went unfetched. A page the crawl
+            // waited out of a 429 makes that reachable rather than theoretical: its links are
+            // written into the crawl's own bookkeeping by this project rather than by the
+            // frontier, so a sub-crawl that never had a link to lose before can have one now.
+            run.links_never_followed
+                .extend(outcome.links_never_followed);
+            run.links_recovered += outcome.links_recovered;
             if write_failure.is_some() {
                 break;
             }
@@ -600,7 +629,20 @@ pub fn capture_sitemap_reporting(
                 break;
             }
         } else {
-            let event = engine.fetch(url, seed);
+            // Backoff giving up on one listed URL, because a further wait would not fit
+            // what is left of the budget, ends that URL and not the list: the refusal is
+            // handed back and recorded as owed like any other, and the loop goes on to the
+            // remaining entries while the deadline is still open. The loop's own guard at
+            // the top is what ends the phase when the deadline actually runs out.
+            let event = wait_out_rate_limit(
+                engine.fetch(url, seed),
+                seed.deadline,
+                started,
+                seed.delay,
+                &mut rate_limit_state,
+                &mut run.pages_recovered_from_rate_limit,
+                |retry_url| engine.fetch(retry_url, seed),
+            );
             let answer = capture_page(
                 event,
                 archive,
@@ -1226,6 +1268,11 @@ pub fn owed_addresses(run: &CaptureRun) -> Vec<OwedAddress> {
         // A count of links this run got back, so nothing here is owed: a link recovered was
         // fetched, and one recovery failed to fetch is in `links_never_followed` above.
         links_recovered: _,
+        // A count of pages a host refused for rate and then served once the run waited it
+        // out, so nothing here is owed either: a page recovered this way is an ordinary
+        // capture the moment it lands, and one still refused reached `refused_responses`
+        // above instead of this field.
+        pages_recovered_from_rate_limit: _,
         assets_stored: _,
         assets_missed: _,
         asset_fetches: _,
@@ -3324,6 +3371,44 @@ mod tests {
         );
     }
 
+    /// A link a sitemap sub-crawl discovered and never fetched is the run's to report. The
+    /// phase used to read the sub-crawl's `pages_dropped` and throw away everything it said
+    /// about links, so a run whose sub-crawl lost one printed `links lost 0` and left with a
+    /// success: the first sentence of `Report honesty` in `AGENTS.md` says a run never exits
+    /// zero while a link it discovered went unfetched.
+    #[test]
+    fn a_link_a_sitemap_sub_crawl_never_followed_is_reported_by_the_run() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let seed = Seed::new("https://example.com/");
+        let url = "https://example.com/listed".to_owned();
+        let mut engine = ScriptedCrawlEngine::new(vec![page(
+            &url,
+            200,
+            "<html><head><title>Listed</title></head><body>listed</body></html>",
+        )]);
+        engine.outcome.links_never_followed = vec!["https://example.com/lost".to_owned()];
+        engine.outcome.links_recovered = 2;
+
+        let run = capture_sitemap(
+            &engine,
+            &archive,
+            &seed,
+            &SiteRules::default(),
+            &[url],
+            true,
+            RunSoFar::nothing_yet(&HashSet::new()),
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(
+            run.links_never_followed,
+            vec!["https://example.com/lost".to_owned()],
+            "the phase kept a link the sub-crawl told it about to itself"
+        );
+        assert_eq!(run.links_recovered, 2);
+    }
+
     /// The wait is paid for a request and not for a loop iteration. A URL the run already
     /// filed is skipped without asking the host anything, so pacing it would spend the run's
     /// wall clock on politeness towards a request nobody made.
@@ -3501,7 +3586,15 @@ mod tests {
     fn a_refusal_during_the_sitemap_phase_survives_into_the_run_it_is_merged_into() {
         let dir = TempDir::new().expect("temp dir");
         let archive = archive_in(&dir);
-        let seed = Seed::new("https://example.com/");
+        let mut seed = Seed::new("https://example.com/");
+        // No deadline rather than a short one. Backoff waits a 429 out only while there is
+        // a budget for the wait to be bounded by, so `None` keeps this test off the clock
+        // entirely: the wait itself is `wait_out_rate_limit`'s own tests to cover, and this
+        // one is about the count surviving a merge. A deadline short enough to refuse every
+        // wait is also short enough for the phase's own loop guard to reach it while the
+        // first capture is being written, which made this fail under load with the two
+        // refusals never asked for at all.
+        seed.deadline = None;
         let urls: Vec<String> = (0..3)
             .map(|i| format!("https://example.com/p/{i}"))
             .collect();
@@ -3536,6 +3629,61 @@ mod tests {
             vec![urls[1].as_str(), urls[2].as_str()],
             "a phase's refused addresses survive the merge along with its count"
         );
+    }
+
+    /// Backoff giving up on one listed URL, because a further wait would not fit what is
+    /// left of the budget, is a decision about that URL. The phase goes on to the entries
+    /// behind it and, having answered its whole list inside the budget, says so: the
+    /// deadline did not end anything. Reported the other way round, this loop broke out of
+    /// the list on the first such address, which on a resume is every remaining debt of that
+    /// origin thrown away over one host's `Retry-After`.
+    #[test]
+    fn a_listed_url_backoff_gave_up_on_costs_that_url_and_not_the_rest_of_the_list() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let mut seed = Seed::new("https://example.com/");
+        // A generous deadline and a refusal asking for an hour, rather than a deadline too
+        // short for any wait: what has to be exercised is an address given up on while the
+        // budget is still open, and a budget short enough to refuse every wait is also short
+        // enough for this phase's own loop guard to end the list on its own, which proves
+        // nothing about the address. Nothing here waits, because an hour does not fit.
+        seed.deadline = Some(Duration::from_secs(30));
+        let refusing = "https://example.com/refusing".to_owned();
+        let serving = "https://example.com/serving".to_owned();
+        let mut refusal = page(&refusing, 429, "Too Many Requests");
+        response_of(&mut refusal).headers.push(Header {
+            name: "Retry-After".to_owned(),
+            value: "3600".to_owned(),
+        });
+        let engine = ScriptedCrawlEngine::new(Vec::new()).serving(vec![
+            refusal,
+            page(&serving, 200, "<html><body><p>prose</p></body></html>"),
+        ]);
+
+        let run = capture_sitemap(
+            &engine,
+            &archive,
+            &seed,
+            &SiteRules::default(),
+            &[refusing, serving],
+            false,
+            RunSoFar::nothing_yet(&HashSet::new()),
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        assert_eq!(
+            run.stopped,
+            CrawlStop::Exhausted,
+            "a phase that read its whole list named a bound that never ended it"
+        );
+        // One, not two: the refused URL is recorded as owed rather than filed as an item,
+        // so the capture that exists at all is the entry behind it, which is exactly what a
+        // loop that broke out on the refusal would not have.
+        assert_eq!(
+            run.captures_written, 1,
+            "the URL behind the one backoff gave up on was never asked for"
+        );
+        assert_eq!(run.responses_refused, BTreeMap::from([(429, 1)]));
     }
 
     /// The two bounds this phase answers to are different facts and send an operator to

@@ -275,8 +275,6 @@ impl<F: BarFacts> Drop for TickingBar<F> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
-
     use super::*;
 
     /// The decision `ProgressLine` exists to isolate: off a terminal, an update is a plain

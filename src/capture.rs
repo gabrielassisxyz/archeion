@@ -580,6 +580,10 @@ pub fn capture_sitemap_reporting(
             }) {
                 Ok(outcome) => outcome,
                 Err(error) => {
+                    // Reported as well as recorded: the report counts this URL among the ones
+                    // that answered nothing, so a live account that skipped it would be the
+                    // one place a run went quiet about an address it had accounted for.
+                    reporter.page(url, PageOutcome::NoResponse, &run);
                     run.failed_fetches.push(FetchFailure {
                         url: url.clone(),
                         reason: error.to_string(),
@@ -1598,6 +1602,41 @@ mod tests {
                 PageOutcome::NotArticle,
                 1
             )]
+        );
+    }
+
+    /// The offset through the path that actually has more than one phase-like segment: a
+    /// resume runs one sub-crawl per origin group, each with a `CaptureRun` of its own, so a
+    /// count read off the group rather than off the run restarts at one on the second host.
+    #[test]
+    fn a_resume_counts_on_across_the_origin_groups_it_runs_one_at_a_time() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/a",
+            200,
+            "<html><head><title>One</title></head><body>a page</body></html>",
+        )]);
+        let (seen, mut on_page) = recording_progress();
+
+        capture_owed_reporting(
+            &engine,
+            &archive,
+            &Seed::new("https://example.com/"),
+            &SiteRules::default(),
+            &[
+                "https://first.example.com/a".to_owned(),
+                "https://second.example.com/a".to_owned(),
+            ],
+            &mut on_page,
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        let counts: Vec<usize> = seen.borrow().iter().map(|(_, _, spent)| *spent).collect();
+        assert_eq!(
+            counts,
+            [1, 2],
+            "the second origin group restarted the run's count"
         );
     }
 

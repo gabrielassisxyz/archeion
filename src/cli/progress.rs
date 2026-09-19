@@ -117,17 +117,24 @@ pub trait BarFacts: Send + 'static {
 pub struct TickingBar<F: BarFacts> {
     shared: Arc<Mutex<DrawnBar<F>>>,
     stop: Arc<AtomicBool>,
-    /// `None` only after `Drop` has taken it to join the thread.
+    /// `None` once the ticking thread has been stopped and joined, which happens on the first
+    /// `clear` and again in `Drop` for a bar that was never cleared.
     ticker: Option<JoinHandle<()>>,
 }
 
-/// The bar and everything it is drawn from, behind the one lock the run's thread and the
-/// ticking thread take turns on. `last_printed` is what makes the tick polite off a terminal:
-/// it moves on every write to stderr this bar makes, warnings included, so the tick only ever
+/// The bar, what it is drawn from and where it is drawn, behind the one lock the run's thread
+/// and the ticking thread take turns on. `last_printed` is what makes the tick polite off a
+/// terminal: it moves on every write this bar makes, warnings included, so the tick only ever
 /// prints into a window in which nothing else did.
+///
+/// The destination is a boxed writer rather than `io::stderr()` reached for at each write, for
+/// the reason `ProgressLine` takes its `is_tty` as a plain `bool`: what happens when a bar goes
+/// quiet, when a warning interrupts it and when a run takes it down is then assertable against
+/// a buffer, and a caller outside a test has exactly one writer to pass.
 struct DrawnBar<F: BarFacts> {
     line: ProgressLine,
     facts: F,
+    out: Box<dyn io::Write + Send>,
     last_printed: Instant,
     redraw_after: Duration,
 }
@@ -135,34 +142,55 @@ struct DrawnBar<F: BarFacts> {
 impl<F: BarFacts> DrawnBar<F> {
     fn draw(&mut self) {
         let text = self.facts.line();
-        self.line.update(&mut io::stderr(), &text);
+        self.line.update(&mut self.out, &text);
         self.last_printed = Instant::now();
     }
 }
 
 impl<F: BarFacts> TickingBar<F> {
+    /// The bar a run gets: drawn on stderr, redrawn about once a second on a terminal and far
+    /// more rarely off one.
     pub fn new(is_tty: bool, facts: F) -> Self {
         let redraw_after = if is_tty {
             TTY_REDRAW_AFTER
         } else {
             PIPE_LINE_AFTER
         };
+        Self::writing_to(is_tty, facts, Box::new(io::stderr()), redraw_after)
+    }
+
+    /// The same bar with its destination and its own pace named, which is what lets the tick,
+    /// the interruption and the takedown be asserted without a terminal and without waiting
+    /// out a redraw period measured in seconds.
+    fn writing_to(
+        is_tty: bool,
+        facts: F,
+        out: Box<dyn io::Write + Send>,
+        redraw_after: Duration,
+    ) -> Self {
         let shared = Arc::new(Mutex::new(DrawnBar {
             line: ProgressLine::new(is_tty),
             facts,
+            out,
             last_printed: Instant::now(),
             redraw_after,
         }));
         let stop = Arc::new(AtomicBool::new(false));
+        let poll = TICK_POLL.min(redraw_after);
         let ticker = thread::spawn({
             let shared = Arc::clone(&shared);
             let stop = Arc::clone(&stop);
             move || {
-                while !stop.load(Ordering::Relaxed) {
-                    thread::sleep(TICK_POLL);
-                    let Ok(mut bar) = shared.lock() else {
+                loop {
+                    thread::sleep(poll);
+                    let mut bar = lock(&shared);
+                    // Read under the lock, and set under the lock by `stop_ticking`, so that
+                    // "stopped" and "about to draw" cannot both be true. Read outside it, a
+                    // tick already past its sleep draws one more line after the run is over,
+                    // which a terminal erases on the way out and a log file keeps forever.
+                    if stop.load(Ordering::Relaxed) {
                         return;
-                    };
+                    }
                     if bar.last_printed.elapsed() >= bar.redraw_after {
                         bar.draw();
                     }
@@ -180,9 +208,7 @@ impl<F: BarFacts> TickingBar<F> {
     /// does. The two happen under one lock so the ticking thread cannot draw the half-updated
     /// state in between.
     pub fn advance(&mut self, change: impl FnOnce(&mut F)) {
-        let Ok(mut bar) = self.shared.lock() else {
-            return;
-        };
+        let mut bar = lock(&self.shared);
         change(&mut bar.facts);
         bar.draw();
     }
@@ -192,37 +218,57 @@ impl<F: BarFacts> TickingBar<F> {
     /// corruption this exists to rule out rather than merely to make unlikely, which is why it
     /// holds the lock across the whole write: the ticking thread cannot redraw into the gap.
     pub fn interrupt(&mut self, lines: impl IntoIterator<Item = String>) {
-        let Ok(mut bar) = self.shared.lock() else {
-            return;
-        };
-        let mut stderr = io::stderr();
-        bar.line.clear_for_interruption(&mut stderr);
-        for line in lines {
-            let _ = writeln!(stderr, "warning: {line}");
+        let mut bar = lock(&self.shared);
+        let DrawnBar { line, out, .. } = &mut *bar;
+        line.clear_for_interruption(out);
+        for text in lines {
+            let _ = writeln!(out, "warning: {text}");
         }
         bar.last_printed = Instant::now();
     }
 
-    /// Takes the bar down and leaves it down until something draws it again. Called before
-    /// anything is written to stdout, and again by `Drop` so that every path out of a run,
-    /// the ones that return an error included, leaves the terminal with its own line free.
+    /// Takes the bar down for good: the ticking thread is stopped and joined first, so nothing
+    /// can draw it again afterwards. Called before anything is written to stdout, and again by
+    /// `Drop` so that every path out of a run, the ones that return an error included, leaves
+    /// the terminal with its own line free.
+    ///
+    /// Stopping rather than only erasing is the difference between a bar that is down and a bar
+    /// that is down until the next tick: the report's first line would otherwise be appended to
+    /// a redraw that landed in the microseconds between the two.
     pub fn clear(&mut self) {
-        let Ok(mut bar) = self.shared.lock() else {
-            return;
-        };
-        bar.line.clear_for_interruption(&mut io::stderr());
+        self.stop_ticking();
+        let mut bar = lock(&self.shared);
+        let DrawnBar { line, out, .. } = &mut *bar;
+        line.clear_for_interruption(out);
     }
+
+    fn stop_ticking(&mut self) {
+        {
+            // Set under the lock, so a tick that is already awake and holding it finishes its
+            // draw before this, and a tick that is not cannot start one after it.
+            let _held = lock(&self.shared);
+            self.stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(ticker) = self.ticker.take() {
+            let _ = ticker.join();
+        }
+    }
+}
+
+/// The bar's own state, whether or not a panic while it was held poisoned the lock.
+///
+/// A poisoned bar is a bar whose counters may be half-updated, which is the whole of the
+/// damage: taking it down and putting a warning where it was are the two things most worth
+/// doing after a panic, and refusing the lock would leave the bar drawn under the panic's own
+/// message instead.
+fn lock<F: BarFacts>(shared: &Mutex<DrawnBar<F>>) -> std::sync::MutexGuard<'_, DrawnBar<F>> {
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl<F: BarFacts> Drop for TickingBar<F> {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(ticker) = self.ticker.take() {
-            let _ = ticker.join();
-        }
-        // After the join, so nothing can redraw over the clear: a bar left on the line is what
-        // the next thing written to this terminal lands on top of, and for a run ending in an
-        // error that next thing is the error.
         self.clear();
     }
 }
@@ -312,6 +358,43 @@ mod tests {
         }
     }
 
+    /// A writer a test can read back while the bar's own thread is still writing into it.
+    #[derive(Clone)]
+    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedBuffer {
+        fn new() -> Self {
+            Self(Arc::new(Mutex::new(Vec::new())))
+        }
+
+        fn written(&self) -> String {
+            String::from_utf8(self.0.lock().expect("the buffer's lock").clone())
+                .expect("only ASCII was written")
+        }
+    }
+
+    impl io::Write for SharedBuffer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the buffer's lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A pace short enough for a test to wait out several of, and long enough that a loaded
+    /// machine still gets through a tick or two inside the waits below.
+    const A_FAST_PACE: Duration = Duration::from_millis(20);
+
+    fn ticking(out: &SharedBuffer) -> TickingBar<CountedFacts> {
+        TickingBar::writing_to(false, CountedFacts(0), Box::new(out.clone()), A_FAST_PACE)
+    }
+
     /// A bar off a terminal keeps its tick rare on purpose, because every tick there is a line
     /// in a log file that nothing ever erases. Five seconds is far longer than any test may
     /// wait for, so what is asserted is the number the choice turns on rather than a wait.
@@ -321,20 +404,73 @@ mod tests {
         assert!(TICK_POLL < TTY_REDRAW_AFTER);
     }
 
-    /// The bar the run itself drives, with the ticking thread running beside it the whole
-    /// time: an update still lands exactly once per call, so the thread is not stealing
-    /// redraws from the run or adding any of its own inside a window this short.
+    /// The whole reason the thread exists: a run that has gone quiet is still drawn, so a host
+    /// that stopped answering reads as a run waiting rather than as a run that finished.
     #[test]
-    fn a_ticking_bar_still_draws_once_per_advance_while_its_thread_runs() {
-        let mut bar = TickingBar::new(false, CountedFacts(0));
+    fn a_bar_nobody_advances_is_redrawn_by_its_own_tick() {
+        let out = SharedBuffer::new();
+        let bar = ticking(&out);
+        thread::sleep(A_FAST_PACE * 6);
+        let while_quiet = out.written();
+        drop(bar);
+
+        assert!(
+            while_quiet.lines().count() >= 2,
+            "a bar left alone was drawn {} time(s): {while_quiet:?}",
+            while_quiet.lines().count()
+        );
+    }
+
+    /// Taking the bar down stops the thread that would put it back. Without that, the report
+    /// on stdout is written into the microseconds between a clear and the next redraw.
+    #[test]
+    fn a_bar_taken_down_is_not_drawn_again_by_the_tick_that_was_coming() {
+        let out = SharedBuffer::new();
+        let mut bar = ticking(&out);
         bar.advance(|facts| facts.0 = 1);
-        bar.advance(|facts| facts.0 = 2);
-        let seen = bar
-            .shared
-            .lock()
-            .expect("the bar's lock is not poisoned")
-            .facts
-            .0;
-        assert_eq!(seen, 2);
+        bar.clear();
+        let when_cleared = out.written();
+        thread::sleep(A_FAST_PACE * 6);
+
+        assert_eq!(
+            out.written(),
+            when_cleared,
+            "the bar was drawn again after it was taken down"
+        );
+    }
+
+    /// A warning interrupts the bar rather than sharing a line with it, and the bar's own pace
+    /// starts again from the interruption: a tick landing immediately after would otherwise
+    /// redraw on top of the warning that had just been printed.
+    #[test]
+    fn an_interruption_is_written_whole_and_resets_the_bar_s_own_pace() {
+        let out = SharedBuffer::new();
+        let mut bar = ticking(&out);
+        bar.advance(|facts| facts.0 = 3);
+        bar.interrupt(["the seed's robots.txt could not be read".to_owned()]);
+        bar.clear();
+
+        assert!(
+            out.written()
+                .contains("warning: the seed's robots.txt could not be read\n"),
+            "the warning did not survive the bar: {:?}",
+            out.written()
+        );
+    }
+
+    /// The bar advanced by the run itself, with the ticking thread running beside it: what the
+    /// run says still lands, and it lands whole.
+    #[test]
+    fn a_ticking_bar_draws_what_the_run_advanced_it_to() {
+        let out = SharedBuffer::new();
+        let mut bar = ticking(&out);
+        bar.advance(|facts| facts.0 = 7);
+        bar.clear();
+
+        assert!(
+            out.written().contains("7 so far"),
+            "the run's own advance was not drawn: {:?}",
+            out.written()
+        );
     }
 }

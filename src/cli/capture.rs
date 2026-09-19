@@ -554,10 +554,9 @@ fn capture_resume(args: &CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> 
     let archive = Archive::open_existing(&args.archive)?;
     let (rules, unused_rules) = SiteRules::read(&archive.extraction_rules_path());
 
-    let owed = archive.read_owed()?;
-    let urls = owed_but_not_yet_filed(&archive, &owed);
-    let requested = urls.len();
-
+    // Built before the archive's own record is read, because reading it can fail and leave the
+    // verb: a warning held behind a `?` is a warning a run with no `--progress` at all stopped
+    // printing, which is stderr changing for the default level.
     let mut progress = args
         .progress
         .map(|level| CaptureProgress::new(level, &seed, Instant::now()));
@@ -566,6 +565,10 @@ fn capture_resume(args: &CaptureArgs, json: bool) -> Result<(), Box<dyn Error>> 
         progress.as_mut(),
         unused_rules.iter().map(ToString::to_string),
     );
+
+    let owed = archive.read_owed()?;
+    let urls = owed_but_not_yet_filed(&archive, &owed);
+    let requested = urls.len();
     let mut on_page = |url: &str, outcome: PageOutcome, pages_spent: usize| {
         if let Some(progress) = progress.as_mut() {
             progress.page(url, outcome, pages_spent);

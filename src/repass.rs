@@ -78,7 +78,7 @@ impl RepassOutcome {
     pub fn as_word(self) -> &'static str {
         match self {
             Self::Written => report_words::WRITTEN,
-            Self::Refused => report_words::REFUSED_IN_ARTICLES_ROW,
+            Self::Refused => report_words::ARTICLE_REFUSED,
             Self::NotArticle => report_words::NOT_ARTICLE,
             Self::MetadataWritten => report_words::METADATA_WRITTEN,
             Self::Unchanged => report_words::UNCHANGED,
@@ -107,6 +107,10 @@ pub enum RepassEvent<'a> {
         items_done: usize,
         total_items: usize,
     },
+    /// The walk found its items and is about to start. Fired once, before the first of them,
+    /// because the total is known then and an item can take a long time: a bar told the total
+    /// only by the first `ItemFinished` reads "0/0 items" for the whole of that first item.
+    WalkStarted { total_items: usize },
 }
 
 pub fn repass_archive(
@@ -151,6 +155,7 @@ pub fn repass_archive_reporting(
     let mut seed = Seed::new(String::new());
     seed.allow_private_addresses = options.allow_private_addresses;
     let mut assets = AssetCapture::new(engine, archive, &seed, Instant::now());
+    progress(RepassEvent::WalkStarted { total_items });
 
     for (item_index, item) in walk.items.into_iter().enumerate() {
         let items_done = item_index + 1;

@@ -88,6 +88,9 @@ impl RepassProgress {
                 pace.total_items = total_items;
                 pace.last_item = Some(Instant::now());
             }),
+            (Self::Bar(bar), RepassEvent::WalkStarted { total_items }) => {
+                bar.advance(|pace| pace.total_items = total_items)
+            }
             _ => {}
         }
     }

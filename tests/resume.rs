@@ -886,11 +886,12 @@ fn a_resume_bounded_by_max_pages_stops_early_and_leaves_the_rest_owed() {
     );
 }
 
-/// Report honesty on the resume path, which routes every owed address through the same
-/// plain-fetch loop the sitemap phase uses. An address abandoned for want of budget has to
-/// cost that address and not the ones queued behind it: the first owed address here refuses
-/// forever, and the deadline is short enough that backoff runs out of room for a second wait
-/// almost at once, while the two addresses after it are still asked for and paid down.
+/// Report honesty on the resume path, which hands each owed address to the sitemap phase as
+/// a sub-crawl of its own. An address abandoned for want of budget has to cost that address
+/// and not the ones queued behind it: the first owed address here refuses forever, and the
+/// three second budget leaves one address under a second of waiting to spend, which is less
+/// than the smallest wait backoff will take, so it gives up without sleeping at all and the
+/// two addresses after it are asked for and paid down.
 #[test]
 fn an_owed_address_given_up_on_for_want_of_budget_does_not_cost_the_rest_of_the_debt() {
     let dir = TempDir::new().expect("temp dir");
@@ -915,8 +916,11 @@ fn an_owed_address_given_up_on_for_want_of_budget_does_not_cost_the_rest_of_the_
         .arg("capture")
         .arg(dir.path())
         .arg("--resume")
-        // Three seconds buys backoff its first one second wait on `/refusing` and refuses
-        // the two second one after it, which is all this test needs that route to do.
+        // Three seconds is under four times the smallest wait backoff takes, so the share
+        // of a budget one address may spend on being waited out buys no wait at all here.
+        // That is what this test wants and it is also what keeps it off the clock: a budget
+        // that bought one wait would leave the phase's own loop guard racing the rest of
+        // the list under load.
         .args([
             "--deadline",
             "3s",

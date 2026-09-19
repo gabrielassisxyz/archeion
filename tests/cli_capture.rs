@@ -1062,7 +1062,10 @@ fn a_page_that_refuses_twice_and_then_serves_is_captured_with_nothing_owed() {
         .arg(dir.path())
         .arg(&seed_url)
         .args(["--max-pages", "1", "--max-retries", "0"])
-        .args(["--deadline", "10s", "--allow-private-addresses"])
+        // Thirty seconds rather than ten: one address may spend a quarter of the budget
+        // being waited out, and the second of this page's two waits does not fit inside a
+        // quarter of ten.
+        .args(["--deadline", "30s", "--allow-private-addresses"])
         .output()
         .expect("the binary runs");
 
@@ -1114,10 +1117,11 @@ fn a_retry_after_given_in_seconds_and_longer_than_the_default_backoff_is_honoure
         .arg(dir.path())
         .arg(&seed_url)
         .args(["--max-pages", "1", "--max-retries", "0"])
-        // Room for the header's own wait and the run's startup both: backoff refuses a wait
-        // that would not fit inside what is left of the deadline, so a budget only just
-        // larger than the header asks for is a budget the header loses against.
-        .args(["--deadline", "30s", "--allow-private-addresses"])
+        // Room for four times the header's own wait: backoff refuses a wait that would not
+        // fit inside the deadline, and refuses one that would spend more than a quarter of
+        // the budget on a single address, so a budget merely larger than the header asks
+        // for is still a budget the header loses against.
+        .args(["--deadline", "60s", "--allow-private-addresses"])
         .output()
         .expect("the binary runs");
     let elapsed = started.elapsed();
@@ -1156,10 +1160,11 @@ fn a_retry_after_given_as_an_http_date_and_longer_than_the_default_backoff_is_ho
         .arg(dir.path())
         .arg(&seed_url)
         .args(["--max-pages", "1", "--max-retries", "0"])
-        // Room for the header's own wait and the run's startup both: backoff refuses a wait
-        // that would not fit inside what is left of the deadline, so a budget only just
-        // larger than the header asks for is a budget the header loses against.
-        .args(["--deadline", "30s", "--allow-private-addresses"])
+        // Room for four times the header's own wait: backoff refuses a wait that would not
+        // fit inside the deadline, and refuses one that would spend more than a quarter of
+        // the budget on a single address, so a budget merely larger than the header asks
+        // for is still a budget the header loses against.
+        .args(["--deadline", "60s", "--allow-private-addresses"])
         .output()
         .expect("the binary runs");
     let elapsed = started.elapsed();
@@ -1184,17 +1189,21 @@ fn archive_owed(path: &std::path::Path) -> Vec<OwedAddress> {
         .expect("the owed record reads back")
 }
 
-/// A host that never stops refusing does not hold the run past its own deadline, and backoff
-/// actually spent part of it waiting rather than giving up on the first refusal: the lower
-/// bound proves the wait was taken at all, and the upper bound, generous against the 5s
-/// deadline, proves the run gave up near it rather than past it. `RATE_LIMIT_MAX_BACKOFF`
-/// alone would let one more doubling run to 16s past the point the run is out of budget, so
-/// an upper bound near the deadline is what a broken deadline check inside the backoff loop
-/// would fail rather than only a slow one.
+/// A host that never stops refusing is waited out only as far as the bounds allow, and the
+/// address is then owed.
+///
+/// The request count is what pins where it stopped, and a duration alone cannot: with a
+/// twenty second budget one address may spend five, so the one and two second waits are
+/// taken, the four second wait after them is refused, and the site sees exactly three
+/// requests. A flat wait that never grew would also take two of them and reach the same
+/// clock reading, which is why the elapsed bounds below are a check on the bound rather
+/// than the whole assertion: the lower one refuses a run that gave up on the first refusal,
+/// and the upper one refuses a deadline check made after the sleep instead of before, which
+/// would take the four second wait too and land past ten.
 #[test]
 fn a_host_that_never_stops_refusing_is_bounded_by_the_run_s_own_deadline() {
     let dir = TempDir::new().expect("temp dir");
-    let (port, _requests) = serve_a_page_that_refuses_a_fixed_number_of_times(u32::MAX, None);
+    let (port, requests) = serve_a_page_that_refuses_a_fixed_number_of_times(u32::MAX, None);
     let seed_url = format!("http://127.0.0.1:{port}/index.html");
 
     let started = std::time::Instant::now();
@@ -1204,19 +1213,27 @@ fn a_host_that_never_stops_refusing_is_bounded_by_the_run_s_own_deadline() {
         .arg(dir.path())
         .arg(&seed_url)
         .args(["--max-pages", "1", "--max-retries", "0"])
-        .args(["--deadline", "5s", "--allow-private-addresses"])
+        .args(["--deadline", "20s", "--allow-private-addresses"])
         .output()
         .expect("the binary runs");
     let elapsed = started.elapsed();
 
     assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(
+        *requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        3,
+        "the run asked for the refusing address other than once plus the two waits its \
+         share of the budget pays for"
+    );
     assert!(
         elapsed >= Duration::from_millis(2_500),
         "the run gave up before backoff had grown past its first two waits, took {elapsed:?}"
     );
     assert!(
-        elapsed < Duration::from_secs(8),
-        "the run outlasted its own 5s deadline by more than a reasonable margin, took {elapsed:?}"
+        elapsed < Duration::from_secs(10),
+        "the run waited past the share of its budget one address may spend, took {elapsed:?}"
     );
 
     // Backoff giving up on the one address this run had is a decision about that address,

@@ -359,6 +359,25 @@ const RATE_LIMIT_BASE_BACKOFF: Duration = Duration::from_secs(1);
 /// on the address altogether.
 const RATE_LIMIT_MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
+/// What fraction of the run's whole budget one refusing address may spend being waited out,
+/// as the divisor: a quarter.
+///
+/// The deadline alone bounds the run and not the address inside it, and those are different
+/// bounds. Every caller here sleeps on the thread that is also draining the crawl, so the
+/// wait is not one address pausing while the rest of the run continues, it is the run
+/// stopping. Bounded only by the deadline, a single path that answers 429 forever, a search
+/// endpoint or an address behind a firewall being the shapes seen, sleeps through one second,
+/// then two, and at the default five minute budget has spent two hundred and fifty five of
+/// them before the next wait stops fitting. The archive that comes back is nearly empty and
+/// the report blames the deadline, over one address that the run before this policy existed
+/// would have recorded as owed and walked past.
+///
+/// A quarter is a share rather than a number of seconds because the question it answers is
+/// how much of this run one address is worth, which is a different answer for a five minute
+/// run and an all night one. Past it the address is recorded as owed exactly as it was before
+/// any of this, and the run keeps three quarters of what it was given for everything else.
+const RATE_LIMIT_SHARE_OF_THE_BUDGET: u32 = 4;
+
 /// How long to wait before asking a rate-limited address again.
 ///
 /// Doubles with every successive 429 the same host has already answered in this run, since a
@@ -462,22 +481,46 @@ pub(crate) fn wait_out_rate_limit(
     let url = first.requested_url.clone();
     let host = host_of(&url);
     let mut event = event;
+    // Read apart from `started`, which is the whole run's clock: this one measures what this
+    // one address has cost, which is what `RATE_LIMIT_SHARE_OF_THE_BUDGET` bounds.
+    let this_address_started = Instant::now();
+    let mut asked_again = false;
     while let PageEvent::Response(page) = &event {
         if page.status != 429 {
             break;
         }
         let consecutive = state.get(&host).copied().unwrap_or(0);
         let wait = rate_limit_backoff(consecutive, floor, retry_after_wait(&page.headers));
-        let fits_the_deadline = match deadline {
-            Some(budget) => started.elapsed() + wait < budget,
+        // Saturating rather than plain addition: `Retry-After` is a number a host chose, and
+        // a host that answers `Retry-After: 18446744073709551615` would otherwise overflow
+        // this sum and panic the run rather than be refused by it.
+        let fits = match deadline {
+            Some(budget) => {
+                started.elapsed().saturating_add(wait) < budget
+                    && this_address_started.elapsed().saturating_add(wait)
+                        <= budget / RATE_LIMIT_SHARE_OF_THE_BUDGET
+            }
             None => false,
         };
-        if !fits_the_deadline {
+        if !fits {
             break;
         }
         std::thread::sleep(wait);
+        asked_again = true;
         state.insert(host.clone(), consecutive + 1);
         event = fetch_again(&url);
+    }
+    // The pace this run owes the host applies to whatever it asks for next, and the request
+    // after this one is not this function's to make: a crawl's own scheduler has been
+    // counting its throttle down while this thread slept, so it dispatches the next page the
+    // moment this returns. Paying the floor here is the gap that would otherwise be missing
+    // between the last request this made and the first request the caller makes after it,
+    // and it is owed only when this actually asked the host for something.
+    if asked_again && !floor.is_zero() {
+        let fits = deadline.is_some_and(|budget| started.elapsed().saturating_add(floor) < budget);
+        if fits {
+            std::thread::sleep(floor);
+        }
     }
     if matches!(&event, PageEvent::Response(page) if page.status < 400) {
         state.insert(host, 0);
@@ -906,6 +949,110 @@ mod tests {
             "a wait was taken on a run with no deadline at all"
         );
         assert_eq!(recovered, 0);
+    }
+
+    /// The deadline bounds the run and this bounds the address inside it, and both have to
+    /// hold: every caller here sleeps on the thread that is also draining the crawl, so an
+    /// address allowed to spend the whole budget is an address that stops the run.
+    ///
+    /// Eight seconds of budget is two seconds for one address. The first wait is a second
+    /// and fits; the two second wait after it would put this address at three, so the
+    /// address is given back refused. Bounded by the deadline alone this would have waited
+    /// one, two and four seconds, asked three times, and spent seven of the eight.
+    #[test]
+    fn wait_out_rate_limit_spends_at_most_its_share_of_the_budget_on_one_address() {
+        let mut state = HashMap::new();
+        let mut recovered = 0;
+        let mut calls = 0;
+
+        let started = Instant::now();
+        let result = wait_out_rate_limit(
+            refused(429, Vec::new()),
+            Some(Duration::from_secs(8)),
+            started,
+            Duration::ZERO,
+            &mut state,
+            &mut recovered,
+            |_url| {
+                calls += 1;
+                refused(429, Vec::new())
+            },
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(&result, PageEvent::Response(page) if page.status == 429),
+            "{result:?}"
+        );
+        assert_eq!(
+            calls, 1,
+            "one address spent more than its share of the run's budget"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "one address held the run for {elapsed:?} of an eight second budget"
+        );
+    }
+
+    /// `Retry-After` is a number a host chose, and the largest one it can spell overflows
+    /// the sum that decides whether the wait fits. Refused, rather than panicking the run
+    /// that was polite enough to read the header.
+    #[test]
+    fn wait_out_rate_limit_refuses_a_retry_after_too_large_to_add_up() {
+        let mut state = HashMap::new();
+        let mut recovered = 0;
+        let mut calls = 0;
+        let event = refused(429, vec![retry_after(&u64::MAX.to_string())]);
+
+        let result = wait_out_rate_limit(
+            event.clone(),
+            Some(Duration::from_secs(300)),
+            Instant::now(),
+            Duration::ZERO,
+            &mut state,
+            &mut recovered,
+            |_url| {
+                calls += 1;
+                ok()
+            },
+        );
+
+        assert_eq!(result, event);
+        assert_eq!(calls, 0);
+    }
+
+    /// The run owes the host its own pace between requests, and the request after a waited
+    /// out refusal is the caller's rather than this function's: a crawl's scheduler counts
+    /// its own throttle down while this thread sleeps, so it dispatches the next page the
+    /// instant this returns. The gap is paid here or it is not paid at all.
+    #[test]
+    fn wait_out_rate_limit_leaves_the_run_s_own_pace_behind_its_last_request() {
+        let mut state = HashMap::new();
+        let mut recovered = 0;
+        let floor = Duration::from_millis(600);
+
+        let started = Instant::now();
+        let result = wait_out_rate_limit(
+            refused(429, Vec::new()),
+            Some(Duration::from_secs(30)),
+            started,
+            floor,
+            &mut state,
+            &mut recovered,
+            |_url| ok(),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(&result, PageEvent::Response(page) if page.status == 200),
+            "{result:?}"
+        );
+        // One second of backoff, which the floor does not reach, and the floor again after
+        // the request it took: under one and a half means the second one was never paid.
+        assert!(
+            elapsed >= Duration::from_millis(1_500),
+            "the pace owed after the recovered request was not waited, took {elapsed:?}"
+        );
     }
 
     /// A host that has already been refused several times in a row does not lend that count

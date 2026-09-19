@@ -458,6 +458,10 @@ pub fn capture_sitemap(
                 }
             };
             run.pages_dropped += outcome.pages_dropped;
+            // Counted here as well as on the ordinary crawl path: a sub-crawl waits a 429
+            // out exactly as a crawl does, and a page it recovered that way is an archived
+            // page this phase would otherwise report nothing about.
+            run.pages_recovered_from_rate_limit += outcome.pages_recovered_from_rate_limit;
             if write_failure.is_some() {
                 break;
             }

@@ -927,9 +927,9 @@ fn a_write_failure_in_the_sitemap_phase_does_not_drop_the_crawl_phases_own_owed_
 /// Report honesty on the sitemap path, which is where giving up on one address used to cost
 /// the most: the plain-fetch branch reads its list in order, so an address it abandons for
 /// want of budget must abandon that address and not the entries behind it. The first listed
-/// URL refuses forever and the deadline is short enough that backoff runs out of room for a
-/// second wait almost at once; the two URLs after it are still asked for and archived, and
-/// the run reports one refusal rather than a deadline.
+/// URL refuses forever and the budget is small enough that the share of it one address may
+/// spend on being waited out buys no wait at all; the two URLs after it are still asked for
+/// and archived, and the run reports one refusal rather than a deadline.
 #[test]
 fn a_listed_url_given_up_on_for_want_of_budget_does_not_cost_the_rest_of_the_list() {
     let dir = TempDir::new().expect("temp dir");
@@ -957,8 +957,10 @@ fn a_listed_url_given_up_on_for_want_of_budget_does_not_cost_the_rest_of_the_lis
 
     // Built directly rather than through `capture_command`, whose baked-in `--deadline 30s`
     // a second occurrence of the flag cannot override, and short on purpose: three seconds
-    // buys backoff its first one second wait and refuses the two second one after it, which
-    // is the whole of what this test needs the refusing route to do.
+    // is under four times the smallest wait backoff takes, so one address's share of the
+    // budget buys no wait at all. That is what this test needs the refusing route to do and
+    // it is also what keeps the test off the clock, since a budget that bought one wait
+    // would leave the loop guard racing the rest of the list under load.
     let output = archeion()
         .arg("capture")
         .arg(&archive_path)

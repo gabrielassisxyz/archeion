@@ -12,7 +12,7 @@ pub use boundary::{
     CrawlEngine, CrawlError, CrawlOutcome, CrawlStop, FetchFailure, PageEvent, PageResponse, Seed,
     SessionCookie,
 };
-pub(crate) use boundary::{points_inside_a_network, wait_out_rate_limit};
+pub(crate) use boundary::{RateLimitMemory, points_inside_a_network, wait_out_rate_limit};
 pub use spider_engine::{
     DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_USER_AGENT, SMALLEST_MAX_RESPONSE_BYTES, SpiderEngine,
     settle_response_byte_ceiling,

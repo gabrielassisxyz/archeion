@@ -4,7 +4,7 @@
 //! archive. What connects them is a page event turning into a capture, which is where
 //! canonicalization decides the address the page is filed under.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
@@ -13,8 +13,8 @@ use url::Url;
 use crate::assets::{AssetCapture, CapturedAssets};
 use crate::canonical_url::{CanonicalUrl, InvalidCanonicalUrl};
 use crate::crawl::{
-    CrawlEngine, CrawlError, CrawlStop, FetchFailure, PageEvent, PageResponse, Seed,
-    points_inside_a_network, wait_out_rate_limit,
+    CrawlEngine, CrawlError, CrawlStop, FetchFailure, PageEvent, PageResponse, RateLimitMemory,
+    Seed, points_inside_a_network, wait_out_rate_limit,
 };
 use crate::metadata::{self, PageMetadata, PageSource, ReferencedAsset, UnreadablePage};
 use crate::readability::{self, Extraction, SiteRules, UnreadableArticle};
@@ -524,7 +524,7 @@ pub fn capture_sitemap_reporting(
     // floor is `--delay` alone, not the larger of it and a site's `Crawl-delay`, on the same
     // limit `docs/crawl-boundary.md` already states for this phase: nothing outside a crawl
     // reads `robots.txt` at all, so there is no `Crawl-delay` here to be larger than.
-    let mut rate_limit_state: HashMap<String, u32> = HashMap::new();
+    let mut rate_limit_state = RateLimitMemory::default();
 
     for url in urls {
         if let Some(bound) = bound_reached(seed, so_far.pages_written_including(&run), started) {

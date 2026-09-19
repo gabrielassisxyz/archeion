@@ -949,3 +949,135 @@ fn an_owed_address_given_up_on_for_want_of_budget_does_not_cost_the_rest_of_the_
     assert_eq!(owed.len(), 1, "{owed:?}");
     assert_eq!(owed[0].url, site.url("/refusing"));
 }
+
+/// How many addresses the refusing origin is owed. Enough that a backoff memory starting
+/// over on each one, and a share of the budget measured against what is left of it rather
+/// than against the run, leave the origin behind them nothing worth having.
+const ADDRESSES_OWED_ON_A_REFUSING_ORIGIN: usize = 50;
+
+/// A loopback site that answers 429 to the first request for each of its paths and serves
+/// the second, so an address here is paid down only by a run that still has enough budget
+/// left to wait a refusal out. `/robots.txt` answers 404 and is not counted.
+fn serve_a_site_refusing_each_path_once() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    let seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let seen = Arc::clone(&seen);
+            thread::spawn(move || answer_refusing_each_path_once(stream, seen));
+        }
+    });
+    port
+}
+
+fn answer_refusing_each_path_once(
+    mut stream: TcpStream,
+    seen: Arc<Mutex<HashSet<String>>>,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    if path == "/robots.txt" {
+        stream.write_all(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return stream.flush();
+    }
+    let first_time = seen
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.clone());
+    let (status, body): (&str, Vec<u8>) = if first_time {
+        ("429 Too Many Requests", b"Too Many Requests".to_vec())
+    } else {
+        ("200 OK", ROUND_TRIP_SERVED.as_bytes().to_vec())
+    };
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()
+}
+
+/// An origin that refuses everything does not cost the run the origins owed behind it.
+///
+/// A resume hands every owed address to the engine as a sub-crawl of its own, and what one
+/// address may spend being waited out is a share of the budget still left. With the count of
+/// a server's successive refusals living inside one sub-crawl, the fiftieth address on a
+/// server that has already refused forty nine begins at the smallest wait as though the
+/// server had never said anything, and pays that share over again; what reaches the origin
+/// listed behind them is a sliver of the deadline, which is not enough to wait out the one
+/// refusal that origin answers with before it serves.
+///
+/// That is what the second origin refusing each path once is for: reaching it is not the
+/// same as being able to pay it. A run that arrives there with its budget intact waits the
+/// refusal out and archives both addresses; a run that arrives with what fifty sub-crawls
+/// left over records them as owed all over again.
+///
+/// The two origins differ by port rather than by host, which is what a loopback test can
+/// arrange, and it is the unit both `capture_owed` and the backoff memory itself work in.
+#[test]
+fn an_origin_that_refuses_everything_does_not_starve_the_origin_owed_behind_it() {
+    let dir = TempDir::new().expect("temp dir");
+    let refusing = Site::start();
+    let serving_port = serve_a_site_refusing_each_path_once();
+    let mut owed = Vec::new();
+    for n in 1..=ADDRESSES_OWED_ON_A_REFUSING_ORIGIN {
+        let path = format!("/refusing{n}");
+        refusing.set_route(&path, refused("Too Many Requests"));
+        owed.push(owed_refused(&refusing.url(&path)));
+    }
+    let served: Vec<String> = ["/first", "/second"]
+        .iter()
+        .map(|path| format!("http://127.0.0.1:{serving_port}{path}"))
+        .collect();
+    owed.extend(served.iter().map(|url| owed_refused(url)));
+
+    let archive = Archive::open(dir.path()).expect("the archive opens");
+    archive
+        .write_owed(&HashSet::new(), &owed)
+        .expect("the owed record is written");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(dir.path())
+        .arg("--resume")
+        .args(["--max-pages", "100", "--max-retries", "0"])
+        // Twenty seconds is enough for the refusing origin to be given up on, in the three
+        // seconds its first address's share of the budget buys, and still leave the origin
+        // behind it more than the four seconds it needs before a one second wait fits in a
+        // quarter of what is left. A memory that starts over on each of the fifty addresses
+        // spends the whole twenty instead.
+        .args(["--deadline", "20s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    for url in &served {
+        let canonical = CanonicalUrl::parse(url).expect("valid url");
+        assert!(
+            archive.has_captures(&canonical),
+            "{url} was left owed, though its own origin never refused twice: {}",
+            stdout_of(&output)
+        );
+    }
+    let still_owed = archive.read_owed().expect("the owed record reads back");
+    assert_eq!(
+        still_owed.len(),
+        ADDRESSES_OWED_ON_A_REFUSING_ORIGIN,
+        "the addresses still owed are the refusing origin's own and nothing else: {still_owed:?}"
+    );
+}

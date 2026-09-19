@@ -354,9 +354,15 @@ const RATE_LIMIT_BASE_BACKOFF: Duration = Duration::from_secs(1);
 
 /// The most a single wait may grow to before the next attempt asks again, independent of the
 /// seed's own deadline. Doubling has no ceiling of its own, and a host that keeps refusing
-/// would otherwise grow one sitting's wait past anything worth sleeping through at once; the
-/// deadline check beside every wait, not this number, is what decides whether the run gives up
-/// on the address altogether.
+/// would otherwise grow one sitting's wait past anything worth sleeping through at once.
+///
+/// It is not this number that decides whether the run gives up on the address. The two
+/// checks beside every wait are, and the tighter of them is ordinarily the share rather
+/// than the deadline: a wait has to fit both what is left of the run and
+/// `RATE_LIMIT_SHARE_OF_THE_BUDGET` of the whole of it. At the default three hundred second
+/// deadline that puts the largest wait ever taken at seventy five seconds, so a
+/// `Retry-After` asking for more is recorded as owed at once however much of the run is
+/// still unspent.
 const RATE_LIMIT_MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
 /// What fraction of the run's whole budget one refusing address may spend being waited out,
@@ -415,15 +421,63 @@ fn retry_after_wait(headers: &[Header]) -> Option<Duration> {
     target.duration_since(SystemTime::now()).ok()
 }
 
-/// The host a backoff decision is tracked against, read off the address itself rather than
-/// off whatever the caller already knows about it: an address this fails to parse still gets
-/// its own counter, keyed on its own spelling, so backoff degrades to per-address rather than
+/// What a backoff decision is tracked against, read off the address itself rather than off
+/// whatever the caller already knows about it: an address this fails to parse still gets its
+/// own entry, keyed on its own spelling, so backoff degrades to per-address rather than
 /// disappearing.
-fn host_of(url: &str) -> String {
+///
+/// The origin rather than the host alone, because a rate limit belongs to the server that
+/// imposed it and a scheme, a host and a port together are what name one server. It is also
+/// the unit a resume already works in: `capture_owed` splits the debt it is paying down into
+/// origin groups and hands the engine one group at a time, so a decision taken about one
+/// group is now a decision about exactly what that group is.
+fn rate_limit_key(url: &str) -> String {
     Url::parse(url)
-        .ok()
-        .and_then(|parsed| parsed.host_str().map(str::to_owned))
-        .unwrap_or_else(|| url.to_owned())
+        .map(|parsed| parsed.origin().ascii_serialization())
+        .unwrap_or_else(|_| url.to_owned())
+}
+
+/// What a run has learned about the servers that answered it 429: how many times in a row
+/// each one has refused, and which ones it has stopped waiting for altogether.
+///
+/// It belongs to the run rather than to one crawl, which is the whole of what makes the
+/// second decision worth recording. A resume hands every owed address to the engine as a
+/// sub-crawl of its own, and a memory that began again with each of them would answer a
+/// server's twentieth refusal at the pace its first one earned, and would pay the share of
+/// the budget one address may spend being waited out twenty times over. A hundred addresses
+/// owed on a server that is still refusing would then leave nothing at all for the server
+/// listed behind them, which is the case this exists to prevent.
+#[derive(Debug, Default)]
+pub(crate) struct RateLimitMemory {
+    consecutive_refusals: HashMap<String, u32>,
+    /// Servers this run has already spent an address's whole share of the budget on without
+    /// getting an answer. Nothing clears an entry: within one run, a server that would not
+    /// be waited out once is not worth waiting out again, and the addresses behind it are
+    /// recorded as owed at the speed of a single request each rather than of a wait each.
+    given_up_on: std::collections::HashSet<String>,
+}
+
+impl RateLimitMemory {
+    fn consecutive_refusals(&self, key: &str) -> u32 {
+        self.consecutive_refusals.get(key).copied().unwrap_or(0)
+    }
+
+    fn refused_again(&mut self, key: &str, consecutive: u32) {
+        self.consecutive_refusals
+            .insert(key.to_owned(), consecutive);
+    }
+
+    fn answered(&mut self, key: &str) {
+        self.consecutive_refusals.insert(key.to_owned(), 0);
+    }
+
+    fn give_up_on(&mut self, key: &str) {
+        self.given_up_on.insert(key.to_owned());
+    }
+
+    fn given_up_on(&self, key: &str) -> bool {
+        self.given_up_on.contains(key)
+    }
 }
 
 /// Waits out a 429 and asks for the same address again, growing the wait across successive
@@ -468,7 +522,7 @@ pub(crate) fn wait_out_rate_limit(
     deadline: Option<Duration>,
     started: Instant,
     floor: Duration,
-    state: &mut HashMap<String, u32>,
+    state: &mut RateLimitMemory,
     recovered: &mut usize,
     mut fetch_again: impl FnMut(&str) -> PageEvent,
 ) -> PageEvent {
@@ -479,7 +533,10 @@ pub(crate) fn wait_out_rate_limit(
         return event;
     }
     let url = first.requested_url.clone();
-    let host = host_of(&url);
+    let host = rate_limit_key(&url);
+    if state.given_up_on(&host) {
+        return event;
+    }
     let mut event = event;
     // Read apart from `started`, which is the whole run's clock: this one measures what this
     // one address has cost, which is what `RATE_LIMIT_SHARE_OF_THE_BUDGET` bounds.
@@ -489,7 +546,7 @@ pub(crate) fn wait_out_rate_limit(
         if page.status != 429 {
             break;
         }
-        let consecutive = state.get(&host).copied().unwrap_or(0);
+        let consecutive = state.consecutive_refusals(&host);
         let wait = rate_limit_backoff(consecutive, floor, retry_after_wait(&page.headers));
         // Saturating rather than plain addition: `Retry-After` is a number a host chose, and
         // a host that answers `Retry-After: 18446744073709551615` would otherwise overflow
@@ -503,11 +560,21 @@ pub(crate) fn wait_out_rate_limit(
             None => false,
         };
         if !fits {
+            // A wait this run will not take is a server it has stopped waiting for. What
+            // the next address on it would do is take this same decision again, one wait
+            // at a time and one share of the budget at a time, and arrive at the same
+            // answer; recording it here is what keeps the hundredth address owed at the
+            // cost of a request rather than of a whole share. A run with no deadline is
+            // not a run that gave up on anything: `fits` is false there because nothing
+            // bounds a wait, not because a wait was refused.
+            if deadline.is_some() {
+                state.give_up_on(&host);
+            }
             break;
         }
         std::thread::sleep(wait);
         asked_again = true;
-        state.insert(host.clone(), consecutive + 1);
+        state.refused_again(&host, consecutive + 1);
         event = fetch_again(&url);
     }
     // The pace this run owes the host applies to whatever it asks for next, and the request
@@ -523,7 +590,7 @@ pub(crate) fn wait_out_rate_limit(
         }
     }
     if matches!(&event, PageEvent::Response(page) if page.status < 400) {
-        state.insert(host, 0);
+        state.answered(&host);
         *recovered += 1;
     }
     event
@@ -829,7 +896,7 @@ mod tests {
     /// returned exactly as it arrived, and the fetch this was given is never called.
     #[test]
     fn wait_out_rate_limit_leaves_every_other_status_untouched() {
-        let mut state = HashMap::new();
+        let mut state = RateLimitMemory::default();
         let mut recovered = 0;
         let mut calls = 0;
         let event = refused(503, Vec::new());
@@ -856,7 +923,7 @@ mod tests {
     /// address is counted as recovered rather than left to be recorded as owed.
     #[test]
     fn wait_out_rate_limit_asks_again_and_counts_a_success() {
-        let mut state = HashMap::new();
+        let mut state = RateLimitMemory::default();
         let mut recovered = 0;
         let mut calls = 0;
 
@@ -880,9 +947,9 @@ mod tests {
         assert_eq!(calls, 1, "the address was not asked for again");
         assert_eq!(recovered, 1);
         assert_eq!(
-            state.get("example.com"),
-            Some(&0),
-            "a host that just answered under 400 was left with an elevated count"
+            state.consecutive_refusals(&rate_limit_key("https://example.com/slow")),
+            0,
+            "a server that just answered under 400 was left with an elevated count"
         );
     }
 
@@ -892,7 +959,7 @@ mod tests {
     /// could ever choose, so the bound is what stops this rather than the test's own timing.
     #[test]
     fn wait_out_rate_limit_gives_up_before_a_wait_would_cross_the_deadline() {
-        let mut state = HashMap::new();
+        let mut state = RateLimitMemory::default();
         let mut recovered = 0;
         let mut calls = 0;
         let event = refused(429, Vec::new());
@@ -925,7 +992,7 @@ mod tests {
     /// it for as long as the run itself has chosen to be willing to run.
     #[test]
     fn wait_out_rate_limit_never_waits_when_the_run_has_no_deadline() {
-        let mut state = HashMap::new();
+        let mut state = RateLimitMemory::default();
         let mut recovered = 0;
         let mut calls = 0;
         let event = refused(429, Vec::new());
@@ -961,7 +1028,7 @@ mod tests {
     /// one, two and four seconds, asked three times, and spent seven of the eight.
     #[test]
     fn wait_out_rate_limit_spends_at_most_its_share_of_the_budget_on_one_address() {
-        let mut state = HashMap::new();
+        let mut state = RateLimitMemory::default();
         let mut recovered = 0;
         let mut calls = 0;
 
@@ -999,7 +1066,7 @@ mod tests {
     /// that was polite enough to read the header.
     #[test]
     fn wait_out_rate_limit_refuses_a_retry_after_too_large_to_add_up() {
-        let mut state = HashMap::new();
+        let mut state = RateLimitMemory::default();
         let mut recovered = 0;
         let mut calls = 0;
         let event = refused(429, vec![retry_after(&u64::MAX.to_string())]);
@@ -1027,7 +1094,7 @@ mod tests {
     /// instant this returns. The gap is paid here or it is not paid at all.
     #[test]
     fn wait_out_rate_limit_leaves_the_run_s_own_pace_behind_its_last_request() {
-        let mut state = HashMap::new();
+        let mut state = RateLimitMemory::default();
         let mut recovered = 0;
         let floor = Duration::from_millis(600);
 
@@ -1055,22 +1122,22 @@ mod tests {
         );
     }
 
-    /// A host that has already been refused several times in a row does not lend that count
-    /// to an address on another host: the wait `a.example`'s own count would produce is
-    /// growing and long, and a fresh host answering 429 for the first time still gets the
+    /// A server that has already been refused several times in a row does not lend that
+    /// count to an address on another one: the wait `a.example`'s own count would produce is
+    /// growing and long, and a fresh server answering 429 for the first time still gets the
     /// smallest wait backoff chooses, not the one `a.example` has earned. Sharing the count
-    /// would cost the run addresses on hosts that never refused anything.
+    /// would cost the run addresses on servers that never refused anything.
     #[test]
-    fn wait_out_rate_limit_keeps_a_separate_backoff_per_host() {
-        let mut state = HashMap::new();
-        // Keyed through the same `host_of` production code uses, rather than a literal
-        // guess at its spelling, so a change to how a host is derived from a URL is a change
-        // this test would notice too: seeding under a key nothing ever looks up again would
-        // pass whether or not the two hosts actually stayed apart.
+    fn wait_out_rate_limit_keeps_a_separate_backoff_per_server() {
+        let mut state = RateLimitMemory::default();
+        // Keyed through the same `rate_limit_key` production code uses, rather than a
+        // literal guess at its spelling, so a change to how a server is derived from a URL
+        // is a change this test would notice too: seeding under a key nothing ever looks up
+        // again would pass whether or not the two servers actually stayed apart.
         //
         // As if `a.example` had already been refused three times in a row; its own next wait
         // would be eight seconds, `RATE_LIMIT_BASE_BACKOFF * 2^3`.
-        state.insert(host_of("https://a.example/first"), 3);
+        state.refused_again(&rate_limit_key("https://a.example/first"), 3);
         let mut recovered = 0;
 
         let started = Instant::now();
@@ -1091,12 +1158,12 @@ mod tests {
         );
         assert!(
             elapsed < Duration::from_secs(4),
-            "a fresh host inherited another host's own backoff count, took {elapsed:?}"
+            "a fresh server inherited another server's own backoff count, took {elapsed:?}"
         );
         assert_eq!(
-            state.get(&host_of("https://a.example/first")),
-            Some(&3),
-            "an unrelated host's own count changed when only b.example was asked for anything"
+            state.consecutive_refusals(&rate_limit_key("https://a.example/first")),
+            3,
+            "an unrelated server's own count changed when only b.example was asked for anything"
         );
     }
 }

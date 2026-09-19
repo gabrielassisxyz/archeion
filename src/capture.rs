@@ -3101,14 +3101,21 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let archive = archive_in(&dir);
         let mut seed = Seed::new("https://example.com/");
-        // Shorter than the rate limit backoff's own smallest wait, so the refusal below gives
-        // up on the deadline rather than have this test sit through however long waiting one
-        // out actually takes.
-        seed.deadline = Some(Duration::from_millis(500));
+        // A generous deadline and a refusal asking for an hour, rather than a deadline too
+        // short for any wait: what has to be exercised is an address given up on while the
+        // budget is still open, and a budget short enough to refuse every wait is also short
+        // enough for this phase's own loop guard to end the list on its own, which proves
+        // nothing about the address. Nothing here waits, because an hour does not fit.
+        seed.deadline = Some(Duration::from_secs(30));
         let refusing = "https://example.com/refusing".to_owned();
         let serving = "https://example.com/serving".to_owned();
+        let mut refusal = page(&refusing, 429, "Too Many Requests");
+        response_of(&mut refusal).headers.push(Header {
+            name: "Retry-After".to_owned(),
+            value: "3600".to_owned(),
+        });
         let engine = ScriptedCrawlEngine::new(Vec::new()).serving(vec![
-            page(&refusing, 429, "Too Many Requests"),
+            refusal,
             page(&serving, 200, "<html><body><p>prose</p></body></html>"),
         ]);
 

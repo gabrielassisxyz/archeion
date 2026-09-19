@@ -8,6 +8,7 @@
 pub mod capture;
 pub mod export;
 pub mod list;
+pub mod progress;
 pub mod repass;
 pub mod session_cookie;
 

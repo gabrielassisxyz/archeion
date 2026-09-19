@@ -2852,3 +2852,254 @@ fn a_mixed_run_lists_only_the_pages_the_host_served() {
         "one blob for the index, one for the served page, and none for the refused one"
     );
 }
+
+/// Everything `--progress` promises about stdout, asserted against the one thing a pipeline
+/// depends on: the flag changes stderr and nothing else. The default level is pinned to its
+/// literal text as well, in both modes, because "unchanged" is only a guarantee against a
+/// recorded before.
+///
+/// One site for every run, so the seed url in the report is the same string each time; the
+/// archive path is the only thing that legitimately differs between them and is folded out.
+#[test]
+fn no_progress_level_changes_a_single_byte_of_stdout() {
+    let site = Site::start();
+    let seed_url = site.url("/index.html");
+    let run = |level: Option<&str>, json: bool| {
+        let dir = TempDir::new().expect("temp dir");
+        let archive_path = dir.path().join("collection");
+        let mut command = archeion();
+        if json {
+            command.arg("--json");
+        }
+        command.arg("capture").arg(&archive_path).arg(&seed_url);
+        if let Some(level) = level {
+            command.arg(level);
+        }
+        let output = command
+            .args([
+                "--max-pages",
+                "4",
+                "--concurrency",
+                "1",
+                "--max-retries",
+                "0",
+            ])
+            .args(["--deadline", "30s", "--allow-private-addresses"])
+            .output()
+            .expect("the binary runs");
+        assert!(output.status.success(), "{}", stderr_of(&output));
+        // The archive lives in a fresh temp dir per run and its path is printed in the
+        // report, so it is the one difference between two runs that says nothing about this.
+        let stdout = stdout_of(&output).replace(&archive_path.display().to_string(), "<archive>");
+        (stdout, stderr_of(&output))
+    };
+
+    let (human, human_stderr) = run(None, false);
+    assert_eq!(
+        human,
+        format!(
+            "created an archive at <archive>\n\
+             archived 2 capture(s) from {seed_url} into <archive>\n  \
+             host refused  none\n  \
+             articles      1 extracted, 0 refused\n  \
+             assets        1 stored, 0 missed, 1 request(s)\n  \
+             pages dropped 0\n  \
+             links lost    0\n  \
+             recovered     0\n  \
+             stopped       nothing was left to fetch\n"
+        )
+    );
+    assert_eq!(human_stderr, "", "a run with no --progress said something");
+    let (machine, machine_stderr) = run(None, true);
+    assert_eq!(machine_stderr, "");
+    serde_json::from_str::<serde_json::Value>(&machine).expect("stdout is one JSON object");
+    assert_eq!(
+        machine,
+        format!(
+            "{{\"seed_url\":\"{seed_url}\",\"archive\":\"<archive>\",\"archive_created\":true,\
+             \"captures_written\":2,\"items_appended\":null,\"responses_refused\":{{}},\
+             \"articles_extracted\":1,\"extractions_refused\":0,\"assets_stored\":1,\
+             \"assets_missed\":0,\"asset_fetches\":1,\"pages_dropped\":0,\
+             \"links_never_followed\":[],\"links_recovered\":0,\"stopped\":\"exhausted\",\
+             \"session\":null,\"sitemap\":null,\"resume\":null,\"failed_fetches\":[],\
+             \"unaddressable_pages\":[],\"pages_inside_a_network\":[],\"unreadable_pages\":[],\
+             \"unreadable_articles\":[]}}\n"
+        ),
+        "--json stdout moved away from its recorded text"
+    );
+
+    for level in ["--progress", "--progress=lines", "--progress=bar"] {
+        assert_eq!(run(Some(level), false).0, human, "{level} reached stdout");
+        assert_eq!(run(Some(level), true).0, machine, "{level} reached stdout");
+    }
+}
+
+/// Stderr with no terminal behind it. A pipe has no cursor to move back to, so a carriage
+/// return written into one is a byte sitting in a log file forever rather than the redraw it
+/// meant on a screen, and an ANSI escape is worse. Every level still has to say something.
+#[test]
+fn a_progress_level_on_a_pipe_writes_no_escape_and_no_redraw() {
+    let site = Site::start();
+    let progress_of = |level: &str| {
+        let dir = TempDir::new().expect("temp dir");
+        let output = archeion()
+            .arg("capture")
+            .arg(dir.path().join("collection"))
+            .arg(site.url("/index.html"))
+            .arg(level)
+            .args([
+                "--max-pages",
+                "4",
+                "--concurrency",
+                "1",
+                "--max-retries",
+                "0",
+            ])
+            .args(["--deadline", "30s", "--allow-private-addresses"])
+            .output()
+            .expect("the binary runs");
+        assert!(output.status.success(), "{}", stderr_of(&output));
+        stderr_of(&output)
+    };
+
+    for level in ["--progress", "--progress=lines", "--progress=bar"] {
+        let stderr = progress_of(level);
+        assert!(!stderr.is_empty(), "{level} said nothing at all");
+        assert!(
+            !stderr.contains('\r'),
+            "{level} redrew into a pipe: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains('\x1b'),
+            "{level} wrote an escape into a pipe: {stderr:?}"
+        );
+    }
+
+    // What each level says, which is the other half of degrading well: a bar that wrote no
+    // control characters and also stated nothing would pass every assertion above.
+    let lines = progress_of("--progress=lines");
+    assert!(
+        lines.contains(&format!("{}: ", site.url("/article.html"))),
+        "the lines level named no page and what it produced: {lines:?}"
+    );
+    // A bare flag is the lines level, not the bar: it names pages the same way.
+    let bare = progress_of("--progress");
+    assert!(
+        bare.contains(&format!("{}: ", site.url("/article.html"))),
+        "a bare --progress did not print the lines level: {bare:?}"
+    );
+    let bar = progress_of("--progress=bar");
+    assert!(
+        bar.contains("/4 pages") && bar.contains("s left"),
+        "the bar stated neither the page limit nor the deadline: {bar:?}"
+    );
+}
+
+/// The one thing a redrawing bar could take from an operator: a warning, printed while the run
+/// is going, landing on the same line as a redraw or being wiped by the next one. The warning
+/// a second run into the same archive prints is the one every capture can arrange.
+#[test]
+fn a_warning_printed_during_a_run_survives_the_bar_intact() {
+    let site = Site::start();
+    let seed_url = site.url("/index.html");
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+    let run = |level: Option<&str>| {
+        let mut command = archeion();
+        command.arg("capture").arg(&archive_path).arg(&seed_url);
+        if let Some(level) = level {
+            command.arg(level);
+        }
+        let output = command
+            .args([
+                "--max-pages",
+                "4",
+                "--concurrency",
+                "1",
+                "--max-retries",
+                "0",
+            ])
+            .args(["--deadline", "30s", "--allow-private-addresses"])
+            .output()
+            .expect("the binary runs");
+        assert!(output.status.success(), "{}", stderr_of(&output));
+        stderr_of(&output)
+    };
+
+    run(None);
+    let expected = format!(
+        "warning: {seed_url} already has captures in this archive; this run appends to them \
+         rather than replacing them\n"
+    );
+    for level in [None, Some("--progress"), Some("--progress=bar")] {
+        let stderr = run(level);
+        assert!(
+            stderr.contains(&expected),
+            "the warning did not survive {level:?}: {stderr:?}"
+        );
+    }
+}
+
+/// `--progress` takes its level with an equals sign and never as the next argument, so a bare
+/// flag cannot eat the positional beside it. Both verbs, and the flag on either side of the
+/// path, because that is where the two orders come apart.
+#[test]
+fn a_bare_progress_flag_does_not_swallow_the_argument_after_it() {
+    let dir = TempDir::new().expect("temp dir");
+    let archive_path = dir.path().join("collection");
+
+    // `repass` on an archive that does not exist fails on the archive, which is the point:
+    // the command line was read, and the path was read as the path.
+    for order in [
+        vec![
+            "repass",
+            "--progress",
+            archive_path.to_str().expect("utf-8"),
+        ],
+        vec![
+            "repass",
+            archive_path.to_str().expect("utf-8"),
+            "--progress",
+        ],
+    ] {
+        let output = archeion().args(&order).output().expect("the binary runs");
+        assert_ne!(
+            output.status.code(),
+            Some(2),
+            "{order:?} was rejected as a command line: {}",
+            stderr_of(&output)
+        );
+    }
+
+    // `capture` with a seed the engine refuses reaches the same place: past the parse.
+    for order in [
+        vec![
+            "capture",
+            "--progress",
+            archive_path.to_str().expect("utf-8"),
+            "https://127.0.0.1/x",
+        ],
+        vec![
+            "capture",
+            archive_path.to_str().expect("utf-8"),
+            "https://127.0.0.1/x",
+            "--progress",
+        ],
+    ] {
+        let output = archeion().args(&order).output().expect("the binary runs");
+        assert_ne!(
+            output.status.code(),
+            Some(2),
+            "{order:?} was rejected as a command line: {}",
+            stderr_of(&output)
+        );
+    }
+
+    // And a level named without the equals sign is refused rather than read off the next
+    // argument, which is what makes the two orders above safe.
+    let output = archeion()
+        .args(["repass", "--progress", "bar", "/nowhere"])
+        .output()
+        .expect("the binary runs");
+    assert_eq!(output.status.code(), Some(2), "{}", stdout_of(&output));
+}

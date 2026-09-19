@@ -1092,14 +1092,20 @@ fn a_page_that_refuses_twice_and_then_serves_is_captured_with_nothing_owed() {
 }
 
 /// A `Retry-After` naming a wait longer than backoff would have chosen on its own, in
-/// seconds, is what the run actually waits: the header asks for three seconds, longer than
-/// the one second `RATE_LIMIT_BASE_BACKOFF` would choose unprompted, and the page is served
-/// on the very next request.
+/// seconds, is what the run actually waits: the header asks for eight seconds and the page
+/// is served on the very next request.
+///
+/// The bound is well clear of the second `RATE_LIMIT_BASE_BACKOFF` chooses when it reads no
+/// header at all, and it has to be: a run's own startup, its `robots.txt` request and the
+/// process spawn are between one and two seconds here, so a bound set a little over that
+/// second is a bound a run ignoring the header entirely still clears. That was the case
+/// with a three second header and a 2.8 second bound, measured by deleting the header read
+/// and watching both of these pass.
 #[test]
 fn a_retry_after_given_in_seconds_and_longer_than_the_default_backoff_is_honoured() {
     let dir = TempDir::new().expect("temp dir");
     let (port, _requests) =
-        serve_a_page_that_refuses_a_fixed_number_of_times(1, Some("3".to_owned()));
+        serve_a_page_that_refuses_a_fixed_number_of_times(1, Some("8".to_owned()));
     let seed_url = format!("http://127.0.0.1:{port}/index.html");
 
     let started = std::time::Instant::now();
@@ -1108,7 +1114,10 @@ fn a_retry_after_given_in_seconds_and_longer_than_the_default_backoff_is_honoure
         .arg(dir.path())
         .arg(&seed_url)
         .args(["--max-pages", "1", "--max-retries", "0"])
-        .args(["--deadline", "10s", "--allow-private-addresses"])
+        // Room for the header's own wait and the run's startup both: backoff refuses a wait
+        // that would not fit inside what is left of the deadline, so a budget only just
+        // larger than the header asks for is a budget the header loses against.
+        .args(["--deadline", "30s", "--allow-private-addresses"])
         .output()
         .expect("the binary runs");
     let elapsed = started.elapsed();
@@ -1117,8 +1126,8 @@ fn a_retry_after_given_in_seconds_and_longer_than_the_default_backoff_is_honoure
     // A lower bound, which is the only kind a sleep can be held to: it never returns early,
     // and asserting an upper bound would be asserting that this machine was not busy.
     assert!(
-        elapsed >= Duration::from_millis(2_800),
-        "a three second Retry-After was not honoured, took {elapsed:?}"
+        elapsed >= Duration::from_millis(6_500),
+        "an eight second Retry-After was not honoured, took {elapsed:?}"
     );
 
     let owed = archive_owed(dir.path());
@@ -1129,14 +1138,15 @@ fn a_retry_after_given_in_seconds_and_longer_than_the_default_backoff_is_honoure
 }
 
 /// The same wait, asked for in the other form the header may take: an HTTP-date naming the
-/// moment to come back rather than a count of seconds.
+/// moment to come back rather than a count of seconds. The bound is far from the wait
+/// backoff takes unprompted for the reason stated above.
 #[test]
 fn a_retry_after_given_as_an_http_date_and_longer_than_the_default_backoff_is_honoured() {
     let dir = TempDir::new().expect("temp dir");
-    // Four seconds ahead rather than three: `fmt_http_date` truncates to a whole second, and
-    // the header is read back a moment after it was written, so a target picked exactly at
-    // the assertion's own bound would round down under it on an unlucky run.
-    let target = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(4));
+    // Nine seconds rather than eight: `fmt_http_date` truncates to a whole second, and the
+    // header is read back a moment after it was written, so a target picked exactly at the
+    // assertion's own bound would round down under it on an unlucky run.
+    let target = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(9));
     let (port, _requests) = serve_a_page_that_refuses_a_fixed_number_of_times(1, Some(target));
     let seed_url = format!("http://127.0.0.1:{port}/index.html");
 
@@ -1146,15 +1156,18 @@ fn a_retry_after_given_as_an_http_date_and_longer_than_the_default_backoff_is_ho
         .arg(dir.path())
         .arg(&seed_url)
         .args(["--max-pages", "1", "--max-retries", "0"])
-        .args(["--deadline", "10s", "--allow-private-addresses"])
+        // Room for the header's own wait and the run's startup both: backoff refuses a wait
+        // that would not fit inside what is left of the deadline, so a budget only just
+        // larger than the header asks for is a budget the header loses against.
+        .args(["--deadline", "30s", "--allow-private-addresses"])
         .output()
         .expect("the binary runs");
     let elapsed = started.elapsed();
 
     assert!(output.status.success(), "{}", stderr_of(&output));
     assert!(
-        elapsed >= Duration::from_millis(2_800),
-        "a four second Retry-After HTTP-date was not honoured, took {elapsed:?}"
+        elapsed >= Duration::from_millis(6_500),
+        "a nine second Retry-After HTTP-date was not honoured, took {elapsed:?}"
     );
 
     let owed = archive_owed(dir.path());

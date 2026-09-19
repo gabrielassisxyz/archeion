@@ -38,7 +38,7 @@ use url::Url;
 
 use super::boundary::{
     CrawlEngine, CrawlError, CrawlOutcome, CrawlStop, FetchFailure, PageEvent, PageResponse, Seed,
-    is_internal_host,
+    is_internal_host, wait_out_rate_limit,
 };
 use super::robots::{Group, RobotRules, Rule};
 use crate::storage::Header;
@@ -336,6 +336,12 @@ async fn crawl_seed(
     let depths: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     configure_for_seed(website, start, seed, Arc::clone(&depths));
     let robots = robots_rules(website, raw_lines_cache, user_agent_of(seed)).await;
+    // The larger of the two, never the site's alone: `robots_rules` above already overwrote
+    // `website`'s own delay with the site's `Crawl-delay` whenever one was declared. Read
+    // once here, ahead of the crawl itself, so a 429 met on the very first page backs off no
+    // faster than the pace this run is already honouring on every other request; recovery
+    // below reuses this same value rather than asking `website` for its delay a second time.
+    let effective_delay = seed.delay.max(website.get_delay());
     // The engine fetches while the caller writes to disk, so the queue between them has to
     // absorb the difference. Sizing it to the fetch concurrency alone drops pages the
     // moment a write is slower than a fetch; sizing it to the page limit would hold a
@@ -348,12 +354,40 @@ async fn crawl_seed(
     // dropped in its own frontier apart from one this adapter never promised to follow.
     let mut fetched: HashSet<String> = HashSet::new();
     let scheme = frontier_scheme(start);
+    // How many times in a row each host has answered 429 to this seed, which is what lets a
+    // wait grow across a run's own successive refusals rather than reset with every new
+    // address. Recovery below shares neither this map nor a backoff of its own: an address it
+    // reaches already spent the crawl's own retry budget without ever being seen here.
+    let mut rate_limit_state: HashMap<String, u32> = HashMap::new();
+    let mut pages_recovered_from_rate_limit = 0usize;
+    // Set the one time backoff gives up on an address specifically because a further wait
+    // would have crossed the seed's own deadline, so a run otherwise reporting `Exhausted`
+    // can say the deadline is what actually ended it instead.
+    let mut deadline_reached_by_backoff = false;
     // Named apart from the caller's own `on_page`, and not a shadow of it, because
     // `recover_lost_links` below needs a second closure built the same way once this one's
     // own borrow of `fetched` has ended; a shadow could not be told apart from the
     // parameter it wraps once this scope needed to build another.
-    let mut filtered_on_page =
-        |event: PageEvent| filter_and_forward(event, &robots, &mut fetched, &scheme, on_page);
+    //
+    // Backoff is applied here and not inside `filter_and_forward`, because recovery already
+    // owns its own retry decision for a 429 and hands the boundary only the attempt it gave
+    // up on (see `recover_lost_links`): a second, slower retry layered underneath that one
+    // would spend requests recovery already decided were not worth spending.
+    let mut filtered_on_page = |event: PageEvent| {
+        forward_after_rate_limit_backoff(
+            event,
+            &robots,
+            &mut fetched,
+            &scheme,
+            seed,
+            seed_started,
+            effective_delay,
+            &mut rate_limit_state,
+            &mut pages_recovered_from_rate_limit,
+            &mut deadline_reached_by_backoff,
+            on_page,
+        )
+    };
 
     // Scoped so the borrow of the website ends with the crawl it was driving.
     let mut stopped = {
@@ -459,11 +493,10 @@ async fn crawl_seed(
             .ok()
             .and_then(|url| url.host_str().map(str::to_owned));
         let selectors = website.setup_selectors();
-        // The larger of the two, never the site's alone: `robots_rules` already overwrote
-        // `website`'s own delay with the site's `Crawl-delay` whenever one was declared,
-        // which on a site asking for less than `--delay` would otherwise let recovery run
-        // faster than the crawl itself just did.
-        let effective_delay = seed.delay.max(website.get_delay());
+        // Computed once, above, right after `robots_rules` overwrote `website`'s own delay
+        // with the site's `Crawl-delay` whenever one was declared: the same value the crawl
+        // itself already paced against, reused here rather than read from `website` a second
+        // time, since nothing between there and here changes what it should be.
 
         // `filtered_on_page`'s own borrow of `fetched` ended with its last use above, so a
         // second closure built the same way, over the same `robots`, `fetched` and
@@ -491,6 +524,16 @@ async fn crawl_seed(
             RecoveryStop::CallerStopped => CrawlStop::CallerStopped,
         };
     }
+    // A run whose crawl and recovery both otherwise say there was nothing left to fetch, but
+    // whose rate limit backoff gave up on an address specifically because the deadline was
+    // in the way, did not run out of things to ask for: it ran out of time to keep asking
+    // the one thing it had left. Never overrides a page ceiling or a caller's own stop,
+    // which are more specific answers than a default this backoff decision would otherwise
+    // leave standing.
+    if deadline_reached_by_backoff && outcome.stopped == CrawlStop::Exhausted {
+        outcome.stopped = CrawlStop::DeadlineReached;
+    }
+    outcome.pages_recovered_from_rate_limit = pages_recovered_from_rate_limit;
     outcome
 }
 
@@ -527,10 +570,61 @@ fn filter_and_forward(
     scheme: &str,
     on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
 ) -> ControlFlow<()> {
-    if !robots.allows(requested_url_of(&event)) {
+    if !admitted(&event, robots, fetched, scheme) {
         return ControlFlow::Continue(());
     }
-    fetched.insert(depth_key(requested_url_of(&event), scheme));
+    on_page(event)
+}
+
+/// Whether a page event is this project's own decision to deliver at all, and marks it
+/// fetched if so. Shared by the crawl's own forwarding and by recovery's: a page this
+/// project's robots decision refuses is not delivered by either door, and `fetched` never
+/// gains an entry for one either way.
+fn admitted(
+    event: &PageEvent,
+    robots: &RobotRules,
+    fetched: &mut HashSet<String>,
+    scheme: &str,
+) -> bool {
+    if !robots.allows(requested_url_of(event)) {
+        return false;
+    }
+    fetched.insert(depth_key(requested_url_of(event), scheme));
+    true
+}
+
+/// What `filter_and_forward` is for the ordinary crawl path, with one further step between
+/// admission and delivery: a page a host answered 429 is not handed over yet, it is waited
+/// out and asked for again first. Recovery does not go through this: it already spent its
+/// own retry budget on a 429 before ever reaching `filter_and_forward`, and a second, slower
+/// layer underneath that decision would retry requests recovery already gave up on.
+#[allow(clippy::too_many_arguments)]
+fn forward_after_rate_limit_backoff(
+    event: PageEvent,
+    robots: &RobotRules,
+    fetched: &mut HashSet<String>,
+    scheme: &str,
+    seed: &Seed,
+    seed_started: Instant,
+    effective_delay: Duration,
+    rate_limit_state: &mut HashMap<String, u32>,
+    pages_recovered_from_rate_limit: &mut usize,
+    deadline_reached_by_backoff: &mut bool,
+    on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
+) -> ControlFlow<()> {
+    if !admitted(&event, robots, fetched, scheme) {
+        return ControlFlow::Continue(());
+    }
+    let (event, gave_up_on_the_deadline) = wait_out_rate_limit(
+        event,
+        seed.deadline,
+        seed_started,
+        effective_delay,
+        rate_limit_state,
+        pages_recovered_from_rate_limit,
+        |url| fetch_off_the_crawl_runtime(url, seed),
+    );
+    *deadline_reached_by_backoff |= gave_up_on_the_deadline;
     on_page(event)
 }
 

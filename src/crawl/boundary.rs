@@ -5,10 +5,11 @@
 //! the archive's terms rather than the engine's, so swapping the engine is a new adapter
 //! and not a rewrite of the code that stores what it produced.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::ControlFlow;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use jiff::Timestamp;
 use url::{Host, Origin, Url};
@@ -338,7 +339,155 @@ pub struct CrawlOutcome {
     /// robots decision would have let them through. Counted rather than listed: once one is
     /// archived it is an ordinary capture like any other, and `list` is what names it.
     pub links_recovered: usize,
+    /// Pages a host answered 429 that were archived anyway, once waiting for it stopped being
+    /// refused. Counted rather than listed, on the same reasoning as `links_recovered` above:
+    /// once one is archived it is an ordinary capture like any other, and it is not owed.
+    pub pages_recovered_from_rate_limit: usize,
     pub stopped: CrawlStop,
+}
+
+/// The smallest a wait for a rate-limited host is ever asked to be, and what it doubles from
+/// on each successive 429 that host has answered. A whole second rather than something
+/// sub-second: a host answering 429 at all is already saying the current pace is too fast, and
+/// asking again inside the same second is the pace that produced the refusal.
+const RATE_LIMIT_BASE_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The most a single wait may grow to before the next attempt asks again, independent of the
+/// seed's own deadline. Doubling has no ceiling of its own, and a host that keeps refusing
+/// would otherwise grow one sitting's wait past anything worth sleeping through at once; the
+/// deadline check beside every wait, not this number, is what decides whether the run gives up
+/// on the address altogether.
+const RATE_LIMIT_MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
+/// How long to wait before asking a rate-limited address again.
+///
+/// Doubles with every successive 429 the same host has already answered in this run, since a
+/// wait that stays flat is a wait tuned for the first refusal and never adjusted for a host
+/// still refusing after it. Never shorter than `floor`, the pace this run is already honouring
+/// on every other request it makes: a backoff under that would be a faster request to the
+/// exact host that just said the pace was too fast, which is not politeness with a different
+/// name. A `Retry-After` the host sent wins whenever it asks for longer than either.
+fn rate_limit_backoff(
+    consecutive_refusals: u32,
+    floor: Duration,
+    retry_after: Option<Duration>,
+) -> Duration {
+    // Ten doublings already exceeds `RATE_LIMIT_MAX_BACKOFF`, so capping the exponent here is
+    // what keeps the multiplication below from ever needing to be checked.
+    let doublings = consecutive_refusals.min(10);
+    let grown = (RATE_LIMIT_BASE_BACKOFF * 2u32.pow(doublings)).min(RATE_LIMIT_MAX_BACKOFF);
+    let floor = grown.max(floor);
+    retry_after.map_or(floor, |asked| floor.max(asked))
+}
+
+/// The wait a `Retry-After` header asked for, read as either form the header may take: a count
+/// of seconds, or an HTTP-date naming when to come back. `None` covers a header that is
+/// absent, unparseable, or already in the past, since a header naming a moment already gone
+/// asks for nothing more than what backoff already provides on its own.
+fn retry_after_wait(headers: &[Header]) -> Option<Duration> {
+    let value = headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("retry-after"))
+        .map(|header| header.value.trim())?;
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let target = httpdate::parse_http_date(value).ok()?;
+    target.duration_since(SystemTime::now()).ok()
+}
+
+/// The host a backoff decision is tracked against, read off the address itself rather than
+/// off whatever the caller already knows about it: an address this fails to parse still gets
+/// its own counter, keyed on its own spelling, so backoff degrades to per-address rather than
+/// disappearing.
+fn host_of(url: &str) -> String {
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        .unwrap_or_else(|| url.to_owned())
+}
+
+/// Waits out a 429 and asks for the same address again, growing the wait across successive
+/// refusals from the same host until the host answers something other than 429 or waiting
+/// again would spend the run's own deadline rather than a fetch. Every other status a caller
+/// hands this is returned untouched: only a 429 says the address is fine and the pace is the
+/// problem, and every other retryable status already had its say, inside the engine or inside
+/// recovery, before either one ever calls this.
+///
+/// `fetch_again` is how this crosses the same line every fetch here does: a caller supplies
+/// it rather than this function reaching for an engine of its own, which is what lets both a
+/// live crawl, where a retry has to bypass the frontier that already gave up on the address,
+/// and a plain fetch, where there was never a frontier to bypass, share the one policy.
+///
+/// A page recovered this way is filed as the response it is, and nothing about its own links
+/// is followed from here: reopening the frontier for a page this project has already decided
+/// not to reach through it is the same call `docs/crawl-boundary.md` makes for a lost link,
+/// made again here for a different reason.
+///
+/// The deadline check happens before every sleep rather than only once at the top, and
+/// compares the wait about to be taken rather than only the clock already spent: a caller
+/// blocking this loop synchronously, as every caller here does, can starve whatever else
+/// would otherwise have noticed the deadline expire, so this has to notice it on its own
+/// before a wait large enough to matter is ever taken, not only after one already was.
+///
+/// A seed with no deadline never waits here at all, and this is the one case a caller cannot
+/// override by choosing a shorter floor: nothing bounds how long a host may keep refusing,
+/// and "bounded by the deadline" has nothing to be bounded by when there is none. A run asked
+/// to run forever keeps doing so, on whatever other addresses are left, rather than this
+/// function choosing a ceiling of its own for a run that deliberately chose to have none.
+///
+/// The second half of what comes back says whether the deadline, rather than the host
+/// finally answering, is what ended this call: true only when a deadline was in force and a
+/// further wait would have crossed it while the address was still refusing. A caller whose
+/// own report otherwise defaults to "nothing was left to fetch" has to read this and say the
+/// deadline instead, since a run held up by backoff and then cut off by its own budget did
+/// not run out of things to ask for, it ran out of time to keep asking the one thing it had
+/// left.
+pub(crate) fn wait_out_rate_limit(
+    event: PageEvent,
+    deadline: Option<Duration>,
+    started: Instant,
+    floor: Duration,
+    state: &mut HashMap<String, u32>,
+    recovered: &mut usize,
+    mut fetch_again: impl FnMut(&str) -> PageEvent,
+) -> (PageEvent, bool) {
+    let PageEvent::Response(first) = &event else {
+        return (event, false);
+    };
+    if first.status != 429 {
+        return (event, false);
+    }
+    let url = first.requested_url.clone();
+    let host = host_of(&url);
+    let mut event = event;
+    let mut gave_up_on_the_deadline = false;
+    while let PageEvent::Response(page) = &event {
+        if page.status != 429 {
+            break;
+        }
+        let consecutive = state.get(&host).copied().unwrap_or(0);
+        let wait = rate_limit_backoff(consecutive, floor, retry_after_wait(&page.headers));
+        let fits_the_deadline = match deadline {
+            Some(budget) => started.elapsed() + wait < budget,
+            None => false,
+        };
+        if !fits_the_deadline {
+            // A `None` deadline never waits at all, which the branch above already answers
+            // on the first pass through this loop; reaching this point with one still means
+            // a deadline was in force and the wait about to be taken would have crossed it.
+            gave_up_on_the_deadline = deadline.is_some();
+            break;
+        }
+        std::thread::sleep(wait);
+        state.insert(host.clone(), consecutive + 1);
+        event = fetch_again(&url);
+    }
+    if matches!(&event, PageEvent::Response(page) if page.status < 400) {
+        state.insert(host, 0);
+        *recovered += 1;
+    }
+    (event, gave_up_on_the_deadline)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -520,5 +669,307 @@ mod tests {
 
         assert!(!printed.contains("secret"), "the cookie was printed");
         assert!(printed.contains("https://parknotes.substack.com"));
+    }
+
+    fn refused(status: u16, headers: Vec<Header>) -> PageEvent {
+        refused_at("https://example.com/rate-limited", status, headers)
+    }
+
+    fn refused_at(url: &str, status: u16, headers: Vec<Header>) -> PageEvent {
+        PageEvent::Response(PageResponse {
+            requested_url: url.to_owned(),
+            final_url: url.to_owned(),
+            status,
+            headers,
+            body: Vec::new(),
+            body_truncated: false,
+            fetched_at: Timestamp::UNIX_EPOCH,
+        })
+    }
+
+    fn ok() -> PageEvent {
+        refused(200, Vec::new())
+    }
+
+    fn retry_after(value: &str) -> Header {
+        Header {
+            name: "Retry-After".to_owned(),
+            value: value.to_owned(),
+        }
+    }
+
+    /// The shape the acceptance criterion asks for directly: a wait that is not the same
+    /// number every time a host refuses in a row.
+    #[test]
+    fn rate_limit_backoff_grows_with_each_successive_refusal() {
+        let first = rate_limit_backoff(0, Duration::ZERO, None);
+        let second = rate_limit_backoff(1, Duration::ZERO, None);
+        let third = rate_limit_backoff(2, Duration::ZERO, None);
+
+        assert!(second > first, "{second:?} did not grow past {first:?}");
+        assert!(third > second, "{third:?} did not grow past {second:?}");
+    }
+
+    /// However small the growth is, it never undercuts the pace the run is already asking
+    /// every other request to honour: `floor` stands in for `--delay` or the site's own
+    /// `Crawl-delay`, whichever the caller passed as the larger of the two.
+    #[test]
+    fn rate_limit_backoff_never_undercuts_the_run_s_own_pace() {
+        let floor = Duration::from_secs(90);
+
+        assert_eq!(rate_limit_backoff(0, floor, None), floor);
+    }
+
+    /// A `Retry-After` longer than what backoff would have chosen on its own wins, in either
+    /// direction: this is the growth alone, with the floor already covered above.
+    #[test]
+    fn rate_limit_backoff_honours_a_longer_retry_after() {
+        let asked = Duration::from_secs(120);
+
+        assert_eq!(
+            rate_limit_backoff(0, Duration::ZERO, Some(asked)),
+            asked,
+            "a Retry-After longer than the grown wait did not win"
+        );
+        assert_eq!(
+            rate_limit_backoff(0, Duration::ZERO, Some(Duration::from_millis(1))),
+            RATE_LIMIT_BASE_BACKOFF,
+            "a Retry-After shorter than the grown wait shortened it"
+        );
+    }
+
+    /// Growth is capped independently of the deadline, which is what keeps a single sleep
+    /// from costing more than a caller can reasonably block a thread for even before the
+    /// deadline check ever runs.
+    #[test]
+    fn rate_limit_backoff_stops_growing_at_its_ceiling() {
+        assert_eq!(
+            rate_limit_backoff(30, Duration::ZERO, None),
+            RATE_LIMIT_MAX_BACKOFF
+        );
+    }
+
+    #[test]
+    fn retry_after_wait_reads_the_seconds_form() {
+        let headers = vec![retry_after("120")];
+
+        assert_eq!(retry_after_wait(&headers), Some(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn retry_after_wait_reads_the_http_date_form() {
+        let target = SystemTime::now() + Duration::from_secs(60);
+        let headers = vec![retry_after(&httpdate::fmt_http_date(target))];
+
+        let read = retry_after_wait(&headers).expect("an HTTP-date in the future parses");
+        // A lower and an upper bound rather than an exact value: `fmt_http_date` rounds to
+        // the second and the parse reads the clock again on the way back, so the two ends of
+        // this round trip are never quite the same instant.
+        assert!(
+            read >= Duration::from_secs(58) && read <= Duration::from_secs(61),
+            "{read:?}"
+        );
+    }
+
+    /// A moment already gone asks for nothing more than backoff already provides, rather
+    /// than for a negative wait no `Duration` can hold.
+    #[test]
+    fn retry_after_wait_ignores_a_date_already_in_the_past() {
+        let past = SystemTime::now() - Duration::from_secs(600);
+        let headers = vec![retry_after(&httpdate::fmt_http_date(past))];
+
+        assert_eq!(retry_after_wait(&headers), None);
+    }
+
+    #[test]
+    fn retry_after_wait_is_absent_when_the_header_is_absent() {
+        assert_eq!(retry_after_wait(&[]), None);
+    }
+
+    /// The one status this waits out at all. Every other status, retryable or not, is
+    /// returned exactly as it arrived, and the fetch this was given is never called.
+    #[test]
+    fn wait_out_rate_limit_leaves_every_other_status_untouched() {
+        let mut state = HashMap::new();
+        let mut recovered = 0;
+        let mut calls = 0;
+        let event = refused(503, Vec::new());
+
+        let (result, gave_up_on_the_deadline) = wait_out_rate_limit(
+            event.clone(),
+            None,
+            Instant::now(),
+            Duration::ZERO,
+            &mut state,
+            &mut recovered,
+            |_url| {
+                calls += 1;
+                ok()
+            },
+        );
+
+        assert_eq!(result, event);
+        assert_eq!(calls, 0, "a 503 was retried by the rate limit backoff");
+        assert_eq!(recovered, 0);
+        assert!(
+            !gave_up_on_the_deadline,
+            "a status this never waits out was blamed on the deadline anyway"
+        );
+    }
+
+    /// The address is asked for again after waiting, and once it answers under 400 the
+    /// address is counted as recovered rather than left to be recorded as owed.
+    #[test]
+    fn wait_out_rate_limit_asks_again_and_counts_a_success() {
+        let mut state = HashMap::new();
+        let mut recovered = 0;
+        let mut calls = 0;
+
+        let (result, gave_up_on_the_deadline) = wait_out_rate_limit(
+            refused(429, Vec::new()),
+            Some(Duration::from_secs(10)),
+            Instant::now(),
+            Duration::ZERO,
+            &mut state,
+            &mut recovered,
+            |_url| {
+                calls += 1;
+                ok()
+            },
+        );
+
+        assert!(
+            matches!(&result, PageEvent::Response(page) if page.status == 200),
+            "{result:?}"
+        );
+        assert_eq!(calls, 1, "the address was not asked for again");
+        assert_eq!(recovered, 1);
+        assert_eq!(
+            state.get("example.com"),
+            Some(&0),
+            "a host that just answered under 400 was left with an elevated count"
+        );
+        assert!(
+            !gave_up_on_the_deadline,
+            "a page that ended up served was blamed on the deadline"
+        );
+    }
+
+    /// A wait large enough to cross the deadline is never taken: the address is handed back
+    /// exactly as refused as it arrived, and the fetch this was given is never called. The
+    /// deadline here is far shorter than `RATE_LIMIT_BASE_BACKOFF`, the smallest wait this
+    /// could ever choose, so the bound is what stops this rather than the test's own timing.
+    #[test]
+    fn wait_out_rate_limit_gives_up_before_a_wait_would_cross_the_deadline() {
+        let mut state = HashMap::new();
+        let mut recovered = 0;
+        let mut calls = 0;
+        let event = refused(429, Vec::new());
+
+        let (result, gave_up_on_the_deadline) = wait_out_rate_limit(
+            event.clone(),
+            Some(Duration::from_millis(10)),
+            Instant::now(),
+            Duration::ZERO,
+            &mut state,
+            &mut recovered,
+            |_url| {
+                calls += 1;
+                ok()
+            },
+        );
+
+        assert_eq!(result, event);
+        assert_eq!(calls, 0, "a wait was taken past the run's own deadline");
+        assert_eq!(recovered, 0);
+        assert!(
+            gave_up_on_the_deadline,
+            "a deadline in force, and crossed by the only wait available, was not blamed"
+        );
+    }
+
+    /// A run with no deadline has nothing for a bound to be measured against, so it does not
+    /// grow one of its own: the address is handed back exactly as refused as it arrived, and
+    /// the fetch this was given is never called. A host that refuses forever in this run costs
+    /// this one address, and the run goes on to whatever else is left rather than waiting on
+    /// it for as long as the run itself has chosen to be willing to run.
+    #[test]
+    fn wait_out_rate_limit_never_waits_when_the_run_has_no_deadline() {
+        let mut state = HashMap::new();
+        let mut recovered = 0;
+        let mut calls = 0;
+        let event = refused(429, Vec::new());
+
+        let (result, gave_up_on_the_deadline) = wait_out_rate_limit(
+            event.clone(),
+            None,
+            Instant::now(),
+            Duration::ZERO,
+            &mut state,
+            &mut recovered,
+            |_url| {
+                calls += 1;
+                ok()
+            },
+        );
+
+        assert_eq!(result, event);
+        assert_eq!(
+            calls, 0,
+            "a wait was taken on a run with no deadline at all"
+        );
+        assert_eq!(recovered, 0);
+        // Not the deadline's doing, because there was none: a caller reading this as "the
+        // deadline ended the run" for a seed that chose to have none would be as dishonest a
+        // report as reading a genuine deadline as `Exhausted`.
+        assert!(
+            !gave_up_on_the_deadline,
+            "a run with no deadline blamed one for a wait it never bounded"
+        );
+    }
+
+    /// A host that has already been refused several times in a row does not lend that count
+    /// to an address on another host: the wait `a.example`'s own count would produce is
+    /// growing and long, and a fresh host answering 429 for the first time still gets the
+    /// smallest wait backoff chooses, not the one `a.example` has earned. Sharing the count
+    /// would cost the run addresses on hosts that never refused anything.
+    #[test]
+    fn wait_out_rate_limit_keeps_a_separate_backoff_per_host() {
+        let mut state = HashMap::new();
+        // Keyed through the same `host_of` production code uses, rather than a literal
+        // guess at its spelling, so a change to how a host is derived from a URL is a change
+        // this test would notice too: seeding under a key nothing ever looks up again would
+        // pass whether or not the two hosts actually stayed apart.
+        //
+        // As if `a.example` had already been refused three times in a row; its own next wait
+        // would be eight seconds, `RATE_LIMIT_BASE_BACKOFF * 2^3`.
+        state.insert(host_of("https://a.example/first"), 3);
+        let mut recovered = 0;
+
+        let started = Instant::now();
+        let (result, _gave_up_on_the_deadline) = wait_out_rate_limit(
+            refused_at("https://b.example/other", 429, Vec::new()),
+            Some(Duration::from_secs(10)),
+            started,
+            Duration::ZERO,
+            &mut state,
+            &mut recovered,
+            |_url| refused_at("https://b.example/other", 200, Vec::new()),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(&result, PageEvent::Response(page) if page.status == 200),
+            "{result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "a fresh host inherited another host's own backoff count, took {elapsed:?}"
+        );
+        assert_eq!(
+            state.get(&host_of("https://a.example/first")),
+            Some(&3),
+            "an unrelated host's own count changed when only b.example was asked for anything"
+        );
     }
 }

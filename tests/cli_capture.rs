@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use archeion::CanonicalUrl;
 use archeion::crawl::DEFAULT_USER_AGENT;
-use archeion::storage::{Archive, OwedReason};
+use archeion::storage::{Archive, OwedAddress, OwedReason};
 use tempfile::TempDir;
 
 const INDEX: &str = r#"<html><head><title>An index</title></head>
@@ -953,6 +953,274 @@ fn answer_always_429(mut stream: TcpStream, requests: Arc<Mutex<u32>>) -> std::i
     stream.write_all(head.as_bytes())?;
     stream.write_all(body)?;
     stream.flush()
+}
+
+/// A loopback site whose one page answers 429 a fixed number of times and then 200, so a run
+/// against it proves whether waiting out a rate limit is what recovered the page. Every test
+/// built on this passes `--max-retries 0`, which turns off the engine's own small retry
+/// budget: without it, a refusal count at or under that budget would be recovered by the
+/// mechanism `docs/crawl-boundary.md` already documented before this bead, and the test would
+/// prove nothing about the backoff this bead adds. `/robots.txt` answers 404 and is not
+/// counted, so the refusal count named by a test is exactly the count of requests for the
+/// page itself.
+fn serve_a_page_that_refuses_a_fixed_number_of_times(
+    refusals: u32,
+    retry_after: Option<String>,
+) -> (u16, Arc<Mutex<u32>>) {
+    let requests = Arc::new(Mutex::new(0u32));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    let counted = Arc::clone(&requests);
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let requests = Arc::clone(&counted);
+            let retry_after = retry_after.clone();
+            thread::spawn(move || {
+                answer_a_fixed_number_of_refusals(stream, requests, refusals, retry_after)
+            });
+        }
+    });
+    (port, requests)
+}
+
+fn answer_a_fixed_number_of_refusals(
+    mut stream: TcpStream,
+    requests: Arc<Mutex<u32>>,
+    refusals: u32,
+    retry_after: Option<String>,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 2 {
+        header.clear();
+    }
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    if path == "/robots.txt" {
+        stream.write_all(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return stream.flush();
+    }
+    let attempt = {
+        let mut count = requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *count += 1;
+        *count
+    };
+    let refused = attempt <= refusals;
+    let (status, body): (&str, &[u8]) = if refused {
+        ("429 Too Many Requests", b"Too Many Requests")
+    } else {
+        (
+            "200 OK",
+            b"<html><head><title>ok</title></head><body>ok</body></html>",
+        )
+    };
+    let retry_after_header = if refused {
+        retry_after
+            .map(|value| format!("Retry-After: {value}\r\n"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let head = format!(
+        "HTTP/1.1 {status}\r\n{retry_after_header}Content-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
+/// The "Done when" of `arch-u59`: a page that refuses the first two requests it answers, and
+/// serves the third, is captured whole in one run, and nothing about it is left owed.
+#[test]
+fn a_page_that_refuses_twice_and_then_serves_is_captured_with_nothing_owed() {
+    let dir = TempDir::new().expect("temp dir");
+    let (port, requests) = serve_a_page_that_refuses_a_fixed_number_of_times(2, None);
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args(["--max-pages", "1", "--max-retries", "0"])
+        .args(["--deadline", "10s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(
+        *requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        3,
+        "two refusals and the request that finally served"
+    );
+
+    let archive = Archive::open_existing(dir.path()).expect("the run created an archive");
+    let canonical = CanonicalUrl::parse(&seed_url).expect("valid url");
+    assert!(
+        !archive
+            .list_captures(&canonical)
+            .expect("captures are listed")
+            .is_empty(),
+        "the page waited out and served is archived"
+    );
+    let owed = archive.read_owed().expect("the owed record reads back");
+    assert!(
+        owed.is_empty(),
+        "nothing is owed once waiting recovered the page: {owed:?}"
+    );
+}
+
+/// A `Retry-After` naming a wait longer than backoff would have chosen on its own, in
+/// seconds, is what the run actually waits: the header asks for three seconds, longer than
+/// the one second `RATE_LIMIT_BASE_BACKOFF` would choose unprompted, and the page is served
+/// on the very next request.
+#[test]
+fn a_retry_after_given_in_seconds_and_longer_than_the_default_backoff_is_honoured() {
+    let dir = TempDir::new().expect("temp dir");
+    let (port, _requests) =
+        serve_a_page_that_refuses_a_fixed_number_of_times(1, Some("3".to_owned()));
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let started = std::time::Instant::now();
+    let output = archeion()
+        .arg("capture")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args(["--max-pages", "1", "--max-retries", "0"])
+        .args(["--deadline", "10s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+    let elapsed = started.elapsed();
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    // A lower bound, which is the only kind a sleep can be held to: it never returns early,
+    // and asserting an upper bound would be asserting that this machine was not busy.
+    assert!(
+        elapsed >= Duration::from_millis(2_800),
+        "a three second Retry-After was not honoured, took {elapsed:?}"
+    );
+
+    let owed = archive_owed(dir.path());
+    assert!(
+        owed.is_empty(),
+        "nothing is owed once waiting recovered the page: {owed:?}"
+    );
+}
+
+/// The same wait, asked for in the other form the header may take: an HTTP-date naming the
+/// moment to come back rather than a count of seconds.
+#[test]
+fn a_retry_after_given_as_an_http_date_and_longer_than_the_default_backoff_is_honoured() {
+    let dir = TempDir::new().expect("temp dir");
+    // Four seconds ahead rather than three: `fmt_http_date` truncates to a whole second, and
+    // the header is read back a moment after it was written, so a target picked exactly at
+    // the assertion's own bound would round down under it on an unlucky run.
+    let target = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(4));
+    let (port, _requests) = serve_a_page_that_refuses_a_fixed_number_of_times(1, Some(target));
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let started = std::time::Instant::now();
+    let output = archeion()
+        .arg("capture")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args(["--max-pages", "1", "--max-retries", "0"])
+        .args(["--deadline", "10s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+    let elapsed = started.elapsed();
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        elapsed >= Duration::from_millis(2_800),
+        "a four second Retry-After HTTP-date was not honoured, took {elapsed:?}"
+    );
+
+    let owed = archive_owed(dir.path());
+    assert!(
+        owed.is_empty(),
+        "nothing is owed once waiting recovered the page: {owed:?}"
+    );
+}
+
+fn archive_owed(path: &std::path::Path) -> Vec<OwedAddress> {
+    Archive::open_existing(path)
+        .expect("the run created an archive")
+        .read_owed()
+        .expect("the owed record reads back")
+}
+
+/// A host that never stops refusing does not hold the run past its own deadline, and backoff
+/// actually spent part of it waiting rather than giving up on the first refusal: the lower
+/// bound proves the wait was taken at all, and the upper bound, generous against the 5s
+/// deadline, proves the run gave up near it rather than past it. `RATE_LIMIT_MAX_BACKOFF`
+/// alone would let one more doubling run to 16s past the point the run is out of budget, so
+/// an upper bound near the deadline is what a broken deadline check inside the backoff loop
+/// would fail rather than only a slow one.
+#[test]
+fn a_host_that_never_stops_refusing_is_bounded_by_the_run_s_own_deadline() {
+    let dir = TempDir::new().expect("temp dir");
+    let (port, _requests) = serve_a_page_that_refuses_a_fixed_number_of_times(u32::MAX, None);
+    let seed_url = format!("http://127.0.0.1:{port}/index.html");
+
+    let started = std::time::Instant::now();
+    let output = archeion()
+        .arg("capture")
+        .arg("--json")
+        .arg(dir.path())
+        .arg(&seed_url)
+        .args(["--max-pages", "1", "--max-retries", "0"])
+        .args(["--deadline", "5s", "--allow-private-addresses"])
+        .output()
+        .expect("the binary runs");
+    let elapsed = started.elapsed();
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        elapsed >= Duration::from_millis(2_500),
+        "the run gave up before backoff had grown past its first two waits, took {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "the run outlasted its own 5s deadline by more than a reasonable margin, took {elapsed:?}"
+    );
+
+    // A run held up by backoff and then ended by its own deadline has to say so: with a
+    // single-page seed the crawl's own frontier would otherwise call this `Exhausted`, since
+    // there genuinely was nothing else queued, and that would be the wrong reason for why
+    // the address stayed refused.
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout_of(&output)).expect("one object and nothing else");
+    assert_eq!(
+        report["stopped"], "deadline-reached",
+        "a run held up by backoff and then ended by its deadline did not say so: {report}"
+    );
+
+    let owed = archive_owed(dir.path());
+    assert_eq!(
+        owed.len(),
+        1,
+        "the address waiting never resolved is owed: {owed:?}"
+    );
+    assert_eq!(
+        owed[0].reason,
+        OwedReason::Refused {
+            status: 429,
+            retry_after: None,
+        }
+    );
 }
 
 const ROBOTS_TXT_ALLOW_OUTRANKING_A_SHORTER_DISALLOW: &str = "User-agent: *\n\
@@ -2713,8 +2981,12 @@ fn a_refusal_with_no_retry_after_records_its_absence() {
             "1",
             "--max-retries",
             "0",
+            // Short enough that the rate limit backoff gives up well before this run would
+            // otherwise sit through several minutes of growing waits on a host that never
+            // stops refusing: this test is about what a refusal with no header records, not
+            // about how long waiting one out takes.
             "--deadline",
-            "30s",
+            "5s",
             "--allow-private-addresses",
         ])
         .output()
@@ -2810,8 +3082,11 @@ fn a_mixed_run_lists_only_the_pages_the_host_served() {
             "1",
             "--max-retries",
             "0",
+            // Short enough that `/refused`'s rate limit backoff gives up well before this run
+            // would otherwise sit through several minutes of growing waits: this test is about
+            // what `list` prints afterward, not about the wait itself.
             "--deadline",
-            "30s",
+            "5s",
             "--allow-private-addresses",
         ])
         .output()

@@ -1409,6 +1409,10 @@ fn a_site_whose_every_route_refuses_twice_is_captured_whole_with_nothing_owed() 
         serde_json::from_str(&stdout_of(&output)).expect("one object and nothing else");
     assert_eq!(report["captures_written"], 4);
     assert_eq!(
+        report["pages_recovered_from_rate_limit"], 4,
+        "the run archived four pages by waiting and reported some other number of them: {report}"
+    );
+    assert_eq!(
         report["stopped"], "exhausted",
         "a run that finished the site named something else as its bound: {report}"
     );

@@ -50,8 +50,10 @@ enum Command {
         #[arg(long)]
         allow_private_addresses: bool,
         /// Says something on stderr while the pass goes, instead of only once at the end.
-        /// The same levels `capture` takes: see its own `--progress` for what each one means.
-        #[arg(long, value_name = "LEVEL", num_args = 0..=1, default_missing_value = "lines")]
+        /// The same levels `capture` takes, named the same way, with an equals sign:
+        /// `--progress=bar`. See its own `--progress` for what each one means.
+        #[arg(long, value_name = "LEVEL", num_args = 0..=1, require_equals = true,
+              default_missing_value = "lines")]
         progress: Option<ProgressLevel>,
         /// Archive directory to update.
         archive: PathBuf,

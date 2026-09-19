@@ -18,6 +18,7 @@ use crate::crawl::{
 };
 use crate::metadata::{self, PageMetadata, PageSource, ReferencedAsset, UnreadablePage};
 use crate::readability::{self, Extraction, SiteRules, UnreadableArticle};
+use crate::report_words;
 use crate::storage::{
     Archive, Header, NewCapture, OwedAddress, OwedReason, PolicyDeparture, StorageError,
 };
@@ -72,14 +73,11 @@ pub struct RefusedResponse {
 /// What one page produced, for a caller that wants to say so while the run is still going
 /// rather than only in the report at the end.
 ///
-/// Each word is the one the end-of-run report already uses for the same fate, so a live line
-/// and the summary printed after it never disagree about what to call the same thing:
-/// `Refused` is `responses_refused`'s own word, reused again for `extractions_refused` since
-/// the report already spends "refused" on both a host's answer and a reading of it; `Extracted`
-/// matches `articles_extracted`; `NoResponse` and `InsideANetwork` quote `losses` below
-/// verbatim, `Unaddressable` shortens its "has no address" to match. `NotArticle` is the one
-/// exception: the report never counts it at all, so there is no existing word to reuse and this
-/// one is new.
+/// Every word comes from `crate::report_words`, which the end-of-run report reads from as
+/// well, so a live line and the summary printed after it cannot disagree about what to call
+/// the same thing. The one split worth naming is the two refusals: a host declining to serve
+/// a page and this project declining to call a page it did receive an article are separate
+/// rows in the report, so they are separate variants here rather than one word spent twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageOutcome {
     /// A capture was written and its prose extraction said nothing distinguishing: no
@@ -88,7 +86,10 @@ pub enum PageOutcome {
     Stored,
     Extracted,
     NotArticle,
-    Refused,
+    /// The host answered with a status the run counts as a refusal, so no item was filed.
+    HostRefused,
+    /// A response this run stored, whose prose reading refused to call it an article.
+    ArticleRefused,
     NoResponse,
     InsideANetwork,
     Unaddressable,
@@ -97,14 +98,59 @@ pub enum PageOutcome {
 impl PageOutcome {
     pub fn as_word(self) -> &'static str {
         match self {
-            Self::Stored => "stored",
-            Self::Extracted => "extracted",
-            Self::NotArticle => "not an article",
-            Self::Refused => "refused",
-            Self::NoResponse => "no response",
-            Self::InsideANetwork => "inside a network",
-            Self::Unaddressable => "no address",
+            Self::Stored => report_words::STORED,
+            Self::Extracted => report_words::EXTRACTED,
+            Self::NotArticle => report_words::NOT_ARTICLE,
+            Self::HostRefused => report_words::HOST_REFUSED,
+            Self::ArticleRefused => report_words::ARTICLE_REFUSED,
+            Self::NoResponse => report_words::NO_RESPONSE,
+            Self::InsideANetwork => report_words::INSIDE_A_NETWORK,
+            Self::Unaddressable => report_words::NO_ADDRESS,
         }
+    }
+}
+
+/// A caller told what each page produced, and how far the whole run is while it is told.
+///
+/// The count exists here rather than being read off the phase's own `CaptureRun` because a
+/// run can have more than one phase and every phase starts its own tally at zero. A bar fed
+/// the phase's count shows a run against `--max-pages 100` reach forty, then restart at one
+/// when the sitemap phase begins, which is worse than no bar: it is a bar that lies. What a
+/// phase is handed instead is what the run spent before the phase began, and it adds its own.
+pub struct PageReporter<'a> {
+    told: &'a mut dyn FnMut(&str, PageOutcome, usize),
+    pages_before_this_phase: usize,
+}
+
+impl<'a> PageReporter<'a> {
+    pub fn new(
+        told: &'a mut dyn FnMut(&str, PageOutcome, usize),
+        pages_before_this_phase: usize,
+    ) -> Self {
+        Self {
+            told,
+            pages_before_this_phase,
+        }
+    }
+
+    fn page(&mut self, url: &str, outcome: PageOutcome, run: &CaptureRun) {
+        (self.told)(url, outcome, self.pages_before_this_phase + run.pages_spent);
+    }
+}
+
+/// Everything one page's pass writes into: the run's own counters, the first write failure
+/// that ended it, and the caller being told what the page produced. They travel together
+/// because they are one destination rather than three, and because `capture_page` had run out
+/// of room for another parameter.
+struct PageTally<'a, 'r> {
+    run: &'a mut CaptureRun,
+    write_failure: &'a mut Option<StorageError>,
+    reporter: &'a mut PageReporter<'r>,
+}
+
+impl PageTally<'_, '_> {
+    fn report(&mut self, url: &str, outcome: PageOutcome) {
+        self.reporter.page(url, outcome, self.run);
     }
 }
 
@@ -287,6 +333,9 @@ pub fn capture_seed_reporting(
     // The pass outlives every page because what it learned about one page's subresources is
     // the answer for the next page that references them.
     let mut assets = AssetCapture::new(engine, archive, seed, started);
+    // Nothing was spent before this phase: an ordinary crawl is the run's first, and a resume
+    // reaches `capture_sitemap_reporting` instead, which is handed the offset it needs.
+    let mut reporter = PageReporter::new(progress, 0);
 
     let outcome = engine.crawl(seed, &mut |event| {
         let answer = capture_page(
@@ -295,9 +344,11 @@ pub fn capture_seed_reporting(
             seed,
             rules,
             &mut assets,
-            &mut run,
-            &mut write_failure,
-            &mut *progress,
+            &mut PageTally {
+                run: &mut run,
+                write_failure: &mut write_failure,
+                reporter: &mut reporter,
+            },
         );
         if answer.is_break() {
             return ControlFlow::Break(());
@@ -427,6 +478,10 @@ pub fn capture_sitemap(
 /// `capture_sitemap`, with the same per-page progress `capture_seed_reporting` carries. See
 /// that function for why this is a second name rather than a parameter every existing caller
 /// of `capture_sitemap` would have had to grow.
+// The seven parameters are `capture_sitemap`'s own, unchanged; the eighth is the callback that
+// is the whole difference between the two names. Bundling any of them into a struct would make
+// this signature stop matching the function it is the reporting twin of, which is the thing a
+// reader of either one needs to be able to see at a glance.
 #[allow(clippy::too_many_arguments)]
 pub fn capture_sitemap_reporting(
     engine: &dyn CrawlEngine,
@@ -450,6 +505,10 @@ pub fn capture_sitemap_reporting(
     // a deadline expires inside one page's own subresource pass. See the hurdle table.
     let started = so_far.started;
     let mut assets = AssetCapture::new(engine, archive, seed, started);
+    // What the run charged against `--max-pages` before this phase began, which is the same
+    // number the bounds above are checked against. A phase reporting its own count instead
+    // would restart a bar at one the moment a sitemap phase or a further origin group began.
+    let mut reporter = PageReporter::new(progress, so_far.pages_written);
 
     let mut asked_the_host_for_something = false;
 
@@ -512,9 +571,11 @@ pub fn capture_sitemap_reporting(
                     seed,
                     rules,
                     &mut assets,
-                    &mut run,
-                    &mut write_failure,
-                    &mut *progress,
+                    &mut PageTally {
+                        run: &mut run,
+                        write_failure: &mut write_failure,
+                        reporter: &mut reporter,
+                    },
                 )
             }) {
                 Ok(outcome) => outcome,
@@ -542,9 +603,11 @@ pub fn capture_sitemap_reporting(
                 seed,
                 rules,
                 &mut assets,
-                &mut run,
-                &mut write_failure,
-                &mut *progress,
+                &mut PageTally {
+                    run: &mut run,
+                    write_failure: &mut write_failure,
+                    reporter: &mut reporter,
+                },
             );
             if answer.is_break() {
                 break;
@@ -831,15 +894,13 @@ fn capture_page(
     seed: &Seed,
     rules: &SiteRules,
     assets: &mut AssetCapture<'_>,
-    run: &mut CaptureRun,
-    write_failure: &mut Option<StorageError>,
-    progress: &mut dyn FnMut(&str, PageOutcome, usize),
+    tally: &mut PageTally<'_, '_>,
 ) -> ControlFlow<()> {
     let page = match event {
         PageEvent::Response(page) => page,
         PageEvent::NoResponse(failure) => {
-            progress(&failure.url, PageOutcome::NoResponse, run.pages_spent);
-            run.failed_fetches.push(failure);
+            tally.report(&failure.url, PageOutcome::NoResponse);
+            tally.run.failed_fetches.push(failure);
             return ControlFlow::Continue(());
         }
     };
@@ -851,8 +912,8 @@ fn capture_page(
     // the archive runs on. The run that asked for local addresses gets them, which is the
     // only way a locally served site is archived at all.
     if !seed.allow_private_addresses && points_inside_a_network(&page.final_url) {
-        progress(&page.final_url, PageOutcome::InsideANetwork, run.pages_spent);
-        run.pages_inside_a_network.push(page.final_url);
+        tally.report(&page.final_url, PageOutcome::InsideANetwork);
+        tally.run.pages_inside_a_network.push(page.final_url);
         return ControlFlow::Continue(());
     }
 
@@ -862,8 +923,8 @@ fn capture_page(
     let canonical = match CanonicalUrl::parse(&page.final_url) {
         Ok(canonical) => canonical,
         Err(reason) => {
-            progress(&page.final_url, PageOutcome::Unaddressable, run.pages_spent);
-            run.unaddressable_pages.push(UnaddressablePage {
+            tally.report(&page.final_url, PageOutcome::Unaddressable);
+            tally.run.unaddressable_pages.push(UnaddressablePage {
                 url: page.final_url,
                 reason,
             });
@@ -880,12 +941,12 @@ fn capture_page(
         // is, a few lines down: before this bead a refusal was a capture and paid into that
         // budget, and it still has to, or a host that refuses everything drains the sitemap
         // listing down to its deadline instead of stopping at `--max-pages`.
-        run.pages_spent += 1;
+        tally.run.pages_spent += 1;
         let canonical_url = canonical.to_string();
-        run.refused_urls.insert(canonical_url.clone());
-        *run.responses_refused.entry(page.status).or_default() += 1;
-        progress(&canonical_url, PageOutcome::Refused, run.pages_spent);
-        run.refused_responses.push(RefusedResponse {
+        tally.run.refused_urls.insert(canonical_url.clone());
+        *tally.run.responses_refused.entry(page.status).or_default() += 1;
+        tally.report(&canonical_url, PageOutcome::HostRefused);
+        tally.run.refused_responses.push(RefusedResponse {
             retry_after: retry_after_of(&page.headers),
             url: canonical_url,
             status: page.status,
@@ -896,8 +957,8 @@ fn capture_page(
     // Read before the capture is written, because the bytes are still in hand, and stored
     // after, because the response is what cannot be recovered: a run cut short then leaves
     // a capture with no reading of it, which a later pass can produce on its own.
-    let extracted = read_page(&page, run);
-    let prose = read_prose(&page, extracted.as_ref(), rules, run);
+    let extracted = read_page(&page, tally.run);
+    let prose = read_prose(&page, extracted.as_ref(), rules, tally.run);
     // The subresources are acquired before the capture is written because the record has to
     // name them, and their bytes are stored before the page's own for the reason every body
     // is stored before every record: a blob nobody references costs disk space, and a record
@@ -906,7 +967,7 @@ fn capture_page(
     let captured = match assets.of_page(referenced_assets(extracted.as_ref())) {
         Ok(captured) => captured,
         Err(error) => {
-            *write_failure = Some(error);
+            *tally.write_failure = Some(error);
             return ControlFlow::Break(());
         }
     };
@@ -918,43 +979,43 @@ fn capture_page(
     {
         Ok(capture) => capture,
         Err(error) => {
-            *write_failure = Some(error);
+            *tally.write_failure = Some(error);
             return ControlFlow::Break(());
         }
     };
-    run.captures_written += 1;
+    tally.run.captures_written += 1;
     if item_already_had_a_capture {
-        run.items_appended += 1;
+        tally.run.items_appended += 1;
     }
-    run.pages_spent += 1;
+    tally.run.pages_spent += 1;
     // Counted off the record that landed rather than off the seed, so what the report says a
     // session reached is what the archive says too.
     if capture
         .policy_departures
         .contains(&PolicyDeparture::Session)
     {
-        run.captures_with_a_session += 1;
+        tally.run.captures_with_a_session += 1;
     }
     // Kept so a later phase of the same run does not archive an address this one already has.
     // It is what this run wrote rather than what the archive holds, because an archive holds
     // the history of everything ever captured and the question here is about one run.
-    run.archived_urls.insert(canonical.to_string());
+    tally.run.archived_urls.insert(canonical.to_string());
     // Counted with the capture rather than with the pass. A subresource whose capture never
     // reached the disk is a blob nothing references, and reporting it beside a capture that
     // does not exist would describe an archive nobody has.
-    run.assets_stored += stored;
-    run.assets_missed += missed;
+    tally.run.assets_stored += stored;
+    tally.run.assets_missed += missed;
 
     if let Some(metadata) = &extracted
         && let Err(error) = archive.write_metadata(&canonical, &capture.id, metadata)
     {
-        *write_failure = Some(error);
+        *tally.write_failure = Some(error);
         return ControlFlow::Break(());
     }
 
     let outcome = match &prose {
         Extraction::Article(_) => PageOutcome::Extracted,
-        Extraction::Refused(_) => PageOutcome::Refused,
+        Extraction::Refused(_) => PageOutcome::ArticleRefused,
         Extraction::NotArticle(_) => PageOutcome::NotArticle,
         Extraction::Nothing => PageOutcome::Stored,
     };
@@ -969,10 +1030,10 @@ fn capture_page(
         Extraction::Nothing => Ok(()),
     };
     if let Err(error) = stored_prose {
-        *write_failure = Some(error);
+        *tally.write_failure = Some(error);
         return ControlFlow::Break(());
     }
-    progress(&canonical.to_string(), outcome, run.pages_spent);
+    tally.report(&canonical.to_string(), outcome);
     ControlFlow::Continue(())
 }
 
@@ -1432,13 +1493,13 @@ mod tests {
         event
     }
 
+    /// Every `(url, outcome, pages_spent)` a run reported, in the order it reported them.
+    type ReportedPages = std::rc::Rc<RefCell<Vec<(String, PageOutcome, usize)>>>;
+
     /// A closure that records every `(url, outcome, pages_spent)` this run reports as it goes,
     /// so a test can assert on the live sequence rather than only on the counts left behind
     /// once the run is over.
-    fn recording_progress() -> (
-        std::rc::Rc<RefCell<Vec<(String, PageOutcome, usize)>>>,
-        impl FnMut(&str, PageOutcome, usize),
-    ) {
+    fn recording_progress() -> (ReportedPages, impl FnMut(&str, PageOutcome, usize)) {
         let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
         let recorder = std::rc::Rc::clone(&seen);
         let on_page = move |url: &str, outcome: PageOutcome, pages_spent: usize| {
@@ -1540,8 +1601,47 @@ mod tests {
         );
     }
 
+    /// The count a bar draws is the run's, not the phase's. A sitemap phase and every origin
+    /// group of a resume start a fresh `CaptureRun`, so a phase reporting its own
+    /// `pages_spent` sends a run at `40/100` back to `1/100` the moment the next phase
+    /// begins, which is a bar that lies rather than a bar that is merely coarse.
     #[test]
-    fn a_response_the_host_refused_is_reported_refused() {
+    fn a_phase_that_is_not_the_run_s_first_counts_on_from_what_the_run_already_spent() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/listed",
+            200,
+            "<html><head><title>Listed</title></head><body>a listed page</body></html>",
+        )]);
+        let (seen, mut on_page) = recording_progress();
+
+        capture_sitemap_reporting(
+            &engine,
+            &archive,
+            &Seed::new("https://example.com/"),
+            &SiteRules::default(),
+            &["https://example.com/listed".to_owned()],
+            true,
+            RunSoFar {
+                started: Instant::now(),
+                pages_written: 3,
+                archived: &HashSet::new(),
+            },
+            &mut on_page,
+        )
+        .expect("a fake engine and a fresh archive do not fail a write");
+
+        let counts: Vec<usize> = seen.borrow().iter().map(|(_, _, spent)| *spent).collect();
+        assert_eq!(
+            counts,
+            [4],
+            "the phase reported its own count rather than the run's"
+        );
+    }
+
+    #[test]
+    fn a_response_the_host_refused_is_reported_as_the_host_s_own_refusal() {
         let dir = TempDir::new().expect("temp dir");
         let archive = archive_in(&dir);
         let engine = ScriptedCrawlEngine::new(vec![page(
@@ -1562,7 +1662,11 @@ mod tests {
 
         assert_eq!(
             seen.borrow().as_slice(),
-            [("https://example.com/a".to_owned(), PageOutcome::Refused, 1)]
+            [(
+                "https://example.com/a".to_owned(),
+                PageOutcome::HostRefused,
+                1
+            )]
         );
     }
 

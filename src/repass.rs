@@ -12,6 +12,7 @@ use crate::assets::{AssetCapture, retryable_miss};
 use crate::crawl::{CrawlEngine, Seed};
 use crate::metadata::{self, AssetKind, PageMetadata, PageSource, ReferencedAsset};
 use crate::readability::{self, Extraction, ExtractionRules, SiteRules};
+use crate::report_words;
 use crate::storage::{Archive, Capture, CaptureId, StorageError};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -55,18 +56,20 @@ pub enum RepassError {
     },
 }
 
-/// What one capture's derived records became, named the way the end-of-run report already
-/// names the same fate: `Written`, `Refused` and `NotArticle` are `articles_written`,
-/// `extractions_refused` and the report's own "not article", `Unchanged` is
-/// `derived_unchanged`, and `Unreadable` is the word the report's own warnings already use for
-/// a body, a page or a prose reading that could not be refreshed: "unreadable item", "body for
-/// ... could not be refreshed". Every branch a repass can take already has a row or a warning
-/// to borrow a word from; nothing here is new the way `PageOutcome::NotArticle` had to be.
+/// What one capture's derived records became.
+///
+/// Every word comes from `crate::report_words`, which the end-of-run report reads from as
+/// well, so the live account and the summary after it cannot disagree. `MetadataWritten` is
+/// the variant that exists because they otherwise would: a capture whose metadata this pass
+/// replaced and whose article it left alone is counted under `metadata_written` by the report,
+/// so calling it unchanged on a progress line would be the live account claiming this pass did
+/// nothing to a record it did in fact rewrite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepassOutcome {
     Written,
     Refused,
     NotArticle,
+    MetadataWritten,
     Unchanged,
     Unreadable,
 }
@@ -74,13 +77,36 @@ pub enum RepassOutcome {
 impl RepassOutcome {
     pub fn as_word(self) -> &'static str {
         match self {
-            Self::Written => "written",
-            Self::Refused => "refused",
-            Self::NotArticle => "not article",
-            Self::Unchanged => "unchanged",
-            Self::Unreadable => "unreadable",
+            Self::Written => report_words::WRITTEN,
+            Self::Refused => report_words::REFUSED_IN_ARTICLES_ROW,
+            Self::NotArticle => report_words::NOT_ARTICLE,
+            Self::MetadataWritten => report_words::METADATA_WRITTEN,
+            Self::Unchanged => report_words::UNCHANGED,
+            Self::Unreadable => report_words::UNREADABLE,
         }
     }
+}
+
+/// What a repass tells a caller while it walks, which is two different things rather than one.
+///
+/// A capture's own fate is what a per-URL account is after, and an item can hold several. How
+/// far the walk is, on the other hand, is counted in items, because the number of items is the
+/// only denominator the walk knows before it starts. Keeping them apart is what lets an item
+/// the walk could not read at all still advance a bar: it has no capture to report and it is
+/// still one of the items the total counted, and a bar that skipped it would stop short of its
+/// own total and read as a pass that hung.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepassEvent<'a> {
+    /// One capture of one item finished, with what its derived records became.
+    Capture {
+        url: &'a str,
+        outcome: RepassOutcome,
+    },
+    /// One item finished, whatever its captures did and however few of them could be read.
+    ItemFinished {
+        items_done: usize,
+        total_items: usize,
+    },
 }
 
 pub fn repass_archive(
@@ -89,7 +115,7 @@ pub fn repass_archive(
     rules: &SiteRules,
     options: RepassOptions,
 ) -> Result<RepassRun, RepassError> {
-    repass_archive_reporting(engine, archive, rules, options, &mut |_, _, _, _| {})
+    repass_archive_reporting(engine, archive, rules, options, &mut |_| {})
 }
 
 /// `repass_archive`, with a caller told what each capture produced as the walk goes rather
@@ -97,19 +123,19 @@ pub fn repass_archive(
 /// existing caller of `repass_archive`, here and in `tests/repass.rs`, keeps compiling
 /// unchanged, and the CLI is the one caller that reaches this name instead.
 ///
-/// The progress closure is handed the item's own URL, what this capture produced, which item
-/// this is (one-based) and how many the walk found in total. It fires once per capture rather
-/// than once per item, since an item can hold several and each can land on a different
-/// outcome, while the item count is what a caller can know before the walk starts and is
-/// what the counted-against total means: `walk.items.len()`, not a count of every capture,
-/// which is only known by asking the same directory listing this loop already asks once and
-/// would otherwise ask twice for no reason a large archive should pay for.
+/// The progress closure is handed a `RepassEvent`: one per capture naming what that capture
+/// produced, and one per item saying the item is done. The item count is what a caller can
+/// know before the walk starts and is what a bar counts against: `walk.items.len()`, not a
+/// count of every capture, which is only known by asking the same directory listing this loop
+/// already asks once and would otherwise ask twice for no reason a large archive should pay
+/// for. Every item fires its own `ItemFinished`, including one whose captures could not be
+/// listed or read, so a bar reaches its total rather than stopping short of it.
 pub fn repass_archive_reporting(
     engine: &dyn CrawlEngine,
     archive: &Archive,
     rules: &SiteRules,
     options: RepassOptions,
-    progress: &mut dyn FnMut(&str, RepassOutcome, usize, usize),
+    progress: &mut dyn FnMut(RepassEvent<'_>),
 ) -> Result<RepassRun, RepassError> {
     let mut run = RepassRun::default();
     let walk = archive.walk().map_err(|source| RepassError::Storage {
@@ -128,6 +154,13 @@ pub fn repass_archive_reporting(
 
     for (item_index, item) in walk.items.into_iter().enumerate() {
         let items_done = item_index + 1;
+        // `ItemFinished` below is fired on every path out of this item's turn, the two that
+        // give up on it included. A bar counts items, and an item skipped silently is a bar
+        // that ends below its own total on an archive with nothing this pass did not report.
+        let finished = RepassEvent::ItemFinished {
+            items_done,
+            total_items,
+        };
         let captures = match archive.list_captures(&item.canonical_url) {
             Ok(captures) => captures,
             Err(source) => {
@@ -136,6 +169,7 @@ pub fn repass_archive_reporting(
                     capture: None,
                     reason: source.to_string(),
                 });
+                progress(finished);
                 continue;
             }
         };
@@ -148,6 +182,10 @@ pub fn repass_archive_reporting(
                         Some(&capture_id),
                         source,
                     ));
+                    progress(RepassEvent::Capture {
+                        url: item.canonical_url.as_str(),
+                        outcome: RepassOutcome::Unreadable,
+                    });
                     continue;
                 }
             };
@@ -156,6 +194,10 @@ pub fn repass_archive_reporting(
                     url: item.canonical_url.to_string(),
                     capture: Some(capture_id.to_string()),
                     reason: format!("capture record names itself as {}", capture.id),
+                });
+                progress(RepassEvent::Capture {
+                    url: item.canonical_url.as_str(),
+                    outcome: RepassOutcome::Unreadable,
                 });
                 continue;
             }
@@ -169,12 +211,10 @@ pub fn repass_archive_reporting(
                 &mut run,
             ) {
                 Ok(outcome) => {
-                    progress(
-                        item.canonical_url.as_str(),
+                    progress(RepassEvent::Capture {
+                        url: item.canonical_url.as_str(),
                         outcome,
-                        items_done,
-                        total_items,
-                    );
+                    });
                 }
                 Err(source) => {
                     run.asset_fetches = assets.fetches();
@@ -185,6 +225,7 @@ pub fn repass_archive_reporting(
                 }
             }
         }
+        progress(finished);
     }
     run.asset_fetches = assets.fetches();
     Ok(run)
@@ -317,11 +358,13 @@ fn repass_capture(
         content_type: content_type_of(&capture.response_headers),
         final_url: capture.final_url.as_str(),
     };
+    let mut metadata_was_written = false;
     let current_metadata = if metadata_stale {
         match metadata::extract(source) {
             Ok(Some(extracted)) => {
                 archive.write_metadata(url, &capture.id, &extracted)?;
                 run.metadata_written += 1;
+                metadata_was_written = true;
                 Some(extracted)
             }
             Ok(None) => None,
@@ -338,7 +381,12 @@ fn repass_capture(
         metadata
     };
 
-    if article_stale {
+    // No `if article_stale` here, and that is the point rather than an omission. It is
+    // `metadata_stale || ...`, and the early return above answered the one case where both
+    // are false, so nothing reaches this line with a current article. The arm that used to
+    // stand here returned `Unchanged` for a capture that had just had its metadata rewritten,
+    // which is the second thing wrong with it.
+    {
         let title = current_metadata
             .as_ref()
             .and_then(|metadata| metadata.title.as_ref())
@@ -348,7 +396,17 @@ fn repass_capture(
             .and_then(|metadata| readability::declared_accessible_for_free(&metadata.json_ld));
         match readability::extract(source, title, accessible_for_free, rules) {
             Ok(extracted) => {
-                write_extraction(archive, url, capture, article_state, extracted, run)
+                let outcome =
+                    write_extraction(archive, url, capture, article_state, extracted, run)?;
+                // The report counts a metadata rewrite under `metadata_written`, so a capture
+                // whose article this pass left alone is still not one it left alone. Calling
+                // it unchanged is the live account contradicting the summary printed after it.
+                Ok(match outcome {
+                    RepassOutcome::Unchanged if metadata_was_written => {
+                        RepassOutcome::MetadataWritten
+                    }
+                    outcome => outcome,
+                })
             }
             Err(unreadable) => {
                 run.unreadable_articles.push(RepassLoss {
@@ -359,13 +417,6 @@ fn repass_capture(
                 Ok(RepassOutcome::Unreadable)
             }
         }
-    } else {
-        // Unreachable in practice: `article_stale` is `metadata_stale || ...`, so this arm
-        // is only reached when neither is true, which the early return above already
-        // answered. Kept rather than asserted away, since the two conditions living in one
-        // `bool` is what stops a future edit from splitting them without noticing this falls
-        // through to something that never runs today.
-        Ok(RepassOutcome::Unchanged)
     }
 }
 

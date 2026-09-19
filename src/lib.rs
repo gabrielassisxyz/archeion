@@ -6,6 +6,7 @@ pub mod export;
 pub mod metadata;
 pub mod readability;
 pub mod repass;
+pub mod report_words;
 pub mod sitemap;
 mod srcset;
 pub mod storage;

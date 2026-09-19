@@ -5,7 +5,7 @@
 //! the archive's terms rather than the engine's, so swapping the engine is a new adapter
 //! and not a rewrite of the code that stores what it produced.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::ControlFlow;
@@ -359,10 +359,12 @@ const RATE_LIMIT_BASE_BACKOFF: Duration = Duration::from_secs(1);
 /// It is not this number that decides whether the run gives up on the address. The two
 /// checks beside every wait are, and the tighter of them is ordinarily the share rather
 /// than the deadline: a wait has to fit both what is left of the run and
-/// `RATE_LIMIT_SHARE_OF_THE_BUDGET` of the whole of it. At the default three hundred second
-/// deadline that puts the largest wait ever taken at seventy five seconds, so a
-/// `Retry-After` asking for more is recorded as owed at once however much of the run is
-/// still unspent.
+/// `RATE_LIMIT_SHARE_OF_THE_BUDGET` of the budget it was handed. A top level crawl at the
+/// default three hundred second deadline therefore never takes a wait over seventy five
+/// seconds, and a `Retry-After` asking for more is recorded as owed at once however much of
+/// the run is still unspent. The caller decides what that budget is: a sitemap sub-crawl and
+/// a resumed address are handed what is left of the run's deadline rather than the whole of
+/// it, so the same quarter is a smaller number the later in the run it is read.
 const RATE_LIMIT_MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
 /// What fraction of the run's whole budget one refusing address may spend being waited out,
@@ -454,7 +456,7 @@ pub(crate) struct RateLimitMemory {
     /// getting an answer. Nothing clears an entry: within one run, a server that would not
     /// be waited out once is not worth waiting out again, and the addresses behind it are
     /// recorded as owed at the speed of a single request each rather than of a wait each.
-    given_up_on: std::collections::HashSet<String>,
+    given_up_on: HashSet<String>,
 }
 
 impl RateLimitMemory {
@@ -547,11 +549,10 @@ pub(crate) fn wait_out_rate_limit(
             break;
         }
         let consecutive = state.consecutive_refusals(&host);
-        let wait = rate_limit_backoff(consecutive, floor, retry_after_wait(&page.headers));
         // Saturating rather than plain addition: `Retry-After` is a number a host chose, and
         // a host that answers `Retry-After: 18446744073709551615` would otherwise overflow
         // this sum and panic the run rather than be refused by it.
-        let fits = match deadline {
+        let fits = |wait: Duration| match deadline {
             Some(budget) => {
                 started.elapsed().saturating_add(wait) < budget
                     && this_address_started.elapsed().saturating_add(wait)
@@ -559,15 +560,24 @@ pub(crate) fn wait_out_rate_limit(
             }
             None => false,
         };
-        if !fits {
-            // A wait this run will not take is a server it has stopped waiting for. What
-            // the next address on it would do is take this same decision again, one wait
-            // at a time and one share of the budget at a time, and arrive at the same
-            // answer; recording it here is what keeps the hundredth address owed at the
-            // cost of a request rather than of a whole share. A run with no deadline is
-            // not a run that gave up on anything: `fits` is false there because nothing
-            // bounds a wait, not because a wait was refused.
-            if deadline.is_some() {
+        let wait = rate_limit_backoff(consecutive, floor, retry_after_wait(&page.headers));
+        if !fits(wait) {
+            // A wait the growth itself has outrun is a server this run has stopped waiting
+            // for. What the next address on it would do is take this same decision again,
+            // one wait at a time and one share of the budget at a time, and arrive at the
+            // same answer; recording it here is what keeps the hundredth address owed at
+            // the cost of a request rather than of a whole share.
+            //
+            // A wait refused because of what one response's own `Retry-After` asked for is
+            // a different thing, and reading it the same way costs the run a whole server:
+            // one search endpoint answering `Retry-After: 3600` would stop every article
+            // behind it from being waited out at all, and the next response may carry no
+            // header whatsoever. So the decision is taken against the wait this policy
+            // would have chosen on its own, header aside, and a header too long to take
+            // ends this address alone. A run with no deadline gave up on nothing either:
+            // `fits` is false there because nothing bounds a wait, not because a wait was
+            // refused.
+            if deadline.is_some() && !fits(rate_limit_backoff(consecutive, floor, None)) {
                 state.give_up_on(&host);
             }
             break;
@@ -1042,6 +1052,59 @@ mod tests {
             "a server already given up on was waited out again, took {elapsed:?}"
         );
         assert_eq!(recovered, 0);
+    }
+
+    /// A `Retry-After` too long to fit the share of the budget one address may spend is a
+    /// refusal of that wait, not evidence that the server has stopped answering. The next
+    /// address on the same server is still waited out normally, because the header that
+    /// refused the first one was one response's own and the next response may carry none at
+    /// all. Reading it as a reason to stop waiting for the server is what turned one search
+    /// endpoint's hour long `Retry-After` into forty articles re-owed without a request.
+    #[test]
+    fn a_retry_after_too_long_to_take_does_not_stop_the_server_being_waited_out() {
+        let mut state = RateLimitMemory::default();
+        let mut recovered = 0;
+        let mut calls = 0;
+        // The default deadline, whose share is seventy five seconds; the header asks for ten
+        // minutes, so no wait for this address fits.
+        let budget = Some(Duration::from_secs(300));
+
+        let _ = wait_out_rate_limit(
+            refused(429, vec![retry_after("600")]),
+            budget,
+            Instant::now(),
+            Duration::ZERO,
+            &mut state,
+            &mut recovered,
+            |_url| {
+                calls += 1;
+                ok()
+            },
+        );
+        assert_eq!(
+            calls, 0,
+            "a ten minute wait was taken inside a five minute run"
+        );
+
+        let result = wait_out_rate_limit(
+            refused_at("https://example.com/article", 429, Vec::new()),
+            budget,
+            Instant::now(),
+            Duration::ZERO,
+            &mut state,
+            &mut recovered,
+            |_url| {
+                calls += 1;
+                refused_at("https://example.com/article", 200, Vec::new())
+            },
+        );
+
+        assert!(
+            matches!(&result, PageEvent::Response(page) if page.status == 200),
+            "the address after a long `Retry-After` was never asked again: {result:?}"
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(recovered, 1);
     }
 
     /// A different server is not given up on by another one's answer: the memory is keyed by

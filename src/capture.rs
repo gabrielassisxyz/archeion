@@ -3046,11 +3046,14 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let archive = archive_in(&dir);
         let mut seed = Seed::new("https://example.com/");
-        // Shorter than the rate limit backoff's own smallest wait, so both refusals below
-        // give up on the run's deadline rather than have this test sit through however long
-        // waiting one out actually takes: this test is about the count surviving a merge, not
-        // about the wait itself, which `wait_out_rate_limit`'s own tests already cover.
-        seed.deadline = Some(Duration::from_millis(500));
+        // No deadline rather than a short one. Backoff waits a 429 out only while there is
+        // a budget for the wait to be bounded by, so `None` keeps this test off the clock
+        // entirely: the wait itself is `wait_out_rate_limit`'s own tests to cover, and this
+        // one is about the count surviving a merge. A deadline short enough to refuse every
+        // wait is also short enough for the phase's own loop guard to reach it while the
+        // first capture is being written, which made this fail under load with the two
+        // refusals never asked for at all.
+        seed.deadline = None;
         let urls: Vec<String> = (0..3)
             .map(|i| format!("https://example.com/p/{i}"))
             .collect();

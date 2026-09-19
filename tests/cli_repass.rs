@@ -162,6 +162,16 @@ fn no_progress_level_changes_a_single_byte_of_a_repass_report() {
     );
     let (machine, machine_stderr) = at_level(None, true);
     assert_eq!(machine_stderr, "");
+    assert_eq!(
+        machine,
+        "{\"archive\":\"<archive>\",\"captures_seen\":1,\"metadata_written\":1,\
+         \"articles_written\":0,\"extractions_refused\":0,\"non_articles_marked\":1,\
+         \"derived_unchanged\":0,\"assets_recovered\":0,\"asset_fetches\":0,\
+         \"assets_still_missing\":0,\"assets_not_retried\":0,\"unreadable_items\":[],\
+         \"unreadable_captures\":[],\"unreadable_bodies\":[],\"unreadable_pages\":[],\
+         \"unreadable_articles\":[]}\n",
+        "--json stdout moved away from its recorded text"
+    );
 
     for level in ["--progress", "--progress=lines", "--progress=bar"] {
         let (stdout, stderr) = at_level(Some(level), false);

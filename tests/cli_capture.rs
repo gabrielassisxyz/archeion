@@ -2913,6 +2913,20 @@ fn no_progress_level_changes_a_single_byte_of_stdout() {
     let (machine, machine_stderr) = run(None, true);
     assert_eq!(machine_stderr, "");
     serde_json::from_str::<serde_json::Value>(&machine).expect("stdout is one JSON object");
+    assert_eq!(
+        machine,
+        format!(
+            "{{\"seed_url\":\"{seed_url}\",\"archive\":\"<archive>\",\"archive_created\":true,\
+             \"captures_written\":2,\"items_appended\":null,\"responses_refused\":{{}},\
+             \"articles_extracted\":1,\"extractions_refused\":0,\"assets_stored\":1,\
+             \"assets_missed\":0,\"asset_fetches\":1,\"pages_dropped\":0,\
+             \"links_never_followed\":[],\"links_recovered\":0,\"stopped\":\"exhausted\",\
+             \"session\":null,\"sitemap\":null,\"resume\":null,\"failed_fetches\":[],\
+             \"unaddressable_pages\":[],\"pages_inside_a_network\":[],\"unreadable_pages\":[],\
+             \"unreadable_articles\":[]}}\n"
+        ),
+        "--json stdout moved away from its recorded text"
+    );
 
     for level in ["--progress", "--progress=lines", "--progress=bar"] {
         assert_eq!(run(Some(level), false).0, human, "{level} reached stdout");
@@ -2967,6 +2981,12 @@ fn a_progress_level_on_a_pipe_writes_no_escape_and_no_redraw() {
     assert!(
         lines.contains(&format!("{}: ", site.url("/article.html"))),
         "the lines level named no page and what it produced: {lines:?}"
+    );
+    // A bare flag is the lines level, not the bar: it names pages the same way.
+    let bare = progress_of("--progress");
+    assert!(
+        bare.contains(&format!("{}: ", site.url("/article.html"))),
+        "a bare --progress did not print the lines level: {bare:?}"
     );
     let bar = progress_of("--progress=bar");
     assert!(

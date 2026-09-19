@@ -1601,6 +1601,56 @@ mod tests {
         );
     }
 
+    /// The two refusals are two fates and print as two words. A host declining to serve a
+    /// page costs the run a request and files nothing; a reading declining to call a page an
+    /// article is a stored capture with a record of the refusal beside it. The report keeps
+    /// them in separate rows, so a live line spending one word on both would be the only
+    /// account of the run that could not tell them apart.
+    #[test]
+    fn a_reading_that_refused_a_page_is_not_reported_as_the_host_refusing_it() {
+        let dir = TempDir::new().expect("temp dir");
+        let archive = archive_in(&dir);
+        let engine = ScriptedCrawlEngine::new(vec![page(
+            "https://example.com/",
+            200,
+            &format!(
+                r#"<html><head><title>The Slow Kitchen</title></head>
+                   <body><header><h1>The Slow Kitchen</h1><p>Notes on bread, patience and the
+                   things that take longer than the recipe says they will.</p></header><main>
+                   <p>This is where I write down what I have learned about baking at home, one
+                   loaf at a time. Everything here is written slowly and revised often, so
+                   nothing is ever quite finished, and most of it is wrong in some way I have
+                   not noticed yet. If you came here for a recipe you can follow in an
+                   afternoon, the archive below is not going to help you very much, and I would
+                   rather say so at the top than have you find it out four paragraphs down.</p>
+                   <ul>{}</ul></main><footer><p>Written by hand, published from a laptop on a
+                   kitchen table. There is no newsletter, no tracking and no comment section,
+                   which suits everyone involved rather well.</p></footer></body></html>"#,
+                r#"<li><a href="/p">Keeping a sourdough starter alive through a cold winter</a></li>"#
+                    .repeat(12)
+            ),
+        )]);
+        let (seen, mut on_page) = recording_progress();
+
+        let run = capture_seed_reporting(
+            &engine,
+            &archive,
+            &Seed::new("https://example.com/"),
+            &SiteRules::default(),
+            &mut on_page,
+        )
+        .expect("the run completes");
+
+        assert_eq!(run.extractions_refused, 1, "the reading did not refuse");
+        let words: Vec<&str> = seen
+            .borrow()
+            .iter()
+            .map(|(_, outcome, _)| outcome.as_word())
+            .collect();
+        assert_eq!(words, [report_words::ARTICLE_REFUSED]);
+        assert_ne!(report_words::ARTICLE_REFUSED, report_words::HOST_REFUSED);
+    }
+
     /// The count a bar draws is the run's, not the phase's. A sitemap phase and every origin
     /// group of a resume start a fresh `CaptureRun`, so a phase reporting its own
     /// `pages_spent` sends a run at `40/100` back to `1/100` the moment the next phase

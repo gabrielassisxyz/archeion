@@ -419,10 +419,10 @@ fn host_of(url: &str) -> String {
 /// live crawl, where a retry has to bypass the frontier that already gave up on the address,
 /// and a plain fetch, where there was never a frontier to bypass, share the one policy.
 ///
-/// A page recovered this way is filed as the response it is, and nothing about its own links
-/// is followed from here: reopening the frontier for a page this project has already decided
-/// not to reach through it is the same call `docs/crawl-boundary.md` makes for a lost link,
-/// made again here for a different reason.
+/// A page recovered this way is filed as the response it is, and whatever else its own links
+/// have to become is the caller's: `fetch_again` is the one place a recovered body is ever
+/// seen, so a caller that has to fold the page's links into a crawl's own bookkeeping does
+/// it from inside the fetch it supplies rather than from here.
 ///
 /// The deadline check happens before every sleep rather than only once at the top, and
 /// compares the wait about to be taken rather than only the clock already spent: a caller
@@ -436,13 +436,14 @@ fn host_of(url: &str) -> String {
 /// to run forever keeps doing so, on whatever other addresses are left, rather than this
 /// function choosing a ceiling of its own for a run that deliberately chose to have none.
 ///
-/// The second half of what comes back says whether the deadline, rather than the host
-/// finally answering, is what ended this call: true only when a deadline was in force and a
-/// further wait would have crossed it while the address was still refusing. A caller whose
-/// own report otherwise defaults to "nothing was left to fetch" has to read this and say the
-/// deadline instead, since a run held up by backoff and then cut off by its own budget did
-/// not run out of things to ask for, it ran out of time to keep asking the one thing it had
-/// left.
+/// Giving up on an address because a further wait would not fit the remaining budget ends
+/// this call and nothing else. The refusal is handed back exactly as it arrived, so the
+/// caller records the address as owed the way it records any other refusal, and the run
+/// carries on with whatever else it had to ask for. It is not a deadline that ended the
+/// run: the budget is still open, and a run that goes on to finish its remaining addresses
+/// inside it finished inside it. Blaming the deadline here would name a bound that decided
+/// one address rather than the run, and on the sitemap and resume paths it would also cost
+/// every address still unasked behind it.
 pub(crate) fn wait_out_rate_limit(
     event: PageEvent,
     deadline: Option<Duration>,
@@ -451,17 +452,16 @@ pub(crate) fn wait_out_rate_limit(
     state: &mut HashMap<String, u32>,
     recovered: &mut usize,
     mut fetch_again: impl FnMut(&str) -> PageEvent,
-) -> (PageEvent, bool) {
+) -> PageEvent {
     let PageEvent::Response(first) = &event else {
-        return (event, false);
+        return event;
     };
     if first.status != 429 {
-        return (event, false);
+        return event;
     }
     let url = first.requested_url.clone();
     let host = host_of(&url);
     let mut event = event;
-    let mut gave_up_on_the_deadline = false;
     while let PageEvent::Response(page) = &event {
         if page.status != 429 {
             break;
@@ -473,10 +473,6 @@ pub(crate) fn wait_out_rate_limit(
             None => false,
         };
         if !fits_the_deadline {
-            // A `None` deadline never waits at all, which the branch above already answers
-            // on the first pass through this loop; reaching this point with one still means
-            // a deadline was in force and the wait about to be taken would have crossed it.
-            gave_up_on_the_deadline = deadline.is_some();
             break;
         }
         std::thread::sleep(wait);
@@ -487,7 +483,7 @@ pub(crate) fn wait_out_rate_limit(
         state.insert(host, 0);
         *recovered += 1;
     }
-    (event, gave_up_on_the_deadline)
+    event
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -795,7 +791,7 @@ mod tests {
         let mut calls = 0;
         let event = refused(503, Vec::new());
 
-        let (result, gave_up_on_the_deadline) = wait_out_rate_limit(
+        let result = wait_out_rate_limit(
             event.clone(),
             None,
             Instant::now(),
@@ -811,10 +807,6 @@ mod tests {
         assert_eq!(result, event);
         assert_eq!(calls, 0, "a 503 was retried by the rate limit backoff");
         assert_eq!(recovered, 0);
-        assert!(
-            !gave_up_on_the_deadline,
-            "a status this never waits out was blamed on the deadline anyway"
-        );
     }
 
     /// The address is asked for again after waiting, and once it answers under 400 the
@@ -825,7 +817,7 @@ mod tests {
         let mut recovered = 0;
         let mut calls = 0;
 
-        let (result, gave_up_on_the_deadline) = wait_out_rate_limit(
+        let result = wait_out_rate_limit(
             refused(429, Vec::new()),
             Some(Duration::from_secs(10)),
             Instant::now(),
@@ -849,10 +841,6 @@ mod tests {
             Some(&0),
             "a host that just answered under 400 was left with an elevated count"
         );
-        assert!(
-            !gave_up_on_the_deadline,
-            "a page that ended up served was blamed on the deadline"
-        );
     }
 
     /// A wait large enough to cross the deadline is never taken: the address is handed back
@@ -866,7 +854,7 @@ mod tests {
         let mut calls = 0;
         let event = refused(429, Vec::new());
 
-        let (result, gave_up_on_the_deadline) = wait_out_rate_limit(
+        let result = wait_out_rate_limit(
             event.clone(),
             Some(Duration::from_millis(10)),
             Instant::now(),
@@ -879,13 +867,12 @@ mod tests {
             },
         );
 
-        assert_eq!(result, event);
+        assert_eq!(
+            result, event,
+            "the refusal was not handed back for the caller to record as owed"
+        );
         assert_eq!(calls, 0, "a wait was taken past the run's own deadline");
         assert_eq!(recovered, 0);
-        assert!(
-            gave_up_on_the_deadline,
-            "a deadline in force, and crossed by the only wait available, was not blamed"
-        );
     }
 
     /// A run with no deadline has nothing for a bound to be measured against, so it does not
@@ -900,7 +887,7 @@ mod tests {
         let mut calls = 0;
         let event = refused(429, Vec::new());
 
-        let (result, gave_up_on_the_deadline) = wait_out_rate_limit(
+        let result = wait_out_rate_limit(
             event.clone(),
             None,
             Instant::now(),
@@ -919,13 +906,6 @@ mod tests {
             "a wait was taken on a run with no deadline at all"
         );
         assert_eq!(recovered, 0);
-        // Not the deadline's doing, because there was none: a caller reading this as "the
-        // deadline ended the run" for a seed that chose to have none would be as dishonest a
-        // report as reading a genuine deadline as `Exhausted`.
-        assert!(
-            !gave_up_on_the_deadline,
-            "a run with no deadline blamed one for a wait it never bounded"
-        );
     }
 
     /// A host that has already been refused several times in a row does not lend that count
@@ -947,7 +927,7 @@ mod tests {
         let mut recovered = 0;
 
         let started = Instant::now();
-        let (result, _gave_up_on_the_deadline) = wait_out_rate_limit(
+        let result = wait_out_rate_limit(
             refused_at("https://b.example/other", 429, Vec::new()),
             Some(Duration::from_secs(10)),
             started,

@@ -356,23 +356,28 @@ async fn crawl_seed(
     let scheme = frontier_scheme(start);
     // How many times in a row each host has answered 429 to this seed, which is what lets a
     // wait grow across a run's own successive refusals rather than reset with every new
-    // address. Recovery below shares neither this map nor a backoff of its own: an address it
-    // reaches already spent the crawl's own retry budget without ever being seen here.
+    // address. Recovery below shares this same map rather than starting a count of its own:
+    // a host still refusing when the crawl ended is the same host recovery is about to ask,
+    // and a fresh counter there would answer it at the pace the crawl already outgrew.
     let mut rate_limit_state: HashMap<String, u32> = HashMap::new();
     let mut pages_recovered_from_rate_limit = 0usize;
-    // Set the one time backoff gives up on an address specifically because a further wait
-    // would have crossed the seed's own deadline, so a run otherwise reporting `Exhausted`
-    // can say the deadline is what actually ended it instead.
-    let mut deadline_reached_by_backoff = false;
+    // Both read here rather than after the crawl, because the backoff re-fetch below needs
+    // them while the crawl is still running and recovery needs the same two values once it
+    // has finished. Nothing between the two points changes either: `configure_for_seed` and
+    // `robots_rules` above are the last things to touch the website's own configuration.
+    let seed_host = Url::parse(start)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned));
+    let selectors = website.setup_selectors();
     // Named apart from the caller's own `on_page`, and not a shadow of it, because
     // `recover_lost_links` below needs a second closure built the same way once this one's
     // own borrow of `fetched` has ended; a shadow could not be told apart from the
     // parameter it wraps once this scope needed to build another.
     //
-    // Backoff is applied here and not inside `filter_and_forward`, because recovery already
-    // owns its own retry decision for a 429 and hands the boundary only the attempt it gave
-    // up on (see `recover_lost_links`): a second, slower retry layered underneath that one
-    // would spend requests recovery already decided were not worth spending.
+    // Backoff is applied here and not inside `filter_and_forward`, because recovery reaches
+    // `filter_and_forward` too and applies backoff at its own point, after its own retry
+    // budget rather than after the engine's: putting it in the shared path would wait out a
+    // 429 twice for one address.
     let mut filtered_on_page = |event: PageEvent| {
         forward_after_rate_limit_backoff(
             event,
@@ -384,7 +389,16 @@ async fn crawl_seed(
             effective_delay,
             &mut rate_limit_state,
             &mut pages_recovered_from_rate_limit,
-            &mut deadline_reached_by_backoff,
+            |url| {
+                refetch_a_rate_limited_page(
+                    url,
+                    seed,
+                    &selectors,
+                    seed_host.as_deref(),
+                    &scheme,
+                    &depths,
+                )
+            },
             on_page,
         )
     };
@@ -489,10 +503,6 @@ async fn crawl_seed(
         // own count starting over from zero: a run that spent eight of its ten pages
         // before the frontier lost anything has two left for recovery, not ten.
         let already_fetched = fetched.len();
-        let seed_host = Url::parse(start)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_owned));
-        let selectors = website.setup_selectors();
         // Computed once, above, right after `robots_rules` overwrote `website`'s own delay
         // with the site's `Crawl-delay` whenever one was declared: the same value the crawl
         // itself already paced against, reused here rather than read from `website` a second
@@ -514,6 +524,8 @@ async fn crawl_seed(
             effective_delay,
             &depths,
             &robots,
+            &mut rate_limit_state,
+            &mut pages_recovered_from_rate_limit,
             &mut recovery_on_page,
         );
         outcome.links_recovered = links_recovered;
@@ -523,15 +535,6 @@ async fn crawl_seed(
             RecoveryStop::DeadlineReached => CrawlStop::DeadlineReached,
             RecoveryStop::CallerStopped => CrawlStop::CallerStopped,
         };
-    }
-    // A run whose crawl and recovery both otherwise say there was nothing left to fetch, but
-    // whose rate limit backoff gave up on an address specifically because the deadline was
-    // in the way, did not run out of things to ask for: it ran out of time to keep asking
-    // the one thing it had left. Never overrides a page ceiling or a caller's own stop,
-    // which are more specific answers than a default this backoff decision would otherwise
-    // leave standing.
-    if deadline_reached_by_backoff && outcome.stopped == CrawlStop::Exhausted {
-        outcome.stopped = CrawlStop::DeadlineReached;
     }
     outcome.pages_recovered_from_rate_limit = pages_recovered_from_rate_limit;
     outcome
@@ -595,9 +598,10 @@ fn admitted(
 
 /// What `filter_and_forward` is for the ordinary crawl path, with one further step between
 /// admission and delivery: a page a host answered 429 is not handed over yet, it is waited
-/// out and asked for again first. Recovery does not go through this: it already spent its
-/// own retry budget on a 429 before ever reaching `filter_and_forward`, and a second, slower
-/// layer underneath that decision would retry requests recovery already gave up on.
+/// out and asked for again first. Recovery does not go through this one, and not because it
+/// is exempt: it waits a 429 out at its own point inside `recover_lost_links`, after its own
+/// retry budget rather than after the engine's, so routing it through here as well would
+/// wait the same address out twice.
 #[allow(clippy::too_many_arguments)]
 fn forward_after_rate_limit_backoff(
     event: PageEvent,
@@ -609,23 +613,75 @@ fn forward_after_rate_limit_backoff(
     effective_delay: Duration,
     rate_limit_state: &mut HashMap<String, u32>,
     pages_recovered_from_rate_limit: &mut usize,
-    deadline_reached_by_backoff: &mut bool,
+    fetch_again: impl FnMut(&str) -> PageEvent,
     on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
 ) -> ControlFlow<()> {
     if !admitted(&event, robots, fetched, scheme) {
         return ControlFlow::Continue(());
     }
-    let (event, gave_up_on_the_deadline) = wait_out_rate_limit(
+    let event = wait_out_rate_limit(
         event,
         seed.deadline,
         seed_started,
         effective_delay,
         rate_limit_state,
         pages_recovered_from_rate_limit,
-        |url| fetch_off_the_crawl_runtime(url, seed),
+        fetch_again,
     );
-    *deadline_reached_by_backoff |= gave_up_on_the_deadline;
     on_page(event)
+}
+
+/// Asks a rate-limited address again, once `wait_out_rate_limit` has waited out the refusal,
+/// and folds whatever the answer links to into the crawl's own depth bookkeeping.
+///
+/// The re-fetch has to go around the frontier, which already handed this address up as
+/// refused and will not ask for it a second time, and going around it is what would
+/// otherwise lose the page's own links: the engine's `on_link_find_callback` never sees a
+/// response this adapter fetched itself, so nothing records what the page names and the
+/// crawl ends believing the page was a leaf. Writing those links into `depths` here puts
+/// them exactly where a page the frontier did fetch would have put them, which is what makes
+/// `links_discovered_but_never_fetched` notice them and `recover_lost_links` go and get
+/// them, inside the same `--max-pages`, deadline, delay and robots decision every other
+/// address of this run is inside. A publication that answers 429 on its first page is
+/// therefore captured whole by one slower run rather than reduced to that one page.
+///
+/// A page the site answered with a failure is left out of the bookkeeping entirely: what it
+/// names is an error document's links, not the site's.
+fn refetch_a_rate_limited_page(
+    url: &str,
+    seed: &Seed,
+    selectors: &RelativeSelectors,
+    seed_host: Option<&str>,
+    seed_scheme: &str,
+    depths: &Mutex<HashMap<String, usize>>,
+) -> PageEvent {
+    let (event, has_absolute_base_href, page_links) = fetch_recovered_page(url, seed, selectors);
+    if !matches!(&event, PageEvent::Response(page) if page.status < 400) {
+        return event;
+    }
+    let mut discovered = depths
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // An address the crawl reached but nothing linked to is the seed, which is zero hops
+    // out; every other page arrives here already placed by `hop_depth_guard`.
+    let depth = discovered
+        .get(&depth_key(url, seed_scheme))
+        .copied()
+        .unwrap_or(0);
+    if depth >= seed.max_depth {
+        return event;
+    }
+    record_discovered_links(
+        url,
+        has_absolute_base_href,
+        page_links.as_deref(),
+        seed_host,
+        seed_scheme,
+        depth,
+        &mut discovered,
+        None,
+    );
+    event
 }
 
 /// Whether a status is worth asking again, the same three shapes `configure_for_seed`'s own
@@ -673,8 +729,10 @@ fn is_retryable_status(status: u16) -> bool {
 ///
 /// A response the site sent is delivered like any other, archived and counted, because a
 /// capture is what the server answered; a status of 400 or higher is retried up to the
-/// seed's own retry budget and, if it is still refusing past that budget, does not count as
-/// having recovered the link. A page nothing answered is delivered as the failure it is and
+/// seed's own retry budget, a 429 still standing past that budget is waited out by
+/// `wait_out_rate_limit` on the crawl's own per-host counter exactly as the crawl path waits
+/// one out past the engine's budget, and an address still refusing after both does not count
+/// as having recovered the link. A page nothing answered is delivered as the failure it is and
 /// does not count either. Only a status under 400 clears a URL from what this returns.
 ///
 /// What comes back is the URLs still missing once the attempt is over, how many were
@@ -697,6 +755,8 @@ fn recover_lost_links(
     effective_delay: Duration,
     depths: &Mutex<HashMap<String, usize>>,
     robots: &RobotRules,
+    rate_limit_state: &mut HashMap<String, u32>,
+    pages_recovered_from_rate_limit: &mut usize,
     on_page: &mut dyn FnMut(PageEvent) -> ControlFlow<()>,
 ) -> (Vec<String>, usize, RecoveryStop) {
     let mut seen: HashSet<String> = initial.iter().map(|(url, _)| url.clone()).collect();
@@ -730,7 +790,7 @@ fn recover_lost_links(
         }
 
         let mut attempts = 0u8;
-        let (event, has_absolute_base_href, page_links) = loop {
+        let (event, mut has_absolute_base_href, mut page_links) = loop {
             let attempt = fetch_recovered_page(&url, seed, selectors);
             let should_retry = matches!(
                 &attempt.0,
@@ -744,6 +804,30 @@ fn recover_lost_links(
                 std::thread::sleep(effective_delay);
             }
         };
+
+        // A 429 still standing once the loop above has spent the seed's retry budget is the
+        // same refusal the crawl path hands to backoff once the engine has spent the same
+        // budget, and it gets the same answer here. The counter is the crawl's own, so a
+        // host that was already refusing during the crawl keeps the wait it had grown rather
+        // than starting over the moment the address is reached by this door instead.
+        let mut links_of_the_last_attempt = None;
+        let event = wait_out_rate_limit(
+            event,
+            seed.deadline,
+            seed_started,
+            effective_delay,
+            rate_limit_state,
+            pages_recovered_from_rate_limit,
+            |url| {
+                let (attempt, has_base, links) = fetch_recovered_page(url, seed, selectors);
+                links_of_the_last_attempt = Some((has_base, links));
+                attempt
+            },
+        );
+        if let Some((has_base, links)) = links_of_the_last_attempt {
+            has_absolute_base_href = has_base;
+            page_links = links;
+        }
 
         let recovered = matches!(&event, PageEvent::Response(response) if response.status < 400);
         if recovered {
@@ -2885,6 +2969,8 @@ mod tests {
             Duration::ZERO,
             &depths,
             &robots,
+            &mut HashMap::new(),
+            &mut 0,
             &mut |_event| ControlFlow::Break(()),
         );
 

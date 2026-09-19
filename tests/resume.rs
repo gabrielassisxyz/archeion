@@ -449,8 +449,13 @@ fn a_resumed_run_asks_only_for_what_the_archive_still_owes() {
             "1",
             "--max-retries",
             "0",
+            // Short on purpose: `/refused` answers 429 forever, and backoff waits out a 429
+            // for as much of the remaining budget as a further wait fits inside. Five
+            // seconds buys the one and two second waits and refuses the four second one,
+            // which is the whole of what this test wants from that route; a longer deadline
+            // would only buy more sleeping.
             "--deadline",
-            "30s",
+            "5s",
             "--allow-private-addresses",
         ])
         .output()
@@ -747,8 +752,11 @@ fn a_resume_refused_again_reports_what_is_still_owed() {
         .arg(dir.path())
         .arg("--resume")
         .args([
+            // Short for the reason the round trip above states: the route answers 429
+            // forever, and every second of the budget past the waits backoff can fit inside
+            // it is a second spent asleep.
             "--deadline",
-            "15s",
+            "5s",
             "--allow-private-addresses",
             "--max-retries",
             "0",
@@ -876,4 +884,64 @@ fn a_resume_bounded_by_max_pages_stops_early_and_leaves_the_rest_owed() {
         1,
         "a resume bounded to one page paid down more than its budget: {owed:?}"
     );
+}
+
+/// Report honesty on the resume path, which routes every owed address through the same
+/// plain-fetch loop the sitemap phase uses. An address abandoned for want of budget has to
+/// cost that address and not the ones queued behind it: the first owed address here refuses
+/// forever, and the deadline is short enough that backoff runs out of room for a second wait
+/// almost at once, while the two addresses after it are still asked for and paid down.
+#[test]
+fn an_owed_address_given_up_on_for_want_of_budget_does_not_cost_the_rest_of_the_debt() {
+    let dir = TempDir::new().expect("temp dir");
+    let site = Site::start();
+    site.set_route("/refusing", refused("Too Many Requests"));
+    site.set_route("/second", ok(ROUND_TRIP_SERVED));
+    site.set_route("/third", ok(ROUND_TRIP_SERVED));
+
+    let archive = Archive::open(dir.path()).expect("the archive opens");
+    archive
+        .write_owed(
+            &HashSet::new(),
+            &[
+                owed_refused(&site.url("/refusing")),
+                owed_refused(&site.url("/second")),
+                owed_refused(&site.url("/third")),
+            ],
+        )
+        .expect("the owed record is written");
+
+    let output = archeion()
+        .arg("capture")
+        .arg(dir.path())
+        .arg("--resume")
+        // Three seconds buys backoff its first one second wait on `/refusing` and refuses
+        // the two second one after it, which is all this test needs that route to do.
+        .args([
+            "--deadline",
+            "3s",
+            "--allow-private-addresses",
+            "--max-retries",
+            "0",
+        ])
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stdout_of(&output).contains("3 requested, 1 still owed"),
+        "one address given up on took the rest of the debt with it: {}",
+        stdout_of(&output)
+    );
+
+    for path in ["/second", "/third"] {
+        let url = CanonicalUrl::parse(&site.url(path)).expect("valid url");
+        assert!(
+            archive.has_captures(&url),
+            "{path} was never asked for, though the run still had budget for it"
+        );
+    }
+    let owed = archive.read_owed().expect("the owed record reads back");
+    assert_eq!(owed.len(), 1, "{owed:?}");
+    assert_eq!(owed[0].url, site.url("/refusing"));
 }

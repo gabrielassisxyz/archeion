@@ -466,7 +466,12 @@ pub fn capture_sitemap(
                 break;
             }
         } else {
-            let (event, gave_up_on_the_deadline) = wait_out_rate_limit(
+            // Backoff giving up on one listed URL, because a further wait would not fit
+            // what is left of the budget, ends that URL and not the list: the refusal is
+            // handed back and recorded as owed like any other, and the loop goes on to the
+            // remaining entries while the deadline is still open. The loop's own guard at
+            // the top is what ends the phase when the deadline actually runs out.
+            let event = wait_out_rate_limit(
                 engine.fetch(url, seed),
                 seed.deadline,
                 started,
@@ -475,13 +480,6 @@ pub fn capture_sitemap(
                 &mut run.pages_recovered_from_rate_limit,
                 |retry_url| engine.fetch(retry_url, seed),
             );
-            // A phase that otherwise finished its list, but only because backoff gave up on
-            // one of its addresses when the deadline was in the way, did not run out of URLs
-            // to ask for; it ran out of time to keep asking the one it had left. Never
-            // overrides a page ceiling already reached, which is a more specific answer.
-            if gave_up_on_the_deadline && run.stopped == CrawlStop::Exhausted {
-                run.stopped = CrawlStop::DeadlineReached;
-            }
             let answer = capture_page(
                 event,
                 archive,
@@ -3089,12 +3087,14 @@ mod tests {
         );
     }
 
-    /// A phase that answers every listed URL, and would otherwise say nothing was left to
-    /// ask for, has to say the deadline is what actually ended it once backoff gave up on one
-    /// of them for exactly that reason: it did not run out of URLs, it ran out of time to
-    /// keep asking the one it had left.
+    /// Backoff giving up on one listed URL, because a further wait would not fit what is
+    /// left of the budget, is a decision about that URL. The phase goes on to the entries
+    /// behind it and, having answered its whole list inside the budget, says so: the
+    /// deadline did not end anything. Reported the other way round, this loop broke out of
+    /// the list on the first such address, which on a resume is every remaining debt of that
+    /// origin thrown away over one host's `Retry-After`.
     #[test]
-    fn a_sitemap_phase_stopped_by_backoff_names_the_deadline_rather_than_exhausted() {
+    fn a_listed_url_backoff_gave_up_on_costs_that_url_and_not_the_rest_of_the_list() {
         let dir = TempDir::new().expect("temp dir");
         let archive = archive_in(&dir);
         let mut seed = Seed::new("https://example.com/");
@@ -3102,19 +3102,19 @@ mod tests {
         // up on the deadline rather than have this test sit through however long waiting one
         // out actually takes.
         seed.deadline = Some(Duration::from_millis(500));
-        let url = "https://example.com/only".to_owned();
-        let engine = ScriptedCrawlEngine::new(Vec::new()).serving(vec![page(
-            &url,
-            429,
-            "Too Many Requests",
-        )]);
+        let refusing = "https://example.com/refusing".to_owned();
+        let serving = "https://example.com/serving".to_owned();
+        let engine = ScriptedCrawlEngine::new(Vec::new()).serving(vec![
+            page(&refusing, 429, "Too Many Requests"),
+            page(&serving, 200, "<html><body><p>prose</p></body></html>"),
+        ]);
 
         let run = capture_sitemap(
             &engine,
             &archive,
             &seed,
             &SiteRules::default(),
-            &[url],
+            &[refusing, serving],
             false,
             RunSoFar::nothing_yet(&HashSet::new()),
         )
@@ -3122,9 +3122,17 @@ mod tests {
 
         assert_eq!(
             run.stopped,
-            CrawlStop::DeadlineReached,
-            "a refusal backoff gave up on for the deadline was reported as `Exhausted`"
+            CrawlStop::Exhausted,
+            "a phase that read its whole list named a bound that never ended it"
         );
+        // One, not two: the refused URL is recorded as owed rather than filed as an item,
+        // so the capture that exists at all is the entry behind it, which is exactly what a
+        // loop that broke out on the refusal would not have.
+        assert_eq!(
+            run.captures_written, 1,
+            "the URL behind the one backoff gave up on was never asked for"
+        );
+        assert_eq!(run.responses_refused, BTreeMap::from([(429, 1)]));
     }
 
     /// The two bounds this phase answers to are different facts and send an operator to
